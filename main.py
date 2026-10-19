@@ -47,7 +47,7 @@ THEME_PRESETS = {
         "fill": "#00ACC1", "fill_alpha": 42,
         "grid": "#222222", "grid_alpha": 45, "axis_text": "#858A94",
     },
-    "Azul Pro-Q": {
+    "Azul Estudio": {
         "background": "#0D1017", "curve": "#A0AAB8", "curve_width": 15,
         "fill": "#606B7D", "fill_alpha": 38,
         "grid": "#2D3340", "grid_alpha": 30, "axis_text": "#7A8496",
@@ -63,7 +63,7 @@ BACKGROUND_COLOR_PRESETS = [
     ("Gris Puro #141414", "#141414"),
     ("Carbón #1E1E1E", "#1E1E1E"),
     ("Negro Absoluto #080808", "#080808"),
-    ("Azul Pro-Q #0D1017", "#0D1017"),
+    ("Azul Estudio #0D1017", "#0D1017"),
 ]
 
 THEME_NUMERIC_RANGES = {"curve_width": (10, 60), "fill_alpha": (0, 255), "grid_alpha": (5, 100)}
@@ -1267,7 +1267,7 @@ class GraphStageContainer(QWidget):
 class AudioAnalyzerApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Pro•Q 4 Standalone Parametric & Dynamic EQ")
+        self.setWindowTitle("BDJ-FFT-EQ")
         self.setMinimumSize(860, 520)
 
         screen = QApplication.primaryScreen()
@@ -1438,8 +1438,8 @@ class AudioAnalyzerApp(QMainWindow):
         top_layout.setSpacing(8)
 
         brand_label = QLabel(
-            "<span style='color:#A6ACB8; font-size:12px;'>fabfilter</span> "
-            "<b style='color:#FFD54F; font-size:13px;'>Pro•Q 4</b>"
+            "<b style='color:#00E5FF; font-size:13px; letter-spacing:0.8px;'>BDJ</b> "
+            "<b style='color:#FFD54F; font-size:13px;'>FFT-EQ</b>"
         )
         brand_label.setContentsMargins(2, 0, 4, 0)
         top_layout.addWidget(brand_label)

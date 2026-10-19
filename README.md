@@ -1,4 +1,4 @@
-# Pro•Q 4 Standalone
+# BDJ-FFT-EQ
 ### Real-Time Parametric & Dynamic Equalizer, FFT Spectrum Analyzer & Oscilloscope for Windows
 
 ![Platform](https://img.shields.io/badge/Platform-Windows%2010%20%7C%2011-0078D6?logo=windows)
@@ -8,7 +8,7 @@
 ![DSP](https://img.shields.io/badge/DSP-NumPy%20%7C%20SciPy-013243)
 ![License](https://img.shields.io/badge/License-MIT-F5A623)
 
-A professional, studio-grade standalone Parametric & Dynamic Equalizer inspired by **FabFilter Pro-Q 4** with integrated real-time system audio routing, high-resolution FFT spectrum analyzer, and scroll-blitted oscilloscope.
+A professional, studio-grade standalone Parametric & Dynamic Equalizer with integrated real-time system audio routing, high-resolution FFT spectrum analyzer, and scroll-blitted oscilloscope.
 
 Process, sculpt, and equalize Windows system audio in real time with ultra-low latency—**no DAW or plugin host required**.
 
@@ -62,7 +62,7 @@ Process, sculpt, and equalize Windows system audio in real time with ultra-low l
 - **Pre-EQ & Post-EQ Visualization:** Simultaneous tracking of raw incoming audio (faint ghost curve) and processed output spectrum.
 - **Hardware-Accelerated 2D Rendering:** Hardware GPU acceleration (`OpenGL`) maintaining fluid 60 FPS.
 - **Zero-CPU Idle Optimization:** Dynamic dirty-flag architecture stops computing FFT, cubic splines, and redraws when the audio signal is at rest in silence.
-- **Studio Color Presets:** Neutral Pure Studio Gray (`#141414`), Studio Carbon (`#1E1E1E`), Absolute Black (`#080808`), Pro-Q Blue (`#0D1017`), and Analog Amber (`#140C02`).
+- **Studio Color Presets:** Neutral Pure Studio Gray (`#141414`), Studio Carbon (`#1E1E1E`), Absolute Black (`#080808`), Deep Studio Blue (`#0D1017`), and Analog Amber (`#140C02`).
 
 ### 5. Robust Audio I/O & Safety
 - **High-Priority PortAudio Stream:** Built with `sounddevice` running a non-blocking C callback with $512$-sample audio blocks (~$10.6\text{ ms}$ at $48\text{ kHz}$).
@@ -104,7 +104,7 @@ Analyzer/
 ├── build.bat                     # Single-click PyInstaller build script
 ├── config.json                   # Auto-saved user preferences and band states
 ├── eq_dsp.py                     # Vectorized DSP biquad filter & dynamic EQ engine
-├── eq_ui.py                      # Pro-Q 4 overlay, Liquid Glass widgets & floating HUD
+├── eq_ui.py                      # BDJ-FFT-EQ overlay, Liquid Glass widgets & floating HUD
 ├── fft_analyzer.py               # Rolling ring buffer FFT spectrum analyzer
 ├── main.py                       # Main application window & PortAudio stream manager
 ├── requirements.txt              # Python package dependencies
@@ -146,7 +146,7 @@ Analyzer/
 
 ## Building Standalone Executable (.exe)
 
-To build a standalone, single-file Windows executable (`dist/ProQ4_Standalone.exe`):
+To build a standalone, single-file Windows executable (`dist/FIRST RELEASE.exe`):
 
 ```cmd
 build.bat
@@ -154,7 +154,7 @@ build.bat
 
 Or run PyInstaller directly:
 ```bash
-pyinstaller --noconsole --onefile --name "ProQ4_Standalone" main.py
+pyinstaller --noconsole --onefile --name "FIRST RELEASE" main.py
 ```
 
 The resulting executable will be created in the `dist/` directory.

@@ -1,7 +1,7 @@
-# Especificación Técnica y Reglas de Arquitectura: Ecualizador Paramétrico & Dinámico Standalone (Estilo FabFilter Pro-Q 4) + Analizador FFT
+# Especificación Técnica y Reglas de Arquitectura: BDJ-FFT-EQ Standalone
 
 ## 1. Descripción del Sistema y Propuesta de Valor
-Aplicación de escritorio standalone en Python para Windows que combina un **Analizador de Espectro FFT de alta precisión** con un **Ecualizador Paramétrico y Dinámico en Tiempo Real inspirado en FabFilter Pro-Q 4**, capaz de procesar todo el audio del sistema sin necesidad de abrir un DAW.
+Aplicación de escritorio standalone en Python para Windows que combina un **Analizador de Espectro FFT de alta precisión** con un **Ecualizador Paramétrico y Dinámico en Tiempo Real (BDJ-FFT-EQ)**, capaz de procesar todo el audio del sistema sin necesidad de abrir un DAW.
 - Recibe la señal desde un dispositivo de entrada (ej. cable virtual en Windows) y la envía procesada con latencia ultra baja hacia los altavoces físicos.
 - Permite ecualización estática y **ecualización dinámica por banda (Dynamic EQ)** (comprimiendo o expandiendo rangos de frecuencia específicos según un `Threshold`, `Dynamic Range`, `Attack` y `Release`).
 - Visualiza simultáneamente el espectro **Pre-EQ** y **Post-EQ** (con curva suavizada por splines cúbicos y efecto "tira elástica" anclada en 10 Hz) junto con las curvas de respuesta estática y la excursión dinámica instantánea en tiempo real sobre una interfaz oscura de alta precisión (`#0D0F14`).
