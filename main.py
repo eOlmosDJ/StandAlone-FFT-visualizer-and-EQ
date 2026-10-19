@@ -25,9 +25,15 @@ try:
 except Exception:
     pg.setConfigOptions(antialias=True)
 
+from eq_ui import ProQ4Overlay, FloatingBandHUD, LiquidGlassButton
 from fft_analyzer import FFTSpectrumAnalyzer
 from eq_dsp import ParametricEQEngine
-from eq_ui import ProQ4Overlay, FloatingBandHUD, LiquidGlassButton
+
+
+def get_resource_path(relative_path: str) -> str:
+    """Obtiene la ruta absoluta hacia un recurso, compatible con desarrollo y PyInstaller."""
+    base_path = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base_path, relative_path)
 
 
 DEFAULT_PRESET_NAME = "Gris Puro de Estudio (Default)"
@@ -1270,6 +1276,12 @@ class AudioAnalyzerApp(QMainWindow):
         self.setWindowTitle("BDJ-FFT-EQ")
         self.setMinimumSize(860, 520)
 
+        icon_path = get_resource_path(os.path.join("assets", "icon.ico"))
+        if not os.path.exists(icon_path):
+            icon_path = get_resource_path(os.path.join("assets", "logo.png"))
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
+
         screen = QApplication.primaryScreen()
         if screen is not None:
             avail = screen.availableGeometry()
@@ -1437,11 +1449,21 @@ class AudioAnalyzerApp(QMainWindow):
         top_layout.setContentsMargins(4, 2, 4, 2)
         top_layout.setSpacing(8)
 
+        logo_path = get_resource_path(os.path.join("assets", "logo.png"))
+        if os.path.exists(logo_path):
+            logo_lbl = QLabel(self.top_bar)
+            logo_pix = QPixmap(logo_path).scaled(
+                22, 22, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
+            )
+            logo_lbl.setPixmap(logo_pix)
+            logo_lbl.setContentsMargins(2, 0, 0, 0)
+            top_layout.addWidget(logo_lbl)
+
         brand_label = QLabel(
             "<b style='color:#00E5FF; font-size:13px; letter-spacing:0.8px;'>BDJ</b> "
             "<b style='color:#FFD54F; font-size:13px;'>FFT-EQ</b>"
         )
-        brand_label.setContentsMargins(2, 0, 4, 0)
+        brand_label.setContentsMargins(0, 0, 4, 0)
         top_layout.addWidget(brand_label)
 
         self.mute_btn = LiquidGlassButton("🔇 Muted (Activar)", self.top_bar, tint_color="#FF5252", active_tint_color="#FF5252")
@@ -2291,7 +2313,21 @@ class AudioAnalyzerApp(QMainWindow):
 
 
 if __name__ == "__main__":
+    # Fijar el AppUserModelID para que Windows muestre el icono en la barra de tareas
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("bdj.ffteq.standalone.v1.0")
+    except Exception:
+        pass
+
     app = QApplication(sys.argv)
+
+    icon_path = get_resource_path(os.path.join("assets", "icon.ico"))
+    if not os.path.exists(icon_path):
+        icon_path = get_resource_path(os.path.join("assets", "logo.png"))
+    if os.path.exists(icon_path):
+        app.setWindowIcon(QIcon(icon_path))
+
     window = AudioAnalyzerApp()
     window.show()
     sys.exit(app.exec())

@@ -1,5 +1,8 @@
-# BDJ-FFT-EQ
-### Real-Time Parametric & Dynamic Equalizer, FFT Spectrum Analyzer & Oscilloscope for Windows
+<div align="center">
+  <img src="assets/logo.png" width="160" alt="BDJ-FFT-EQ Logo" />
+  <h1>BDJ-FFT-EQ</h1>
+  <p><strong>Real-Time Parametric & Dynamic Equalizer, FFT Spectrum Analyzer & Oscilloscope for Windows</strong></p>
+</div>
 
 ![Platform](https://img.shields.io/badge/Platform-Windows%2010%20%7C%2011-0078D6?logo=windows)
 ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python)
@@ -97,6 +100,8 @@ Process, sculpt, and equalize Windows system audio in real time with ultra-low l
 ```
 Analyzer/
 ├── assets/
+│   ├── icon.ico                  # Application multi-resolution Windows icon
+│   ├── logo.png                  # Application emblem and visual badge
 │   ├── proq4_main_hud.png        # Screenshot: Main interface & HUD
 │   └── proq4_scope_expanded.png  # Screenshot: Expanded oscilloscope
 ├── docs/
@@ -154,7 +159,7 @@ build.bat
 
 Or run PyInstaller directly:
 ```bash
-pyinstaller --noconsole --onefile --name "FIRST RELEASE" main.py
+pyinstaller --noconsole --onefile --icon "assets/icon.ico" --add-data "assets;assets" --name "FIRST RELEASE" main.py
 ```
 
 The resulting executable will be created in the `dist/` directory.
