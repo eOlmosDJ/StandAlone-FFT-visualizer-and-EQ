@@ -25,3 +25,7 @@ ENV/
 .idea/
 *.sublime-project
 *.sublime-workspace
+
+# Testing / Scratch
+scratch/
+

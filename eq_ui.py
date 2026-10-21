@@ -1,17 +1,64 @@
 import math
+import time
 import numpy as np
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QComboBox, QFrame, QMenu, QColorDialog, QDialog, QToolTip
+    QComboBox, QFrame, QMenu, QColorDialog, QDialog, QToolTip,
+    QGraphicsOpacityEffect, QListView
 )
 from PyQt6.QtCore import Qt, QEvent, QPoint, QPointF, QRectF, pyqtSignal
 from PyQt6.QtGui import (
     QColor, QFont, QPainter, QPainterPath, QPen, QBrush,
-    QLinearGradient, QPolygonF, QPixmap, QIcon
+    QLinearGradient, QPolygonF, QPixmap, QIcon, QCursor
 )
 import pyqtgraph as pg
 
-from eq_dsp import ParametricEQEngine, EQBand, FILTER_TYPES, SLOPE_OPTIONS
+from eq_dsp import (
+    ParametricEQEngine,
+    EQBand,
+    FILTER_TYPES,
+    SLOPE_OPTIONS,
+    CHANNEL_MODES,
+    TARGET_OUTPUTS,
+)
+
+
+def style_dark_combobox(combo: QComboBox):
+    """Fuerza a PyQt6 a renderizar la lista desplegable internamente con estética oscura de alto contraste."""
+    list_view = QListView(combo)
+    list_view.setStyleSheet("""
+        QListView {
+            background-color: #181A20;
+            color: #F0F2F5;
+            border: 1px solid #3A3F4B;
+            border-radius: 6px;
+            padding: 4px;
+            outline: none;
+        }
+        QListView::item {
+            padding: 6px 10px;
+            border-radius: 4px;
+            color: #F0F2F5;
+            background-color: transparent;
+        }
+        QListView::item:hover {
+            background-color: #2B303C;
+            color: #FFFFFF;
+        }
+        QListView::item:selected {
+            background-color: #00E5FF;
+            color: #0D0F14;
+            font-weight: bold;
+        }
+    """)
+    combo.setView(list_view)
+    try:
+        combo.view().window().setWindowFlags(
+            Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint | Qt.WindowType.NoDropShadowWindowHint
+        )
+        combo.view().window().setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+    except Exception:
+        pass
 
 
 STUDIO_BAND_COLORS = [
@@ -993,6 +1040,480 @@ class DynThresholdMeter(QWidget):
         painter.drawText(QRectF(0, top_y + bar_h + 15.0, w, 12.0), Qt.AlignmentFlag.AlignCenter, "THR")
 
 
+class CalloutIconButton(QPushButton):
+    """Botón compacto con íconos vectoriales anti-aliased para el callout del nodo estilo Pro-Q 4."""
+
+    def __init__(self, icon_type: str, parent=None):
+        super().__init__(parent)
+        self.icon_type = icon_type
+        self._hovered = False
+        self._color = QColor("#8E95A5")
+        self._active = False
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def setColor(self, color_val, active: bool = False):
+        self._color = QColor(color_val)
+        self._active = bool(active)
+        self.update()
+
+    def enterEvent(self, event):
+        self._hovered = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hovered = False
+        self.update()
+        super().leaveEvent(event)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        w = float(self.width())
+        h = float(self.height())
+        cx = w * 0.5
+        cy = h * 0.5
+
+        if self._hovered:
+            bg = QColor(255, 255, 255, 25)
+            if self.icon_type == "close":
+                bg = QColor(255, 82, 82, 35)
+            elif self.icon_type == "solo":
+                bg = QColor(0, 229, 255, 35)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(bg))
+            painter.drawRoundedRect(QRectF(1.0, 1.0, w - 2.0, h - 2.0), 4.0, 4.0)
+
+        c = self._color if not (self._hovered and self.icon_type == "close") else QColor("#FF5252")
+        if self._hovered and self.icon_type in ("power", "solo", "menu"):
+            c = _brighten_color(c, 0.3)
+
+        if self.icon_type == "power":
+            r = 5.4
+            pen = QPen(c, 1.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawArc(QRectF(cx - r, cy - r + 0.5, 2.0 * r, 2.0 * r), 120 * 16, -300 * 16)
+            painter.drawLine(QPointF(cx, cy - r - 0.5), QPointF(cx, cy + 0.5))
+
+        elif self.icon_type == "solo":
+            pen = QPen(c, 1.5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            r = 5.5
+            painter.drawArc(QRectF(cx - r, cy - r - 0.5, 2.0 * r, 2.0 * r), 0, 180 * 16)
+            pad_w, pad_h = 2.4, 4.5
+            painter.setBrush(QBrush(c))
+            painter.drawRoundedRect(QRectF(cx - r - 0.5, cy - 0.5, pad_w, pad_h), 1.0, 1.0)
+            painter.drawRoundedRect(QRectF(cx + r - pad_w + 0.5, cy - 0.5, pad_w, pad_h), 1.0, 1.0)
+
+        elif self.icon_type == "close":
+            pen = QPen(c, 1.5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+            painter.setPen(pen)
+            d = 3.8
+            painter.drawLine(QPointF(cx - d, cy - d), QPointF(cx + d, cy + d))
+            painter.drawLine(QPointF(cx + d, cy - d), QPointF(cx - d, cy + d))
+
+        elif self.icon_type == "menu":
+            pen = QPen(c, 1.5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            path = QPainterPath()
+            path.moveTo(cx - 3.5, cy - 1.5)
+            path.lineTo(cx, cy + 2.0)
+            path.lineTo(cx + 3.5, cy - 1.5)
+            painter.drawPath(path)
+
+
+class FilterShapeIconWidget(QWidget):
+    """Pinta la silueta vectorial de la forma del filtro de banda."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._filter_type = "Bell"
+        self._color = QColor("#00E5FF")
+
+    def setShape(self, filter_type: str, color_hex: str):
+        self._filter_type = filter_type
+        self._color = QColor(color_hex)
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        w = float(self.width())
+        h = float(self.height())
+        cx = w * 0.5
+        cy = h * 0.5
+
+        pen = QPen(self._color, 1.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+
+        path = QPainterPath()
+        ft = self._filter_type
+        if ft == "Bell":
+            path.moveTo(2.0, cy + 3.0)
+            path.cubicTo(cx - 3.0, cy + 3.0, cx - 2.0, cy - 5.0, cx, cy - 5.0)
+            path.cubicTo(cx + 2.0, cy - 5.0, cx + 3.0, cy + 3.0, w - 2.0, cy + 3.0)
+        elif ft == "Low Shelf":
+            path.moveTo(2.0, cy - 4.0)
+            path.lineTo(cx - 2.0, cy - 4.0)
+            path.cubicTo(cx, cy - 4.0, cx + 1.0, cy + 3.0, cx + 4.0, cy + 3.0)
+            path.lineTo(w - 2.0, cy + 3.0)
+        elif ft == "High Shelf":
+            path.moveTo(2.0, cy + 3.0)
+            path.lineTo(cx - 4.0, cy + 3.0)
+            path.cubicTo(cx - 1.0, cy + 3.0, cx, cy - 4.0, cx + 2.0, cy - 4.0)
+            path.lineTo(w - 2.0, cy - 4.0)
+        elif ft == "Low Cut":
+            path.moveTo(2.0, cy + 5.0)
+            path.cubicTo(cx - 2.0, cy + 4.0, cx, cy - 4.0, w - 2.0, cy - 4.0)
+        elif ft == "High Cut":
+            path.moveTo(2.0, cy - 4.0)
+            path.cubicTo(cx, cy - 4.0, cx + 2.0, cy + 4.0, w - 2.0, cy + 5.0)
+        elif ft == "Notch":
+            path.moveTo(2.0, cy - 4.0)
+            path.lineTo(cx - 3.0, cy - 4.0)
+            path.lineTo(cx, cy + 4.0)
+            path.lineTo(cx + 3.0, cy - 4.0)
+            path.lineTo(w - 2.0, cy - 4.0)
+        else:  # Band Pass
+            path.moveTo(2.0, cy + 4.0)
+            path.lineTo(cx - 2.0, cy - 4.0)
+            path.lineTo(cx + 2.0, cy - 4.0)
+            path.lineTo(w - 2.0, cy + 4.0)
+
+        painter.drawPath(path)
+
+
+FILTER_SHAPE_ICONS = {
+    "Bell": "⋀",
+    "Low Shelf": "⎍",
+    "High Shelf": "⎎",
+    "Low Cut": "╱",
+    "High Cut": "╲",
+    "Notch": "∨",
+    "Band Pass": "⋂",
+}
+
+
+class BandNodeCallout(QWidget):
+    """
+    Menú flotante / callout sobre el nodo activo estilo FabFilter Pro-Q 4:
+    - Dimensiones: 185px de ancho por 82px de alto total (con flecha inferior hacia el nodo).
+    - Fondo oscuro #1A1D24 (alpha=235), borde redondeado de 8px con flecha inferior.
+    - Tipografía clara de 10pt bold.
+    - Controles interactivos:
+      - Arriba a la izquierda: Botón ⏻ (Power de la banda, pintado con band.color).
+      - Centro (3 renglones legibles): Frecuencia (4545.9 Hz), Ganancia (+5.91 dB) y Factor Q (Q: 1.000).
+      - Arriba a la derecha: Botón 🎧 (Isolate de frecuencia) y botón ✕ para borrar la banda.
+      - Abajo: Ícono de forma de filtro, indicador canal/salida (LR/M/S • A/B/A+B) y flecha ⌄ para cambio rápido.
+    """
+
+    def __init__(self, overlay, parent=None):
+        super().__init__(parent)
+        self.overlay = overlay
+        self.setFixedSize(185, 82)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self._band_color = "#00E5FF"
+        self._building = True
+
+        self._opacity_effect = QGraphicsOpacityEffect(self)
+        self._opacity_effect.setOpacity(1.0)
+        self.setGraphicsEffect(self._opacity_effect)
+        self._current_opacity = 1.0
+
+        self.setStyleSheet("""
+            QWidget {
+                background: transparent;
+            }
+            QLabel {
+                background: transparent;
+                border: none;
+            }
+        """)
+
+        # 1. Fila Superior: Power (⏻), Frecuencia (Bold 10pt), Solo (🎧) y Eliminar (✕)
+        self.power_btn = CalloutIconButton("power", self)
+        self.power_btn.setGeometry(7, 5, 22, 22)
+        self.power_btn.setToolTip("Activar / Desactivar banda")
+        self.power_btn.clicked.connect(self._on_power_clicked)
+
+        self.freq_label = QLabel(self)
+        self.freq_label.setGeometry(30, 5, 98, 20)
+        self.freq_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.freq_label.setStyleSheet("color: #FFFFFF; font-family: 'Segoe UI'; font-size: 10pt; font-weight: bold;")
+
+        self.solo_btn = CalloutIconButton("solo", self)
+        self.solo_btn.setGeometry(132, 5, 22, 22)
+        self.solo_btn.setToolTip("Aislar frecuencia (🎧 Isolate)")
+        self.solo_btn.clicked.connect(self._on_solo_clicked)
+
+        self.close_btn = CalloutIconButton("close", self)
+        self.close_btn.setGeometry(156, 5, 22, 22)
+        self.close_btn.setToolTip("Eliminar banda (Supr)")
+        self.close_btn.clicked.connect(self._on_close_clicked)
+
+        # 2. Renglón Medio: Ganancia (Bold 10pt)
+        self.gain_label = QLabel(self)
+        self.gain_label.setGeometry(15, 27, 155, 20)
+        self.gain_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.gain_label.setStyleSheet("color: #ECEFF4; font-family: 'Segoe UI'; font-size: 10pt; font-weight: bold;")
+
+        # 3. Renglón Inferior: Forma, Q (Bold 10pt), Canal/Salida y Flecha ⌄
+        self.shape_icon = FilterShapeIconWidget(self)
+        self.shape_icon.setGeometry(8, 49, 22, 22)
+
+        self.q_label = QLabel(self)
+        self.q_label.setGeometry(32, 50, 68, 20)
+        self.q_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.q_label.setStyleSheet("color: #B0B6C2; font-family: 'Segoe UI'; font-size: 10pt; font-weight: bold;")
+
+        self.mode_badge = QLabel(self)
+        self.mode_badge.setGeometry(100, 52, 58, 17)
+        self.mode_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.mode_badge.setStyleSheet("color: #8C92A4; font-family: 'Segoe UI'; font-size: 8.5pt; font-weight: bold;")
+
+        self.menu_btn = CalloutIconButton("menu", self)
+        self.menu_btn.setGeometry(162, 50, 16, 20)
+        self.menu_btn.setToolTip("Menú rápido de opciones de banda")
+        self.menu_btn.clicked.connect(self._on_menu_clicked)
+
+        self._building = False
+        self.hide()
+
+    def mousePressEvent(self, event):
+        event.accept()
+
+    def mouseDoubleClickEvent(self, event):
+        event.accept()
+
+    def _on_power_clicked(self):
+        idx = self.overlay.selected_band_idx
+        with self.overlay.eq_engine.lock:
+            if 0 <= idx < len(self.overlay.eq_engine.bands):
+                b = self.overlay.eq_engine.bands[idx]
+                new_en = not b.enabled
+            else:
+                return
+        self.overlay._toggle_band_enabled(idx, new_en)
+
+    def _on_solo_clicked(self):
+        idx = self.overlay.selected_band_idx
+        is_cur_iso = (self.overlay.eq_engine.isolated_band_index == idx)
+        self.overlay._toggle_band_solo(idx, not is_cur_iso)
+
+    def _on_close_clicked(self):
+        idx = self.overlay.selected_band_idx
+        self.overlay._delete_band(idx)
+
+    def _on_menu_clicked(self):
+        idx = self.overlay.selected_band_idx
+        pos = self.menu_btn.mapToGlobal(QPoint(0, self.menu_btn.height() + 2))
+        self.overlay._show_node_context_menu(idx, pos)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        w = float(self.width())
+        body_h = 75.0
+        caret_h = 6.0
+        cx = w * 0.5
+
+        body_rect = QRectF(1.0, 1.0, w - 2.0, body_h)
+        path = QPainterPath()
+        path.addRoundedRect(body_rect, 8.0, 8.0)
+
+        caret_path = QPainterPath()
+        caret_path.moveTo(cx - 7.0, body_h)
+        caret_path.lineTo(cx, body_h + caret_h)
+        caret_path.lineTo(cx + 7.0, body_h)
+        caret_path.closeSubpath()
+
+        full_path = path.united(caret_path)
+
+        # Fondo oscuro #1A1D24 con alpha=235
+        painter.fillPath(full_path, QBrush(QColor(26, 29, 36, 235)))
+
+        # Resplandor exterior sutil del color de la banda
+        glow_c = QColor(self._band_color)
+        glow_c.setAlpha(45)
+        painter.setPen(QPen(glow_c, 3.0))
+        painter.drawPath(full_path)
+
+        # Borde redondeado nítido
+        border_c = QColor(self._band_color)
+        border_c.setAlpha(180)
+        painter.setPen(QPen(border_c, 1.2))
+        painter.drawPath(full_path)
+
+    def update_callout(self):
+        if self._building:
+            return
+        idx = self.overlay.selected_band_idx
+        with self.overlay.eq_engine.lock:
+            bands = self.overlay.eq_engine.bands
+            if not (0 <= idx < len(bands)):
+                self.hide()
+                return
+            b = bands[idx]
+            freq = b.freq
+            gain = b.gain_db
+            q = b.q
+            enabled = b.enabled
+            color = b.color
+            ftype = b.filter_type
+            cm = b.channel_mode
+            to_val = b.target_output
+            supports_gain = b.supports_gain
+            is_iso = bool(b.solo or self.overlay.eq_engine.isolated_band_index == idx)
+
+        self._band_color = color
+
+        # Frecuencia
+        if freq >= 10000.0:
+            self.freq_label.setText(f"{freq / 1000.0:.2f} kHz")
+        elif freq >= 1000.0:
+            self.freq_label.setText(f"{freq / 1000.0:.2f} kHz")
+        else:
+            self.freq_label.setText(f"{freq:.1f} Hz")
+
+        # Ganancia
+        if supports_gain:
+            self.gain_label.setText(f"{gain:+.2f} dB")
+        else:
+            self.gain_label.setText("0.00 dB")
+
+        # Q
+        self.q_label.setText(f"Q: {q:.3f}")
+
+        # Silueta vectorial de la forma de filtro
+        self.shape_icon.setShape(ftype, color)
+
+        # Indicador Modo de Canal y Salida
+        ch_short = {"LR": "LR", "L": "L", "R": "R", "Mid": "M", "Side": "S"}.get(cm, cm)
+        to_short = {"A+B": "A+B", "A": "A", "B": "B"}.get(to_val, to_val)
+        self.mode_badge.setText(f"{ch_short} | {to_short}")
+
+        # Botones vectoriales
+        p_c = color if enabled else "#686C75"
+        self.power_btn.setColor(p_c)
+        self.solo_btn.setColor("#00E5FF" if is_iso else "#8E95A5", active=is_iso)
+        self.close_btn.setColor("#8E95A5")
+        self.menu_btn.setColor("#8E95A5")
+
+        self.reposition()
+        self.show()
+        self.raise_()
+        self.update()
+
+    def set_callout_opacity(self, op: float):
+        self._current_opacity = float(np.clip(op, 0.0, 1.0))
+        if hasattr(self, "_opacity_effect"):
+            self._opacity_effect.setOpacity(self._current_opacity)
+
+    def show_callout(self):
+        self.set_callout_opacity(1.0)
+        self.update_callout()
+        self.show()
+        self.raise_()
+
+    def reposition(self):
+        idx = self.overlay.selected_band_idx
+        with self.overlay.eq_engine.lock:
+            bands = self.overlay.eq_engine.bands
+            if not (0 <= idx < len(bands)):
+                self.hide()
+                return
+            b = bands[idx]
+            vx = self.overlay.freq_to_x(b.freq)
+            vy = self.overlay._band_node_y(b)
+
+        scene_pt = self.overlay.eq_vb.mapViewToScene(QPointF(vx, vy))
+        view_pt = self.overlay.plot_widget.mapFromScene(scene_pt)
+
+        w = self.width()
+        h = self.height()
+        target_x = int(view_pt.x() - w * 0.5)
+        # Flecha inferior apoyada 9px sobre el centro del nodo de la banda
+        target_y = int(view_pt.y() - h - 9)
+
+        pw = self.overlay.plot_widget
+        clamped_x = max(10, min(pw.width() - w - 10, target_x))
+        if target_y < 46:
+            target_y = int(view_pt.y() + 18)
+
+        self.move(clamped_x, target_y)
+
+
+class GhostCurveItem(pg.GraphicsObject):
+    """
+    Ítem gráfico para la curva propuesta con degradado horizontal y bordes transparentes.
+    Dibuja su trazo mediante QPainter estándar para soportar QLinearGradient en el QPen
+    sin depender de OpenGL ni generar artefactos visuales.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.path = QPainterPath()
+        self.bounds = QRectF()
+        self.pen = QPen(Qt.PenStyle.NoPen)
+        self._is_visible = False
+
+    def boundingRect(self) -> QRectF:
+        return self.bounds
+
+    def setData(self, x, y, pen: QPen | None = None):
+        if len(x) < 2:
+            self.clear()
+            return
+
+        new_path = QPainterPath()
+        new_path.moveTo(float(x[0]), float(y[0]))
+        for xi, yi in zip(x[1:], y[1:]):
+            new_path.lineTo(float(xi), float(yi))
+
+        self.prepareGeometryChange()
+        self.path = new_path
+        if pen is not None:
+            pen.setCosmetic(True)
+            self.pen = pen
+        elif self.pen.style() == Qt.PenStyle.NoPen:
+            default_pen = QPen(QColor(245, 195, 85, 140), 1.6)
+            default_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            default_pen.setCosmetic(True)
+            self.pen = default_pen
+        else:
+            self.pen.setCosmetic(True)
+        self.bounds = new_path.boundingRect().adjusted(-0.5, -2.0, 0.5, 2.0)
+        self._is_visible = True
+        self.update()
+
+    def clear(self):
+        if self._is_visible or not self.path.isEmpty():
+            self.prepareGeometryChange()
+            self.path = QPainterPath()
+            self.bounds = QRectF()
+            self.pen = QPen(Qt.PenStyle.NoPen)
+            self._is_visible = False
+            self.update()
+
+    def isVisible(self) -> bool:
+        return self._is_visible
+
+    def paint(self, painter: QPainter, option, widget=None):
+        if not self._is_visible or self.path.isEmpty() or self.pen.style() == Qt.PenStyle.NoPen:
+            return
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(self.pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawPath(self.path)
+        painter.restore()
+
+
 class ProQ4Overlay(QWidget):
     """
     Capa visual interactiva estilo FabFilter Pro-Q 4 Full-Bleed:
@@ -1007,6 +1528,7 @@ class ProQ4Overlay(QWidget):
 
     def __init__(self, plot_widget: pg.PlotWidget, eq_engine: ParametricEQEngine, parent=None):
         super().__init__(parent)
+        self.hud_container = parent
         self.plot_widget = plot_widget
         self._viewport = plot_widget.viewport()
         self.plot_item = plot_widget.getPlotItem()
@@ -1025,9 +1547,28 @@ class ProQ4Overlay(QWidget):
         self._last_rendered_version = -1
         self._was_dyn_moving = False
 
+        # Variables para control y animación de la curva propuesta (Ghost Curve)
+        self._last_ghost_mouse_pos = QPoint(-9999, -9999)
+        self._current_ghost_mouse_pos = QPoint(-9999, -9999)
+        self._current_ghost_scene_pos = QPointF(-9999, -9999)
+        self._last_mouse_move_time = time.perf_counter()
+        self._mouse_velocity_px = 0.0
+        self._ghost_still_since = time.perf_counter()
+        self._ghost_unlocked = False
+        self._ghost_fade = 0.0
+        self._ghost_log_f = 3.0
+        self._ghost_db = 0.0
+        self._ghost_has_pos = False
+        self._proposed_band = None
+
+        # Variables para auto-cierre del menú de nodo por distancia (> 55px por > 0.3s)
+        self._callout_away_since = None
+
         self._rebuild_eval_freqs()
         self._init_secondary_viewbox()
         self._init_curves_and_nodes()
+
+        self.node_callout = BandNodeCallout(self, self.plot_widget)
 
         self._viewport.installEventFilter(self)
         self._viewport.setMouseTracking(True)
@@ -1094,29 +1635,49 @@ class ProQ4Overlay(QWidget):
     def _update_vb_geometry(self):
         self.eq_vb.setGeometry(self.plot_item.vb.sceneBoundingRect())
         self.eq_vb.linkedViewChanged(self.plot_item.vb, self.eq_vb.XAxis)
+        if hasattr(self, "node_callout"):
+            self.node_callout.reposition()
 
     def _init_curves_and_nodes(self):
         self.zero_line = pg.PlotDataItem(
-            pen=pg.mkPen(color=(255, 255, 255, 42), width=1.0)
+            pen=pg.mkPen(color=(255, 255, 255, 40), width=1.0)
         )
         self.zero_line.setZValue(5)
         self.eq_vb.addItem(self.zero_line)
+
+        # Curva fantasma preliminar ("Ghost Preview Curve") con degradado horizontal y bordes transparentes
+        self.ghost_curve = GhostCurveItem()
+        self.ghost_curve.setZValue(12)
+        self.eq_vb.addItem(self.ghost_curve)
+        self._proposed_band = None
 
         self.band_fill_curves: list[pg.PlotDataItem] = []
         self.band_dyn_curves: list[pg.PlotDataItem] = []
         self.band_dyn_fills: list[pg.FillBetweenItem] = []
 
         self.dyn_limit_curve = pg.PlotDataItem(
-            pen=pg.mkPen(color=(0, 229, 255, 175), width=1.4, style=Qt.PenStyle.DotLine)
+            pen=pg.mkPen(color=(0, 229, 255, 175), width=1.4, style=Qt.PenStyle.DotLine),
+            connect='finite',
         )
         self.dyn_limit_curve.setZValue(18)
         self.eq_vb.addItem(self.dyn_limit_curve)
 
+        # Curva Maestra EQ Salida A (1-2) en dorado (#FFD54F)
         self.static_master_curve = pg.PlotDataItem(
-            pen=pg.mkPen(color="#FFD54F", width=2.2)
+            pen=pg.mkPen(color="#FFD54F", width=2.2),
+            connect='finite',
         )
         self.static_master_curve.setZValue(20)
         self.eq_vb.addItem(self.static_master_curve)
+
+        # Curva Maestra EQ Salida B (3-4) en cian eléctrico (#00E5FF)
+        self.static_bus_b_curve = pg.PlotDataItem(
+            pen=pg.mkPen(color="#00E5FF", width=2.0, style=Qt.PenStyle.DashLine),
+            connect='finite',
+        )
+        self.static_bus_b_curve.setZValue(21)
+        self.eq_vb.addItem(self.static_bus_b_curve)
+        self._alt_isolate_dragging = False
 
         self.dyn_nodes_scatter = pg.ScatterPlotItem(size=22, pxMode=True)
         self.dyn_nodes_scatter.setZValue(35)
@@ -1132,6 +1693,302 @@ class ProQ4Overlay(QWidget):
         self.floating_tooltip.setZValue(100)
         self.eq_vb.addItem(self.floating_tooltip)
         self.floating_tooltip.hide()
+
+    def _clear_ghost_curve(self):
+        self._ghost_unlocked = False
+        self._ghost_still_since = time.perf_counter()
+        self._ghost_fade = 0.0
+        self._ghost_has_pos = False
+        if hasattr(self, "ghost_curve"):
+            self.ghost_curve.clear()
+
+    def _update_proposed_band_info(self, scene_pos: QPointF):
+        rect = self.plot_item.vb.sceneBoundingRect()
+        if not rect.contains(scene_pos):
+            self._proposed_band = None
+            return
+
+        hit_idx = self._find_band_near_scene_pos(scene_pos, max_dist_px=22.0)
+        if hit_idx >= 0:
+            self._proposed_band = None
+            return
+
+        view_pt = self.eq_vb.mapSceneToView(scene_pos)
+        f_cursor = self.x_to_freq(view_pt.x())
+        db_cursor = float(np.clip(view_pt.y(), -24.0, 24.0))
+
+        if f_cursor < 45.0:
+            hypo_type = "Low Cut" if abs(db_cursor) < 3.0 else "Low Shelf"
+            hypo_q = 0.707
+        elif f_cursor > 10000.0:
+            hypo_type = "High Cut" if abs(db_cursor) < 3.0 else "High Shelf"
+            hypo_q = 0.707
+        else:
+            hypo_type = "Notch" if db_cursor < -10.0 else "Bell"
+            hypo_q = 1.0
+
+        self._proposed_band = {
+            "type": hypo_type,
+            "freq": f_cursor,
+            "gain": db_cursor,
+            "q": hypo_q,
+        }
+
+    def _render_ghost_curve(self, scene_pos: QPointF):
+        self.update_ghost_tick()
+
+    def _update_ghost_curve(self, scene_pos: QPointF, local_pt: QPoint):
+        """Método de actualización forzada directa (usado en tests y previews)."""
+        self._current_ghost_scene_pos = scene_pos
+        self._current_ghost_mouse_pos = local_pt
+        view_pt = self.eq_vb.mapSceneToView(scene_pos)
+        target_f = self.x_to_freq(view_pt.x())
+        self._ghost_log_f = float(np.log10(target_f)) if self.is_x_log else target_f
+        self._ghost_db = float(np.clip(view_pt.y(), -24.0, 24.0))
+        self._ghost_has_pos = True
+        self._ghost_unlocked = True
+        self._ghost_still_since = time.perf_counter() - 2.0
+        self._ghost_fade = 1.0
+        self._last_mouse_move_time = time.perf_counter() - 1.0
+        self._mouse_velocity_px = 0.0
+        self.update_ghost_tick()
+
+    def update_ghost_tick(self):
+        # --- 1. ZONA SEGURA AMPLIA PARA EL MENÚ DE NODO (Nodo + Callout + Margen 45px) ---
+        if hasattr(self, "node_callout") and self.node_callout.isVisible():
+            node_pt = None
+            with self.eq_engine.lock:
+                bands = self.eq_engine.bands
+                idx = self.selected_band_idx
+                if 0 <= idx < len(bands):
+                    b = bands[idx]
+                    vx = self.freq_to_x(b.freq)
+                    vy = self._band_node_y(b)
+                    scene_pt = self.eq_vb.mapViewToScene(QPointF(vx, vy))
+                    node_pt = self.plot_widget.mapFromScene(scene_pt)
+
+            if node_pt is not None:
+                # Unión Geométrica: círculo del nodo (radio 35px) + rectángulo del callout + margen 45px
+                node_rect = QRectF(node_pt.x() - 35.0, node_pt.y() - 35.0, 70.0, 70.0)
+                callout_rect = QRectF(self.node_callout.geometry())
+                combined_rect = callout_rect.united(node_rect)
+                safe_zone_rect = combined_rect.adjusted(-45.0, -45.0, 45.0, 45.0)
+
+                # Comprobar si el cursor está dentro de safe_zone_rect
+                inside_safe = False
+                cursor_pt = self._current_ghost_mouse_pos
+                if cursor_pt.x() > -9000 and safe_zone_rect.contains(QPointF(cursor_pt)):
+                    inside_safe = True
+
+                if not inside_safe:
+                    try:
+                        global_pos = QCursor.pos()
+                        widget_cursor = QPointF(self.plot_widget.mapFromGlobal(global_pos))
+                        if safe_zone_rect.contains(widget_cursor):
+                            inside_safe = True
+                    except Exception:
+                        pass
+
+                # Condición de Permanencia
+                if inside_safe:
+                    self._callout_away_since = None
+                    if self.node_callout._current_opacity < 1.0:
+                        self.node_callout.set_callout_opacity(1.0)
+                else:
+                    if self._callout_away_since is None:
+                        self._callout_away_since = time.perf_counter()
+                    elapsed = time.perf_counter() - self._callout_away_since
+                    if elapsed >= 0.35:
+                        new_op = max(0.0, self.node_callout._current_opacity - 0.14)
+                        self.node_callout.set_callout_opacity(new_op)
+                        if new_op <= 0.0:
+                            self.node_callout.hide()
+                            self._callout_away_since = None
+            else:
+                self.node_callout.hide()
+                self._callout_away_since = None
+
+        # --- 2. GHOST CURVE ANIMATION & 2-PHASE STATE MACHINE ---
+        if self.dragging_band_idx >= 0:
+            if self._ghost_fade > 0.0 or self.ghost_curve.isVisible():
+                self._clear_ghost_curve()
+            return
+
+        scene_pos = self._current_ghost_scene_pos
+        local_pt = self._current_ghost_mouse_pos
+
+        rect = self.plot_item.vb.sceneBoundingRect()
+        invalid_zone = False
+
+        if not rect.contains(scene_pos):
+            invalid_zone = True
+        else:
+            hit_idx = self._find_band_near_scene_pos(scene_pos, max_dist_px=22.0)
+            if hit_idx >= 0:
+                invalid_zone = True
+            elif hasattr(self, "hud_container") and self.hud_container is not None:
+                hud = getattr(self.hud_container, "floating_hud", None)
+                if hud is not None and hud.isVisible() and hud.geometry().contains(local_pt):
+                    invalid_zone = True
+                top_bar = getattr(self.hud_container, "top_bar", None)
+                if top_bar is not None and top_bar.isVisible() and top_bar.geometry().contains(local_pt):
+                    invalid_zone = True
+            if not invalid_zone and hasattr(self, "node_callout") and self.node_callout.isVisible() and self.node_callout.geometry().contains(local_pt):
+                invalid_zone = True
+
+        if invalid_zone:
+            if self._ghost_unlocked:
+                self._ghost_fade = max(0.0, self._ghost_fade - 0.12)
+                if self._ghost_fade <= 0.01:
+                    self._ghost_unlocked = False
+                    self._ghost_fade = 0.0
+                    self._ghost_still_since = time.perf_counter()
+                    if hasattr(self, "ghost_curve") and self.ghost_curve.isVisible():
+                        self.ghost_curve.clear()
+                    return
+            else:
+                self._ghost_still_since = time.perf_counter()
+                self._ghost_fade = 0.0
+                if hasattr(self, "ghost_curve") and self.ghost_curve.isVisible():
+                    self.ghost_curve.clear()
+                return
+
+        # Coordenadas destino de cursor
+        view_pt = self.eq_vb.mapSceneToView(scene_pos)
+        target_f = self.x_to_freq(view_pt.x())
+        target_log_f = float(np.log10(target_f)) if self.is_x_log else target_f
+        target_db = float(np.clip(view_pt.y(), -24.0, 24.0))
+
+        # Detección de velocidad efectiva del mouse
+        time_since_move = time.perf_counter() - self._last_mouse_move_time
+        if time_since_move > 0.07:
+            v = 0.0
+        else:
+            v = self._mouse_velocity_px
+
+        # Máquina de estados de 2 fases
+        if not self._ghost_unlocked:
+            # Fase 1: Estado Oculto (self._ghost_unlocked == False)
+            self._ghost_fade = 0.0
+            if v > 2.5:
+                self._ghost_still_since = time.perf_counter()
+
+            elapsed_still = time.perf_counter() - self._ghost_still_since
+            if elapsed_still >= 1.0:
+                # Condición de Activación: 1.0 segundo continuo quieto (v <= 2.5)
+                self._ghost_unlocked = True
+                self._ghost_log_f = target_log_f
+                self._ghost_db = target_db
+                self._ghost_has_pos = True
+                self._ghost_fade = 0.06
+            else:
+                if hasattr(self, "ghost_curve") and self.ghost_curve.isVisible():
+                    self.ghost_curve.clear()
+                return
+        else:
+            # Fase 2: Estado Visible / Activo (self._ghost_unlocked == True)
+            if v <= 2.0:
+                # Si permanece quieto (v <= 2.0): fade-in suave hasta 1.0
+                self._ghost_fade = min(1.0, self._ghost_fade + 0.06)
+                lerp_speed = 0.28
+                self._ghost_log_f += (target_log_f - self._ghost_log_f) * lerp_speed
+                self._ghost_db += (target_db - self._ghost_db) * lerp_speed
+            elif 2.0 < v <= 14.0:
+                # Si mueve el cursor lentamente (2.0 < v <= 14.0): permanece a media opacidad (~0.40) y migra suavemente
+                target_crawl = 0.40
+                if self._ghost_fade > target_crawl:
+                    self._ghost_fade = max(target_crawl, self._ghost_fade - 0.05)
+                else:
+                    self._ghost_fade = min(target_crawl, self._ghost_fade + 0.05)
+                lerp_speed = min(0.42, 0.26 + 0.008 * v)
+                self._ghost_log_f += (target_log_f - self._ghost_log_f) * lerp_speed
+                self._ghost_db += (target_db - self._ghost_db) * lerp_speed
+            else:
+                # Movimiento rápido (v > 14.0): reduce la opacidad rápidamente
+                self._ghost_fade = max(0.0, self._ghost_fade - 0.12)
+                if self._ghost_fade <= 0.01:
+                    self._ghost_unlocked = False
+                    self._ghost_fade = 0.0
+                    self._ghost_still_since = time.perf_counter()
+                    if hasattr(self, "ghost_curve") and self.ghost_curve.isVisible():
+                        self.ghost_curve.clear()
+                    return
+                else:
+                    lerp_speed = 0.35
+                    self._ghost_log_f += (target_log_f - self._ghost_log_f) * lerp_speed
+                    self._ghost_db += (target_db - self._ghost_db) * lerp_speed
+
+        if self._ghost_fade <= 0.005:
+            if hasattr(self, "ghost_curve") and self.ghost_curve.isVisible():
+                self.ghost_curve.clear()
+            return
+
+        # Renderizar usando coordenadas suavizadas
+        current_f = float(10.0 ** self._ghost_log_f) if self.is_x_log else float(self._ghost_log_f)
+        current_f = float(np.clip(current_f, 10.0, self.nyquist * 0.99))
+        current_db = float(np.clip(self._ghost_db, -24.0, 24.0))
+
+        if current_f < 45.0:
+            hypo_type = "Low Cut" if abs(current_db) < 3.0 else "Low Shelf"
+            hypo_q = 0.707
+        elif current_f > 10000.0:
+            hypo_type = "High Cut" if abs(current_db) < 3.0 else "High Shelf"
+            hypo_q = 0.707
+        else:
+            hypo_type = "Notch" if current_db < -10.0 else "Bell"
+            hypo_q = 1.0
+
+        self._proposed_band = {
+            "type": hypo_type,
+            "freq": current_f,
+            "gain": current_db,
+            "q": hypo_q,
+        }
+
+        temp_b = EQBand(
+            filter_type=hypo_type,
+            freq=current_f,
+            gain_db=current_db,
+            q=hypo_q,
+            sr=self.eq_engine.sr,
+        )
+        clip_lim = max(36.0, self._effective_eq_vb_limit() * 1.15)
+        resp = np.clip(temp_b.get_static_freq_response_db(self.eval_z1, self.eval_z2), -clip_lim, clip_lim)
+
+        if self.is_x_log:
+            u_c = (self._ghost_log_f - np.log10(10.0)) / (np.log10(self.nyquist) - np.log10(10.0))
+            x_min_view = float(np.log10(10.0))
+            x_max_view = float(np.log10(self.nyquist))
+        else:
+            u_c = current_f / self.nyquist
+            x_min_view = 0.0
+            x_max_view = float(self.nyquist)
+
+        u_c = float(np.clip(u_c, 0.05, 0.95))
+
+        peak_alpha = int(145 * self._ghost_fade)
+        mid_alpha = int(45 * self._ghost_fade)
+
+        grad = QLinearGradient(x_min_view, 0.0, x_max_view, 0.0)
+        s1 = float(np.clip(u_c - 0.28, 0.005, 0.95))
+        s2 = float(np.clip(u_c - 0.10, s1 + 0.005, 0.96))
+        s3 = float(np.clip(u_c, s2 + 0.005, 0.97))
+        s4 = float(np.clip(u_c + 0.10, s3 + 0.005, 0.98))
+        s5 = float(np.clip(u_c + 0.28, s4 + 0.005, 0.99))
+
+        grad.setColorAt(0.00, QColor(180, 180, 190, 0))
+        grad.setColorAt(s1, QColor(180, 180, 190, 0))
+        grad.setColorAt(s2, QColor(200, 200, 210, mid_alpha))
+        grad.setColorAt(s3, QColor(245, 195, 85, peak_alpha))
+        grad.setColorAt(s4, QColor(200, 200, 210, mid_alpha))
+        grad.setColorAt(s5, QColor(180, 180, 190, 0))
+        grad.setColorAt(1.00, QColor(180, 180, 190, 0))
+
+        pen = QPen(QBrush(grad), 1.6)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setCosmetic(True)
+
+        self.ghost_curve.setData(self.eval_x, resp, pen)
 
     def set_axes_mode(self, is_x_log: bool, sr: float):
         self.is_x_log = bool(is_x_log)
@@ -1179,7 +2036,8 @@ class ProQ4Overlay(QWidget):
 
         if etype == QEvent.Type.MouseButtonDblClick:
             if event.button() == Qt.MouseButton.LeftButton:
-                scene_pos = self.plot_widget.mapToScene(event.position().toPoint())
+                pos_pt = event.position().toPoint()
+                scene_pos = self.plot_widget.mapToScene(pos_pt)
                 if not self.plot_item.vb.sceneBoundingRect().contains(scene_pos):
                     return False
 
@@ -1196,20 +2054,34 @@ class ProQ4Overlay(QWidget):
                     self.update_eq_curves(force=True)
                     return True
                 else:
-                    view_pt = self.eq_vb.mapSceneToView(scene_pos)
-                    freq = self.x_to_freq(view_pt.x())
-                    gain_db = float(np.clip(view_pt.y(), -24.0, 24.0))
-                    self.eq_engine.add_band(freq=freq, gain_db=gain_db, q=1.2)
+                    if self._proposed_band is not None:
+                        p_type = self._proposed_band["type"]
+                        p_freq = self._proposed_band["freq"]
+                        p_gain = self._proposed_band["gain"]
+                        p_q = self._proposed_band["q"]
+                    else:
+                        view_pt = self.eq_vb.mapSceneToView(scene_pos)
+                        p_freq = self.x_to_freq(view_pt.x())
+                        p_gain = float(np.clip(view_pt.y(), -24.0, 24.0))
+                        p_type = "Bell"
+                        p_q = 1.0
+
+                    self._clear_ghost_curve()
+                    self.eq_engine.add_band(freq=p_freq, gain_db=p_gain, q=p_q, filter_type=p_type)
                     new_idx = len(self.eq_engine.bands) - 1
                     self.selected_band_idx = new_idx
                     self.dragging_band_idx = new_idx
                     self.band_selected.emit(new_idx)
                     self.band_modified.emit()
                     self.update_eq_curves(force=True)
+                    if hasattr(self, "node_callout"):
+                        self.node_callout.show_callout()
                     return True
 
         elif etype == QEvent.Type.MouseButtonPress:
-            scene_pos = self.plot_widget.mapToScene(event.position().toPoint())
+            pos_pt = event.position().toPoint()
+            scene_pos = self.plot_widget.mapToScene(pos_pt)
+            self._clear_ghost_curve()
             if not self.plot_item.vb.sceneBoundingRect().contains(scene_pos):
                 return False
 
@@ -1220,10 +2092,19 @@ class ProQ4Overlay(QWidget):
                     self.dragging_band_idx = hit_idx
                     with self.eq_engine.lock:
                         self._drag_start_q = self.eq_engine.bands[hit_idx].q
+                    if event.modifiers() & Qt.KeyboardModifier.AltModifier:
+                        self._alt_isolate_dragging = True
+                        self.eq_engine.set_isolated_band(hit_idx)
                     self._drag_start_scene_y = scene_pos.y()
                     self.band_selected.emit(hit_idx)
                     self.update_eq_curves(force=True)
+                    if hasattr(self, "node_callout"):
+                        self.node_callout.show_callout()
                     return True
+                else:
+                    if hasattr(self, "node_callout") and self.node_callout.isVisible():
+                        self.node_callout.hide()
+                        self._callout_away_since = None
             elif event.button() == Qt.MouseButton.RightButton:
                 if hit_idx >= 0:
                     self.selected_band_idx = hit_idx
@@ -1232,8 +2113,27 @@ class ProQ4Overlay(QWidget):
                     return True
 
         elif etype == QEvent.Type.MouseMove:
-            scene_pos = self.plot_widget.mapToScene(event.position().toPoint())
+            pos_pt = event.position().toPoint()
+            scene_pos = self.plot_widget.mapToScene(pos_pt)
+
+            # Medición de velocidad del cursor en px/frame
+            if self._last_ghost_mouse_pos.x() > -9000:
+                dx = pos_pt.x() - self._last_ghost_mouse_pos.x()
+                dy = pos_pt.y() - self._last_ghost_mouse_pos.y()
+                self._mouse_velocity_px = math.hypot(dx, dy)
+            else:
+                self._mouse_velocity_px = 0.0
+
+            if self._mouse_velocity_px > 2.5:
+                self._ghost_still_since = time.perf_counter()
+
+            self._last_ghost_mouse_pos = pos_pt
+            self._last_mouse_move_time = time.perf_counter()
+            self._current_ghost_mouse_pos = pos_pt
+            self._current_ghost_scene_pos = scene_pos
+
             if self.dragging_band_idx >= 0:
+                self._clear_ghost_curve()
                 view_pt = self.eq_vb.mapSceneToView(scene_pos)
                 new_freq = self.x_to_freq(view_pt.x())
                 new_gain = float(np.clip(view_pt.y(), -24.0, 24.0))
@@ -1252,6 +2152,8 @@ class ProQ4Overlay(QWidget):
 
                 self.band_modified.emit()
                 self.update_eq_curves(force=True)
+                if hasattr(self, "node_callout"):
+                    self.node_callout.reposition()
                 return True
             else:
                 hit_idx = self._find_band_near_scene_pos(scene_pos)
@@ -1263,9 +2165,24 @@ class ProQ4Overlay(QWidget):
                         self._viewport.setCursor(Qt.CursorShape.CrossCursor)
                     self.update_eq_curves(force=True)
 
+                if hit_idx < 0:
+                    self._update_proposed_band_info(scene_pos)
+                else:
+                    self._proposed_band = None
+                    self._clear_ghost_curve()
+
+        elif etype == QEvent.Type.Leave:
+            self._current_ghost_mouse_pos = QPoint(-9999, -9999)
+            self._current_ghost_scene_pos = QPointF(-9999, -9999)
+            self._clear_ghost_curve()
+
         elif etype == QEvent.Type.MouseButtonRelease:
             if event.button() == Qt.MouseButton.LeftButton and self.dragging_band_idx >= 0:
                 self.dragging_band_idx = -1
+                if self._alt_isolate_dragging:
+                    self._alt_isolate_dragging = False
+                    self.eq_engine.set_isolated_band(None)
+                    self.band_modified.emit()
                 self.update_eq_curves(force=True)
                 return True
 
@@ -1325,9 +2242,9 @@ class ProQ4Overlay(QWidget):
         act_dyn.setChecked(band.dyn_enabled)
         act_dyn.triggered.connect(lambda checked: self._toggle_band_dyn(band_idx, checked))
 
-        act_solo = menu.addAction("🎧 Solo Banda")
+        act_solo = menu.addAction("🎧 Isolate (Solo de Frecuencia)")
         act_solo.setCheckable(True)
-        act_solo.setChecked(band.solo)
+        act_solo.setChecked(band.solo or self.eq_engine.isolated_band_index == band_idx)
         act_solo.triggered.connect(lambda checked: self._toggle_band_solo(band_idx, checked))
 
         menu.addSeparator()
@@ -1345,6 +2262,32 @@ class ProQ4Overlay(QWidget):
                 act_s.setCheckable(True)
                 act_s.setChecked(band.slope == s)
                 act_s.triggered.connect(lambda _=False, val=s: self._set_band_slope(band_idx, val))
+
+        ch_menu = menu.addMenu("Modo de Canal (LR / L / R / Mid / Side)")
+        ch_labels = {
+            "LR": "Stereo (LR)",
+            "L": "Left (L)",
+            "R": "Right (R)",
+            "Mid": "Mid (M)",
+            "Side": "Side (S)",
+        }
+        for cm in CHANNEL_MODES:
+            act_cm = ch_menu.addAction(ch_labels.get(cm, cm))
+            act_cm.setCheckable(True)
+            act_cm.setChecked(band.channel_mode == cm)
+            act_cm.triggered.connect(lambda _=False, val=cm: self._set_band_channel_mode(band_idx, val))
+
+        out_menu = menu.addMenu("Bus de Salida (Out A / Out B)")
+        out_labels = {
+            "A+B": "A+B (Ambas Salidas 1-4)",
+            "A": "Solo Salida A (Canales 1-2)",
+            "B": "Solo Salida B (Canales 3-4)",
+        }
+        for to_val in TARGET_OUTPUTS:
+            act_to = out_menu.addAction(out_labels.get(to_val, to_val))
+            act_to.setCheckable(True)
+            act_to.setChecked(band.target_output == to_val)
+            act_to.triggered.connect(lambda _=False, val=to_val: self._set_band_target_output(band_idx, val))
 
         color_menu = menu.addMenu("🎨 Color de Banda")
         for label, hex_val in STUDIO_BAND_COLORS:
@@ -1413,10 +2356,29 @@ class ProQ4Overlay(QWidget):
         self.update_eq_curves(force=True)
 
     def _toggle_band_solo(self, idx: int, checked: bool):
+        self.eq_engine.set_isolated_band(idx if checked else None)
+        self.band_modified.emit()
+        self.update_eq_curves(force=True)
+
+    def _set_band_channel_mode(self, idx: int, mode: str):
         with self.eq_engine.lock:
-            if 0 <= idx < len(self.eq_engine.bands):
-                self.eq_engine.bands[idx].solo = checked
-                self.eq_engine.mark_dirty()
+            if 0 <= idx < len(self.eq_engine.bands) and mode in CHANNEL_MODES:
+                b = self.eq_engine.bands[idx]
+                if b.channel_mode != mode:
+                    b.channel_mode = mode
+                    b.reset_state()
+                    self.eq_engine.mark_dirty()
+        self.band_modified.emit()
+        self.update_eq_curves(force=True)
+
+    def _set_band_target_output(self, idx: int, target_out: str):
+        with self.eq_engine.lock:
+            if 0 <= idx < len(self.eq_engine.bands) and target_out in TARGET_OUTPUTS:
+                b = self.eq_engine.bands[idx]
+                if b.target_output != target_out:
+                    b.target_output = target_out
+                    b.reset_state()
+                    self.eq_engine.mark_dirty()
         self.band_modified.emit()
         self.update_eq_curves(force=True)
 
@@ -1505,14 +2467,22 @@ class ProQ4Overlay(QWidget):
                 resp_static = np.clip(b.get_static_freq_response_db(z1, z2), -clip_lim, clip_lim)
                 c = QColor(b.color)
 
-                if is_sel or abs(b.gain_db) > 0.08 or not b.supports_gain or b.is_dynamic_active:
-                    pen_alpha = 210 if is_sel else (120 if b.enabled else 50)
-                    fill_alpha = 48 if is_sel else (22 if b.enabled else 10)
-                    st_curve.setPen(pg.mkPen(color=(c.red(), c.green(), c.blue(), pen_alpha), width=1.5 if is_sel else 1.0))
+                is_active = is_sel or abs(b.gain_db) > 0.05 or not b.supports_gain or b.is_dynamic_active
+
+                if is_active:
+                    pen_alpha = 220 if is_sel else (140 if b.enabled else 60)
+                    fill_alpha = 48 if is_sel else (24 if b.enabled else 10)
+                    pen_w = 2.0 if is_sel else 1.4
+                    st_curve.setPen(pg.mkPen(color=(c.red(), c.green(), c.blue(), pen_alpha), width=pen_w))
                     st_curve.setBrush(pg.mkBrush(c.red(), c.green(), c.blue(), fill_alpha))
-                    st_curve.setData(x, resp_static)
                 else:
-                    st_curve.setData([], [])
+                    # Inactiva (0 dB): trazo muy delgado (1.0px) y opacidad extremadamente baja (alpha=40)
+                    pen_alpha = 40 if b.enabled else 20
+                    st_curve.setPen(pg.mkPen(color=(c.red(), c.green(), c.blue(), pen_alpha), width=1.0))
+                    st_curve.setBrush(pg.mkBrush(0, 0, 0, 0))
+
+                # Curva 100% continua de punta a punta (sin recortes ni np.nan)
+                st_curve.setData(x, resp_static)
 
                 if b.enabled and b.is_dynamic_active and abs(b.current_dyn_offset_db) > 0.02 and not self.eq_engine.bypass:
                     resp_dyn = np.clip(b.get_dynamic_freq_response_db(z1, z2), -clip_lim, clip_lim)
@@ -1530,15 +2500,37 @@ class ProQ4Overlay(QWidget):
                     sel_c = _brighten_color(sel_band.color, 0.15)
                     sel_c.setAlpha(185)
                     self.dyn_limit_curve.setPen(pg.mkPen(color=sel_c, width=1.4, style=Qt.PenStyle.DotLine))
-                    max_dyn_resp = sel_band.get_max_dynamic_freq_response_db(z1, z2)
-                    self.dyn_limit_curve.setData(x, np.clip(max_dyn_resp, -clip_lim, clip_lim))
+                    max_dyn_resp = np.clip(sel_band.get_max_dynamic_freq_response_db(z1, z2), -clip_lim, clip_lim)
+                    self.dyn_limit_curve.setData(x, max_dyn_resp)
                 else:
                     self.dyn_limit_curve.setData([], [])
             else:
                 self.dyn_limit_curve.setData([], [])
 
-            static_clipped = np.clip(total_static_db, -clip_lim, clip_lim)
-            self.static_master_curve.setData(x, static_clipped)
+            static_a_db, _ = self.eq_engine.get_combined_responses_db(z1, z2, target_bus="A")
+            static_b_db, _ = self.eq_engine.get_combined_responses_db(z1, z2, target_bus="B")
+
+            # Independencia absoluta de la perilla OUT:
+            # Nunca se suma al cálculo de los dB visuales en el gráfico.
+            # Las curvas pasan exactamente por el centro físico de cada nodo y se anclan en 0.0 dB.
+            if not self.eq_engine.bypass:
+                out_gain = self.eq_engine.output_gain_db
+                static_a_db = static_a_db - out_gain
+                static_b_db = static_b_db - out_gain
+
+            static_clipped_a = np.clip(static_a_db, -clip_lim, clip_lim)
+            static_clipped_b = np.clip(static_b_db, -clip_lim, clip_lim)
+
+            # Curva Maestra Bus A (Amarilla): 100% continua de punta a punta, sin np.nan
+            self.static_master_curve.setData(x, static_clipped_a)
+
+            # Curva Maestra Bus B (Cian): continua de punta a punta si difiere de Bus A o si hay bandas asignadas a Bus B
+            b_differs = np.any(np.abs(static_clipped_b - static_clipped_a) > 0.02)
+            has_b_routed = any(getattr(b, 'target_output', 'A') in ('B', 'A+B') for b in bands)
+            if b_differs or has_b_routed:
+                self.static_bus_b_curve.setData(x, static_clipped_b)
+            else:
+                self.static_bus_b_curve.setData([], [])
 
             node_spots = []
             dyn_spots = []
@@ -1598,18 +2590,26 @@ class ProQ4Overlay(QWidget):
                 ny = self._band_node_y(b)
                 freq_str = f"{b.freq / 1000.0:.2f} kHz" if b.freq >= 1000.0 else f"{b.freq:.0f} Hz"
                 dyn_str = f" | ΔG: {b.current_dyn_offset_db:+.1f} dB" if b.is_dynamic_active else ""
+                ch_str = f" &bull; [{b.channel_mode}]" if b.channel_mode != "LR" else ""
+                bus_str = f" &bull; [Out {b.target_output}]" if b.target_output != "A+B" else ""
+                iso_str = " &bull; 🎧 ISOLATE" if (b.solo or self.eq_engine.isolated_band_index == active_idx) else ""
                 html = (
                     f"<div style='background-color: rgba(24, 24, 28, 235); "
                     f"border: 1px solid {b.color}; border-radius: 5px; padding: 2px 7px; "
                     f"font-family: Segoe UI, sans-serif; font-size: 10px; color: #ECEFF4;'>"
                     f"<b style='color:{b.color};'>Band {active_idx + 1}</b> "
-                    f"{freq_str} &bull; {b.gain_db:+.1f} dB &bull; Q {b.q:.2f}{dyn_str}</div>"
+                    f"{freq_str} &bull; {b.gain_db:+.1f} dB &bull; Q {b.q:.2f}{ch_str}{bus_str}{dyn_str}{iso_str}</div>"
                 )
-                self.floating_tooltip.setHtml(html)
-                self.floating_tooltip.setPos(nx, min(ny + 1.5, self.eq_range_db * 0.88))
-                self.floating_tooltip.show()
+                self.floating_tooltip.hide()
             else:
                 self.floating_tooltip.hide()
+
+            if hasattr(self, "node_callout"):
+                if 0 <= self.selected_band_idx < len(bands):
+                    if force or self.node_callout.isVisible():
+                        self.node_callout.update_callout()
+                else:
+                    self.node_callout.hide()
 
 
 class FloatingBandHUD(QWidget):
@@ -1711,6 +2711,7 @@ class FloatingBandHUD(QWidget):
         self.color_swatch.colorSelected.connect(self._on_swatch_color_selected)
 
         self.type_combo = QComboBox(self)
+        style_dark_combobox(self.type_combo)
         self.type_combo.addItems(FILTER_TYPES)
         self.type_combo.setFixedSize(112, 27)
         self.type_combo.move(20, 76)
@@ -1718,6 +2719,7 @@ class FloatingBandHUD(QWidget):
         self.type_combo.currentTextChanged.connect(self._on_type_or_slope_changed)
 
         self.slope_combo = QComboBox(self)
+        style_dark_combobox(self.slope_combo)
         self.slope_combo.setFixedSize(112, 27)
         self.slope_combo.move(20, 110)
         self.slope_combo.setToolTip("Pendiente del filtro (Slope)")
@@ -1791,6 +2793,7 @@ class FloatingBandHUD(QWidget):
         bot_row.addWidget(self.prev_band_btn)
 
         self.band_combo = QComboBox(self.bottom_bar)
+        style_dark_combobox(self.band_combo)
         self.band_combo.setFixedSize(96, 24)
         self.band_combo.currentIndexChanged.connect(self._on_band_combo_changed)
         bot_row.addWidget(self.band_combo)
@@ -1815,17 +2818,45 @@ class FloatingBandHUD(QWidget):
 
         bot_row.addStretch(1)
 
+        self.channel_mode_combo = QComboBox(self.bottom_bar)
+        style_dark_combobox(self.channel_mode_combo)
+        self.channel_mode_combo.setFixedSize(110, 24)
+        self.channel_mode_combo.setToolTip("Modo de Canal: Stereo (LR), Left (L), Right (R), Mid (Mono) o Side (Stereo)")
+        for cm, lbl in (
+            ("LR", "Stereo (LR)"),
+            ("L", "Left (L)"),
+            ("R", "Right (R)"),
+            ("Mid", "Mid (Mono)"),
+            ("Side", "Side (Stereo)"),
+        ):
+            self.channel_mode_combo.addItem(lbl, cm)
+        self.channel_mode_combo.currentIndexChanged.connect(self._on_channel_or_output_changed)
+        bot_row.addWidget(self.channel_mode_combo)
+
+        self.target_out_combo = QComboBox(self.bottom_bar)
+        style_dark_combobox(self.target_out_combo)
+        self.target_out_combo.setFixedSize(98, 24)
+        self.target_out_combo.setToolTip("Asignar Banda a Bus de Salida: A+B (Ambas), Out A (1-2) o Out B (3-4)")
+        for to_val, lbl in (
+            ("A+B", "A+B (Ambas)"),
+            ("A", "Out A (1-2)"),
+            ("B", "Out B (3-4)"),
+        ):
+            self.target_out_combo.addItem(lbl, to_val)
+        self.target_out_combo.currentIndexChanged.connect(self._on_channel_or_output_changed)
+        bot_row.addWidget(self.target_out_combo)
+
         self.dyn_toggle_btn = LiquidGlassButton("⚡ DYN", self.bottom_bar, pill_radius=11.0)
         self.dyn_toggle_btn.setCheckable(True)
-        self.dyn_toggle_btn.setFixedSize(68, 24)
+        self.dyn_toggle_btn.setFixedSize(64, 24)
         self.dyn_toggle_btn.setToolTip("Activar / Desactivar modo Dynamic EQ en esta banda")
         self.dyn_toggle_btn.clicked.connect(self._on_dyn_toggle_clicked)
         bot_row.addWidget(self.dyn_toggle_btn)
 
-        self.band_solo_btn = LiquidGlassButton("🎧 Solo", self.bottom_bar, active_tint_color="#00E5FF", pill_radius=11.0)
+        self.band_solo_btn = LiquidGlassButton("🎧 Isolate", self.bottom_bar, active_tint_color="#00E5FF", pill_radius=11.0)
         self.band_solo_btn.setCheckable(True)
-        self.band_solo_btn.setFixedSize(68, 24)
-        self.band_solo_btn.setToolTip("Escuchar únicamente esta banda")
+        self.band_solo_btn.setFixedSize(76, 24)
+        self.band_solo_btn.setToolTip("Aislar únicamente el rango de frecuencias de esta banda (Band-Pass Isolate)")
         self.band_solo_btn.clicked.connect(self._on_band_solo_toggled)
         bot_row.addWidget(self.band_solo_btn)
 
@@ -1939,6 +2970,8 @@ class FloatingBandHUD(QWidget):
         self.overlay.selected_band_idx = index
         self.refresh_from_engine()
         self.overlay.update_eq_curves(force=True)
+        if hasattr(self.overlay, "node_callout"):
+            self.overlay.node_callout.show_callout()
 
     def refresh_from_engine(self):
         self._updating_ui = True
@@ -1963,11 +2996,14 @@ class FloatingBandHUD(QWidget):
                 for w in (
                     self.del_band_btn, self.band_enable_btn, self.prev_band_btn,
                     self.next_band_btn, self.color_swatch, self.band_solo_btn,
+                    self.channel_mode_combo, self.target_out_combo,
                     self.type_combo, self.slope_combo, self.freq_knob,
                     self.gain_dyn_knob, self.thresh_meter, self.q_knob,
                     self.dyn_toggle_btn, self.attack_knob, self.release_knob,
                 ):
                     w.setEnabled(has_band)
+
+                self.freq_knob.max_val = max(24000.0, self.eq_engine.sr * 0.495)
 
                 if has_band:
                     b = bands[idx]
@@ -1976,9 +3012,22 @@ class FloatingBandHUD(QWidget):
                     self.band_enable_btn.setAccentColor(b.color)
 
                     self.band_enable_btn.setChecked(b.enabled)
-                    self.band_solo_btn.setChecked(b.solo)
+                    is_iso = bool(b.solo or self.eq_engine.isolated_band_index == idx)
+                    self.band_solo_btn.setChecked(is_iso)
                     self.band_solo_btn.setActiveTintColor(b.color)
                     self.type_combo.setCurrentText(b.filter_type)
+
+                    cm_idx = self.channel_mode_combo.findData(b.channel_mode)
+                    if cm_idx >= 0:
+                        self.channel_mode_combo.blockSignals(True)
+                        self.channel_mode_combo.setCurrentIndex(cm_idx)
+                        self.channel_mode_combo.blockSignals(False)
+
+                    to_idx = self.target_out_combo.findData(b.target_output)
+                    if to_idx >= 0:
+                        self.target_out_combo.blockSignals(True)
+                        self.target_out_combo.setCurrentIndex(to_idx)
+                        self.target_out_combo.blockSignals(False)
 
                     slope_idx = self.slope_combo.findData(b.slope)
                     if slope_idx >= 0:
@@ -2054,10 +3103,28 @@ class FloatingBandHUD(QWidget):
         if self._updating_ui:
             return
         idx = self.overlay.selected_band_idx
+        self.eq_engine.set_isolated_band(idx if checked else None)
+        self.refresh_from_engine()
+        self.overlay.update_eq_curves(force=True)
+        self.parameters_changed.emit()
+
+    def _on_channel_or_output_changed(self):
+        if self._updating_ui:
+            return
+        idx = self.overlay.selected_band_idx
         with self.eq_engine.lock:
             if 0 <= idx < len(self.eq_engine.bands):
-                self.eq_engine.bands[idx].solo = checked
+                b = self.eq_engine.bands[idx]
+                cm = str(self.channel_mode_combo.currentData())
+                to_val = str(self.target_out_combo.currentData())
+                if cm in CHANNEL_MODES and b.channel_mode != cm:
+                    b.channel_mode = cm
+                    b.reset_state()
+                if to_val in TARGET_OUTPUTS and b.target_output != to_val:
+                    b.target_output = to_val
+                    b.reset_state()
                 self.eq_engine.mark_dirty()
+        self.refresh_from_engine()
         self.overlay.update_eq_curves(force=True)
         self.parameters_changed.emit()
 

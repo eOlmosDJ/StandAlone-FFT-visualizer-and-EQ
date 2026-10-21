@@ -17,14 +17,18 @@ class FFTSpectrumAnalyzer:
 
         self.pre_ring_buffer = np.zeros(self.fft_size, dtype=np.float32)
         self.post_ring_buffer = np.zeros(self.fft_size, dtype=np.float32)
+        self.post2_ring_buffer = np.zeros(self.fft_size, dtype=np.float32)
 
         self.held_pre_fft = None
         self.held_post_fft = None
+        self.held_post2_fft = None
 
         self.pre_at_rest = False
         self.post_at_rest = False
+        self.post2_at_rest = False
         self._last_pre_silent = True
         self._last_post_silent = True
+        self._last_post2_silent = True
 
         self.num_points = 360
         self._rebuild_window_and_freqs()
@@ -66,10 +70,40 @@ class FFTSpectrumAnalyzer:
     def reset_buffers(self):
         self.pre_ring_buffer = np.zeros(self.fft_size, dtype=np.float32)
         self.post_ring_buffer = np.zeros(self.fft_size, dtype=np.float32)
+        self.post2_ring_buffer = np.zeros(self.fft_size, dtype=np.float32)
         self.held_pre_fft = None
         self.held_post_fft = None
+        self.held_post2_fft = None
         self.pre_at_rest = False
         self.post_at_rest = False
+        self.post2_at_rest = False
+        self._last_pre_silent = True
+        self._last_post_silent = True
+        self._last_post2_silent = True
+
+    @property
+    def in_ring_buffer(self):
+        return self.pre_ring_buffer
+
+    @property
+    def out1_ring_buffer(self):
+        return self.post_ring_buffer
+
+    @property
+    def out2_ring_buffer(self):
+        return self.post2_ring_buffer
+
+    @property
+    def in_at_rest(self):
+        return self.pre_at_rest
+
+    @property
+    def out1_at_rest(self):
+        return self.post_at_rest
+
+    @property
+    def out2_at_rest(self):
+        return self.post2_at_rest
 
     @staticmethod
     def _push_to_ring(ring: np.ndarray, blocks: list) -> tuple[np.ndarray, bool]:
@@ -87,8 +121,8 @@ class FFTSpectrumAnalyzer:
                 ring[-n:] = mono_blk
         return ring, all_silent
 
-    def push_blocks(self, pre_blocks: list, post_blocks: list):
-        """Acumula bloques de audio en los Ring Buffers e identifica si están en silencio."""
+    def push_blocks(self, pre_blocks: list, post_blocks: list, post2_blocks: list = None):
+        """Acumula bloques de audio en los 3 Ring Buffers (Input, Output 1, Output 2)."""
         if pre_blocks:
             self.pre_ring_buffer, self._last_pre_silent = self._push_to_ring(self.pre_ring_buffer, pre_blocks)
             if not self._last_pre_silent:
@@ -103,6 +137,13 @@ class FFTSpectrumAnalyzer:
         else:
             self._last_post_silent = True
 
+        if post2_blocks:
+            self.post2_ring_buffer, self._last_post2_silent = self._push_to_ring(self.post2_ring_buffer, post2_blocks)
+            if not self._last_post2_silent:
+                self.post2_at_rest = False
+        else:
+            self._last_post2_silent = True
+
     def _compute_held_spectrum(self, ring: np.ndarray, held_prev: np.ndarray | None, is_silent: bool) -> np.ndarray:
         if is_silent and held_prev is not None:
             # Si el bloque entrante es silencio puro, solo decaemos el vector retenido sin ejecutar rfft
@@ -114,8 +155,24 @@ class FFTSpectrumAnalyzer:
         decayed = held_prev * self.decay_factor + fft_mag * (1.0 - self.decay_factor)
         return np.maximum(fft_mag, decayed)
 
-    def update_spectra(self, compute_pre: bool = True, compute_post: bool = True, db_min: float = -90.0):
+    def update_spectra(
+        self,
+        compute_pre: bool = True,
+        compute_post: bool = True,
+        compute_post2: bool = False,
+        db_min: float = -90.0,
+        compute_in: bool = None,
+        compute_out1: bool = None,
+        compute_out2: bool = None,
+    ):
         """Actualiza las envolventes FFT omitiendo cálculos si la señal ya reposa bajo el piso."""
+        if compute_in is not None:
+            compute_pre = compute_in
+        if compute_out1 is not None:
+            compute_post = compute_out1
+        if compute_out2 is not None:
+            compute_post2 = compute_out2
+
         floor_mag = 10.0 ** ((db_min - 1.0) / 20.0)
 
         if compute_pre and not self.pre_at_rest:
@@ -132,6 +189,13 @@ class FFTSpectrumAnalyzer:
             if self._last_post_silent and self.held_post_fft is not None and np.max(self.held_post_fft) <= floor_mag:
                 self.post_at_rest = True
 
+        if compute_post2 and not self.post2_at_rest:
+            self.held_post2_fft = self._compute_held_spectrum(
+                self.post2_ring_buffer, self.held_post2_fft, self._last_post2_silent
+            )
+            if self._last_post2_silent and self.held_post2_fft is not None and np.max(self.held_post2_fft) <= floor_mag:
+                self.post2_at_rest = True
+
     def get_smooth_curve(
         self,
         which: str = "post",
@@ -143,11 +207,51 @@ class FFTSpectrumAnalyzer:
         """
         Devuelve (x_smooth, y_smooth) usando grillas precalculadas y omitiendo `make_interp_spline`
         cuando el espectro se encuentra en reposo en el piso (`y_floor`).
+        Soporta which="pre" / "in", which="post" / "out1", which="post2" / "out2".
         """
-        held = self.held_post_fft if which == "post" else self.held_pre_fft
-        at_rest = self.post_at_rest if which == "post" else self.pre_at_rest
+        w = which.lower()
+        if w in ("post2", "out2", "output2", "b"):
+            held = self.held_post2_fft
+            at_rest = self.post2_at_rest
+        elif w in ("pre", "in", "input"):
+            held = self.held_pre_fft
+            at_rest = self.pre_at_rest
+        else:
+            held = self.held_post_fft
+            at_rest = self.post_at_rest
+
         if held is None:
             return np.array([]), np.array([])
+
+        y_floor = float(db_min) if is_y_log else 0.0
+        y_ceil = float(db_max) if is_y_log else 1.0
+
+        if len(self.f_real) > 4:
+            x_smooth = self.x_smooth_log if is_x_log else self.x_smooth_lin
+            if at_rest:
+                return x_smooth, np.full_like(x_smooth, y_floor)
+
+            eps = 1e-10
+            mag_real = held[self.valid_mask]
+            if is_y_log:
+                y_real = np.clip(20.0 * np.log10(mag_real + eps), y_floor, y_ceil)
+            else:
+                y_real = np.clip(mag_real, y_floor, y_ceil)
+
+            first_y = y_real[0]
+            anchor_y = np.array([y_floor, y_floor + 0.35 * (first_y - y_floor)])
+            y_full = np.concatenate([anchor_y, y_real])
+
+            if is_x_log:
+                spline = make_interp_spline(self.log_f_full, y_full, k=3)
+                y_smooth = np.clip(spline(self.log_f_smooth), y_floor, y_ceil)
+            else:
+                spline = make_interp_spline(self.f_full_lin, y_full, k=3)
+                y_smooth = np.clip(spline(x_smooth), y_floor, y_ceil)
+
+            return x_smooth, y_smooth
+
+        return self.f_real, np.full_like(self.f_real, y_floor)
 
         y_floor = float(db_min) if is_y_log else 0.0
         y_ceil = float(db_max) if is_y_log else 1.0

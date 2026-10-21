@@ -15,6 +15,10 @@ FILTER_TYPES = [
 
 SLOPE_OPTIONS = [12, 24, 36, 48]
 
+CHANNEL_MODES = ["LR", "L", "R", "Mid", "Side"]
+
+TARGET_OUTPUTS = ["A+B", "A", "B"]
+
 BAND_COLORS = [
     "#00E5FF",  # Cian
     "#00E676",  # Verde Esmeralda
@@ -143,11 +147,152 @@ def design_biquad_sos(
     return np.array([[1.0, 0.0, 0.0, 1.0, 0.0, 0.0]], dtype=np.float64)
 
 
+def design_isolate_bandpass_sos(
+    freq: float,
+    q: float,
+    sr: float,
+    cascade_sections: int = 2,
+) -> np.ndarray:
+    """
+    Diseña en tiempo real un filtro Band-Pass Biquad (2do orden o 4to orden en cascada)
+    centrado exactamente en `freq` (f0) y con el factor de calidad `q` (Q) para Isolate:
+      w0 = 2*pi*f0 / fs, alpha = sin(w0) / (2*Q)
+      b0 = alpha, b1 = 0, b2 = -alpha
+      a0 = 1 + alpha, a1 = -2*cos(w0), a2 = 1 - alpha
+    """
+    sr_f = float(max(sr, 8000.0))
+    f0 = float(np.clip(freq, 10.0, 0.495 * sr_f))
+    q_val = float(np.clip(q, 0.1, 24.0))
+
+    w0 = 2.0 * np.pi * f0 / sr_f
+    cos_w0 = np.cos(w0)
+    sin_w0 = np.sin(w0)
+    alpha = sin_w0 / (2.0 * q_val)
+
+    b0 = alpha
+    b1 = 0.0
+    b2 = -alpha
+    a0 = 1.0 + alpha
+    a1 = -2.0 * cos_w0
+    a2 = 1.0 - alpha
+
+    row = [b0 / a0, b1 / a0, b2 / a0, 1.0, a1 / a0, a2 / a0]
+    n_sec = max(1, int(cascade_sections))
+    return np.array([row for _ in range(n_sec)], dtype=np.float64)
+
+
+def _apply_sos_channel_mode(
+    sos: np.ndarray,
+    block: np.ndarray,
+    zi: np.ndarray,
+    channel_mode: str,
+    zi_mid: np.ndarray | None = None,
+    zi_side: np.ndarray | None = None,
+) -> None:
+    """
+    Aplica `sosfilt` in-place sobre un bloque estéreo `(N, 2)` según `channel_mode`:
+    - "LR": filtra ambos canales `[L, R]` con `zi[:, :, 0:2]`.
+    - "L": filtra únicamente `block[:, 0]` con `zi[:, :, 0]`, dejando `block[:, 1]` intacto.
+    - "R": filtra únicamente `block[:, 1]` con `zi[:, :, 1]`, dejando `block[:, 0]` intacto.
+    - "Mid": codifica `mid = 0.5*(L+R)` y `side = 0.5*(L-R)`, filtra `mid` con `zi_mid` (o `zi[:, :, 0]`),
+      y reconstruye `L = mid + side`, `R = mid - side`.
+    - "Side": codifica `mid = 0.5*(L+R)` y `side = 0.5*(L-R)`, filtra `side` con `zi_side` (o `zi[:, :, 1]`),
+      y reconstruye `L = mid + side`, `R = mid - side`.
+    """
+    if block.ndim == 1:
+        block[:], zi[:, :, 0] = sosfilt(sos, block, zi=zi[:, :, 0])
+        return
+    if block.shape[1] < 2:
+        block[:, 0], zi[:, :, 0] = sosfilt(sos, block[:, 0], zi=zi[:, :, 0])
+        return
+
+    if channel_mode == "L":
+        block[:, 0], zi[:, :, 0] = sosfilt(sos, block[:, 0], zi=zi[:, :, 0])
+    elif channel_mode == "R":
+        block[:, 1], zi[:, :, 1] = sosfilt(sos, block[:, 1], zi=zi[:, :, 1])
+    elif channel_mode == "Mid":
+        ch_l = block[:, 0]
+        ch_r = block[:, 1]
+        mid = 0.5 * (ch_l + ch_r)
+        side = 0.5 * (ch_l - ch_r)
+        if zi_mid is not None:
+            mid_f, zi_mid[:] = sosfilt(sos, mid, zi=zi_mid)
+        else:
+            mid_f, zi[:, :, 0] = sosfilt(sos, mid, zi=zi[:, :, 0])
+        block[:, 0] = mid_f + side
+        block[:, 1] = mid_f - side
+    elif channel_mode == "Side":
+        ch_l = block[:, 0]
+        ch_r = block[:, 1]
+        mid = 0.5 * (ch_l + ch_r)
+        side = 0.5 * (ch_l - ch_r)
+        if zi_side is not None:
+            side_f, zi_side[:] = sosfilt(sos, side, zi=zi_side)
+        else:
+            side_f, zi[:, :, 1] = sosfilt(sos, side, zi=zi[:, :, 1])
+        block[:, 0] = mid + side_f
+        block[:, 1] = mid - side_f
+    else:  # "LR"
+        block[:, 0:2], zi[:, :, 0:2] = sosfilt(sos, block[:, 0:2], axis=0, zi=zi[:, :, 0:2])
+
+
+def _apply_isolate_channel_mode(
+    sos: np.ndarray,
+    indata_f64: np.ndarray,
+    zi: np.ndarray,
+    channel_mode: str,
+    zi_mid: np.ndarray | None = None,
+    zi_side: np.ndarray | None = None,
+) -> np.ndarray:
+    """
+    Aplica el filtro Band-Pass de Isolate respetando `channel_mode` y devolviendo únicamente
+    la porción aislada del espectro (muteando el resto de frecuencias y canales no afectados).
+    """
+    out = np.zeros_like(indata_f64)
+    if indata_f64.ndim == 1 or indata_f64.shape[1] < 2:
+        col = indata_f64 if indata_f64.ndim == 1 else indata_f64[:, 0]
+        filt, zi[:, :, 0] = sosfilt(sos, col, zi=zi[:, :, 0])
+        if out.ndim == 1:
+            out[:] = filt
+        else:
+            out[:, 0] = filt
+        return out
+
+    if channel_mode == "L":
+        out[:, 0], zi[:, :, 0] = sosfilt(sos, indata_f64[:, 0], zi=zi[:, :, 0])
+        out[:, 1] = 0.0
+    elif channel_mode == "R":
+        out[:, 0] = 0.0
+        out[:, 1], zi[:, :, 1] = sosfilt(sos, indata_f64[:, 1], zi=zi[:, :, 1])
+    elif channel_mode == "Mid":
+        mid = 0.5 * (indata_f64[:, 0] + indata_f64[:, 1])
+        if zi_mid is not None:
+            mid_iso, zi_mid[:] = sosfilt(sos, mid, zi=zi_mid)
+        else:
+            mid_iso, zi[:, :, 0] = sosfilt(sos, mid, zi=zi[:, :, 0])
+        out[:, 0] = mid_iso
+        out[:, 1] = mid_iso
+    elif channel_mode == "Side":
+        side = 0.5 * (indata_f64[:, 0] - indata_f64[:, 1])
+        if zi_side is not None:
+            side_iso, zi_side[:] = sosfilt(sos, side, zi=zi_side)
+        else:
+            side_iso, zi[:, :, 1] = sosfilt(sos, side, zi=zi[:, :, 1])
+        out[:, 0] = side_iso
+        out[:, 1] = -side_iso
+    else:  # "LR"
+        out[:, 0:2], zi[:, :, 0:2] = sosfilt(sos, indata_f64[:, 0:2], axis=0, zi=zi[:, :, 0:2])
+    return out
+
+
 class EQBand:
     """
-    Representa una banda paramétrica y dinámica individual estilo FabFilter Pro-Q 4.
-    Cachea su respuesta en frecuencia estática (`_cached_static_db`) para evitar
-    recálculos redundantes en el loop de 60 FPS cuando la banda no fue modificada.
+    Representa una banda paramétrica y dinámica individual del motor BDJ-FFT-EQ.
+    Soporta:
+    - Procesamiento por canal (`channel_mode`: "LR", "L", "R", "Mid", "Side")
+    - Asignación de bus de salida (`target_output`: "A", "B", "A+B") con estados `zi_A` y `zi_B` independientes
+    - Filtro Band-Pass de Isolate en tiempo real con estados `iso_zi_A` e `iso_zi_B`
+    - Caché de respuesta en frecuencia estática (`_cached_static_db`) para evitar recálculos en IDLE.
     """
 
     def __init__(
@@ -166,15 +311,24 @@ class EQBand:
         color: str = "#00E5FF",
         sr: float = 48000.0,
         channels: int = 2,
+        channel_mode: str = "LR",
+        target_output: str = "A+B",
     ):
+        self.sr = float(max(sr, 8000.0))
+        self.channels = max(2, int(channels))
+
         self.enabled = bool(enabled)
         self.solo = False
         self.filter_type = filter_type if filter_type in FILTER_TYPES else "Bell"
-        self.freq = float(np.clip(freq, 10.0, 24000.0))
+        max_nyq = max(24000.0, self.sr * 0.495)
+        self.freq = float(np.clip(freq, 10.0, max_nyq))
         self.gain_db = float(np.clip(gain_db, -24.0, 24.0))
         self.q = float(np.clip(q, 0.1, 24.0))
         self.slope = int(slope) if int(slope) in SLOPE_OPTIONS else 12
         self.color = color
+
+        self.channel_mode = channel_mode if channel_mode in CHANNEL_MODES else "LR"
+        self.target_output = target_output if target_output in TARGET_OUTPUTS else "A+B"
 
         # Parámetros Dynamic EQ
         self.dyn_enabled = bool(dyn_enabled)
@@ -187,22 +341,92 @@ class EQBand:
         self.env_db = -90.0
         self.current_dyn_offset_db = 0.0
 
-        self.sr = float(sr)
-        self.channels = int(channels)
-
         self.sos_static = design_biquad_sos(
             self.filter_type, self.freq, self.gain_db, self.q, self.sr, self.slope
         )
         self.sos_inst = self.sos_static.copy()
         self.sc_sos = design_biquad_sos("Band Pass", self.freq, 0.0, self.q, self.sr)
+        self.iso_sos = design_isolate_bandpass_sos(self.freq, self.q, self.sr, cascade_sections=2)
 
-        self.zi = np.zeros((self.sos_static.shape[0], 2, self.channels), dtype=np.float64)
+        # Estados de filtro independientes para Bus A (1-2) y Bus B (3-4)
+        n_sec = self.sos_static.shape[0]
+        self.zi_A = np.zeros((n_sec, 2, self.channels), dtype=np.float64)
+        self.zi_B = np.zeros((n_sec, 2, self.channels), dtype=np.float64)
+        self.zi_mid_A = np.zeros((n_sec, 2), dtype=np.float64)
+        self.zi_side_A = np.zeros((n_sec, 2), dtype=np.float64)
+        self.zi_mid_B = np.zeros((n_sec, 2), dtype=np.float64)
+        self.zi_side_B = np.zeros((n_sec, 2), dtype=np.float64)
+
+        iso_sec = self.iso_sos.shape[0]
+        self.iso_zi_A = np.zeros((iso_sec, 2, self.channels), dtype=np.float64)
+        self.iso_zi_B = np.zeros((iso_sec, 2, self.channels), dtype=np.float64)
+        self.iso_zi_mid_A = np.zeros((iso_sec, 2), dtype=np.float64)
+        self.iso_zi_side_A = np.zeros((iso_sec, 2), dtype=np.float64)
+        self.iso_zi_mid_B = np.zeros((iso_sec, 2), dtype=np.float64)
+        self.iso_zi_side_B = np.zeros((iso_sec, 2), dtype=np.float64)
+
         self.sc_zi = np.zeros((1, 2), dtype=np.float64)
 
         # Caché de respuesta en frecuencia para no recalcular en IDLE
         self._cache_valid = False
         self._cached_static_db: np.ndarray | None = None
         self._cached_max_dyn_db: np.ndarray | None = None
+
+    @property
+    def zi(self) -> np.ndarray:
+        return self.zi_A
+
+    @zi.setter
+    def zi(self, val: np.ndarray):
+        self.zi_A = val
+
+    @property
+    def zi_a(self) -> np.ndarray:
+        return self.zi_A
+
+    @zi_a.setter
+    def zi_a(self, val: np.ndarray):
+        self.zi_A = val
+
+    @property
+    def zi_b(self) -> np.ndarray:
+        return self.zi_B
+
+    @zi_b.setter
+    def zi_b(self, val: np.ndarray):
+        self.zi_B = val
+
+    @property
+    def zi_mid_a(self) -> np.ndarray:
+        return self.zi_mid_A
+
+    @zi_mid_a.setter
+    def zi_mid_a(self, val: np.ndarray):
+        self.zi_mid_A = val
+
+    @property
+    def zi_side_a(self) -> np.ndarray:
+        return self.zi_side_A
+
+    @zi_side_a.setter
+    def zi_side_a(self, val: np.ndarray):
+        self.zi_side_A = val
+
+    @property
+    def zi_mid_b(self) -> np.ndarray:
+        return self.zi_mid_B
+
+    @zi_mid_b.setter
+    def zi_mid_b(self, val: np.ndarray):
+        self.zi_mid_B = val
+
+    @property
+    def zi_side_b(self) -> np.ndarray:
+        return self.zi_side_B
+
+    @zi_side_b.setter
+    def zi_side_b(self, val: np.ndarray):
+        self.zi_side_B = val
 
     @property
     def is_dynamic_active(self) -> bool:
@@ -221,15 +445,30 @@ class EQBand:
 
     def update_coefficients(self, sr: float | None = None, channels: int | None = None):
         if sr is not None and sr != self.sr:
-            self.sr = float(sr)
+            self.sr = float(max(sr, 8000.0))
         if channels is not None and channels != self.channels:
-            self.channels = int(channels)
+            self.channels = max(2, int(channels))
+
+        max_nyq = max(24000.0, self.sr * 0.495)
+        self.freq = float(np.clip(self.freq, 10.0, max_nyq))
 
         new_sos = design_biquad_sos(
             self.filter_type, self.freq, self.gain_db, self.q, self.sr, self.slope
         )
-        if self.zi.shape != (new_sos.shape[0], 2, self.channels):
-            self.zi = np.zeros((new_sos.shape[0], 2, self.channels), dtype=np.float64)
+        req_shape = (new_sos.shape[0], 2, self.channels)
+        mid_shape = (new_sos.shape[0], 2)
+        if self.zi_A.shape != req_shape:
+            self.zi_A = np.zeros(req_shape, dtype=np.float64)
+        if self.zi_B.shape != req_shape:
+            self.zi_B = np.zeros(req_shape, dtype=np.float64)
+        if self.zi_mid_A.shape != mid_shape:
+            self.zi_mid_A = np.zeros(mid_shape, dtype=np.float64)
+        if self.zi_side_A.shape != mid_shape:
+            self.zi_side_A = np.zeros(mid_shape, dtype=np.float64)
+        if self.zi_mid_B.shape != mid_shape:
+            self.zi_mid_B = np.zeros(mid_shape, dtype=np.float64)
+        if self.zi_side_B.shape != mid_shape:
+            self.zi_side_B = np.zeros(mid_shape, dtype=np.float64)
 
         self.sos_static = new_sos
         if not self.is_dynamic_active:
@@ -241,6 +480,22 @@ class EQBand:
         self.sc_sos = design_biquad_sos("Band Pass", self.freq, 0.0, self.q, self.sr)
         if self.sc_zi.shape != (1, 2):
             self.sc_zi = np.zeros((1, 2), dtype=np.float64)
+
+        self.iso_sos = design_isolate_bandpass_sos(self.freq, self.q, self.sr, cascade_sections=2)
+        iso_shape = (self.iso_sos.shape[0], 2, self.channels)
+        iso_mid_shape = (self.iso_sos.shape[0], 2)
+        if self.iso_zi_A.shape != iso_shape:
+            self.iso_zi_A = np.zeros(iso_shape, dtype=np.float64)
+        if self.iso_zi_B.shape != iso_shape:
+            self.iso_zi_B = np.zeros(iso_shape, dtype=np.float64)
+        if self.iso_zi_mid_A.shape != iso_mid_shape:
+            self.iso_zi_mid_A = np.zeros(iso_mid_shape, dtype=np.float64)
+        if self.iso_zi_side_A.shape != iso_mid_shape:
+            self.iso_zi_side_A = np.zeros(iso_mid_shape, dtype=np.float64)
+        if self.iso_zi_mid_B.shape != iso_mid_shape:
+            self.iso_zi_mid_B = np.zeros(iso_mid_shape, dtype=np.float64)
+        if self.iso_zi_side_B.shape != iso_mid_shape:
+            self.iso_zi_side_B = np.zeros(iso_mid_shape, dtype=np.float64)
 
         self._cache_valid = False
 
@@ -257,7 +512,18 @@ class EQBand:
             )
 
     def reset_state(self):
-        self.zi.fill(0.0)
+        self.zi_A.fill(0.0)
+        self.zi_B.fill(0.0)
+        self.zi_mid_A.fill(0.0)
+        self.zi_side_A.fill(0.0)
+        self.zi_mid_B.fill(0.0)
+        self.zi_side_B.fill(0.0)
+        self.iso_zi_A.fill(0.0)
+        self.iso_zi_B.fill(0.0)
+        self.iso_zi_mid_A.fill(0.0)
+        self.iso_zi_side_A.fill(0.0)
+        self.iso_zi_mid_B.fill(0.0)
+        self.iso_zi_side_B.fill(0.0)
         self.sc_zi.fill(0.0)
         self.env_db = -90.0
         self.current_dyn_offset_db = 0.0
@@ -271,6 +537,9 @@ class EQBand:
 
     def get_dynamic_freq_response_db(self, z1: np.ndarray, z2: np.ndarray) -> np.ndarray:
         return eval_sos_mag_db_fast(self.sos_inst, z1, z2)
+
+    def get_isolate_freq_response_db(self, z1: np.ndarray, z2: np.ndarray) -> np.ndarray:
+        return eval_sos_mag_db_fast(self.iso_sos, z1, z2)
 
     def get_max_dynamic_freq_response_db(self, z1: np.ndarray, z2: np.ndarray) -> np.ndarray:
         if self._cache_valid and self._cached_max_dyn_db is not None and len(self._cached_max_dyn_db) == len(z1):
@@ -297,6 +566,8 @@ class EQBand:
             "gain_db": round(self.gain_db, 2),
             "q": round(self.q, 3),
             "slope": self.slope,
+            "channel_mode": self.channel_mode,
+            "target_output": self.target_output,
             "dyn_enabled": self.dyn_enabled,
             "dyn_range_db": round(self.dyn_range_db, 2),
             "threshold_db": round(self.threshold_db, 2),
@@ -322,6 +593,8 @@ class EQBand:
             color=str(data.get("color", fallback_color)),
             sr=sr,
             channels=channels,
+            channel_mode=str(data.get("channel_mode", "LR")),
+            target_output=str(data.get("target_output", "A+B")),
         )
         b.solo = bool(data.get("solo", False))
         return b
@@ -329,16 +602,18 @@ class EQBand:
 
 class ParametricEQEngine:
     """
-    Motor DSP de Ecualización Paramétrica y Dinámica en Tiempo Real.
-    Incluye contador `static_version` para que la GUI únicamente recalcule y redibuje
-    las curvas estáticas cuando el usuario modifica algún parámetro.
+    Motor DSP de Ecualización Paramétrica y Dinámica en Tiempo Real con:
+    - Procesamiento por canal (`LR`, `L`, `R`, `Mid`, `Side`)
+    - Función Isolate (`isolated_band_index`) con filtro Band-Pass Biquad en tiempo real
+    - Doble Bus de Salida Estéreo Independiente (`Out A [1-2]` y `Out B [3-4]`)
     """
 
     def __init__(self, sample_rate: int = 48000, channels: int = 2):
         self.sr = float(sample_rate)
-        self.channels = int(channels)
+        self.channels = max(2, int(channels))
         self.bypass = False
         self.output_gain_db = 0.0
+        self.isolated_band_index: int | None = None
         self.lock = threading.RLock()
         self.static_version = 1
         self.bands: list[EQBand] = []
@@ -346,6 +621,29 @@ class ParametricEQEngine:
 
     def mark_dirty(self):
         self.static_version += 1
+
+    def set_isolated_band(self, index: int | None):
+        """Activa o desactiva el modo Isolate (Solo de Frecuencia Band-Pass) sobre la banda `index`."""
+        with self.lock:
+            if index is not None and 0 <= int(index) < len(self.bands):
+                idx = int(index)
+                self.isolated_band_index = idx
+                for i, b in enumerate(self.bands):
+                    b.solo = (i == idx)
+            else:
+                self.isolated_band_index = None
+                for b in self.bands:
+                    b.solo = False
+            self.static_version += 1
+
+    def _resolve_isolated_band_index(self) -> int | None:
+        if self.isolated_band_index is not None:
+            if 0 <= self.isolated_band_index < len(self.bands) and self.bands[self.isolated_band_index].enabled:
+                return self.isolated_band_index
+        for i, b in enumerate(self.bands):
+            if b.enabled and b.solo:
+                return i
+        return None
 
     def to_dict(self) -> dict:
         with self.lock:
@@ -361,21 +659,26 @@ class ParametricEQEngine:
         with self.lock:
             self.bypass = bool(data.get("bypass", False))
             self.output_gain_db = float(np.clip(data.get("output_gain_db", 0.0), -24.0, 24.0))
+            self.isolated_band_index = None
             bands_raw = data.get("bands")
             if isinstance(bands_raw, list) and len(bands_raw) > 0:
                 loaded_bands = []
                 for i, b_dict in enumerate(bands_raw):
                     if isinstance(b_dict, dict):
                         color = BAND_COLORS[i % len(BAND_COLORS)]
-                        loaded_bands.append(
-                            EQBand.from_dict(b_dict, sr=self.sr, channels=self.channels, fallback_color=color)
-                        )
+                        b = EQBand.from_dict(b_dict, sr=self.sr, channels=self.channels, fallback_color=color)
+                        if b.solo and self.isolated_band_index is None:
+                            self.isolated_band_index = i
+                        else:
+                            b.solo = False
+                        loaded_bands.append(b)
                 if loaded_bands:
                     self.bands = loaded_bands
             self.static_version += 1
 
     def init_default_bands(self):
         with self.lock:
+            self.isolated_band_index = None
             self.bands = [
                 EQBand(
                     freq=80.0, gain_db=0.0, q=0.80, filter_type="Low Shelf",
@@ -412,6 +715,8 @@ class ParametricEQEngine:
         filter_type: str | None = None,
         dyn_enabled: bool = False,
         dyn_range_db: float = 0.0,
+        channel_mode: str = "LR",
+        target_output: str = "A+B",
     ) -> EQBand:
         with self.lock:
             if filter_type is None:
@@ -438,6 +743,8 @@ class ParametricEQEngine:
                 color=color,
                 sr=self.sr,
                 channels=self.channels,
+                channel_mode=channel_mode,
+                target_output=target_output,
             )
             self.bands.append(band)
             self.static_version += 1
@@ -447,29 +754,90 @@ class ParametricEQEngine:
         with self.lock:
             if 0 <= index < len(self.bands):
                 self.bands.pop(index)
+                if self.isolated_band_index == index:
+                    self.isolated_band_index = None
+                elif self.isolated_band_index is not None and self.isolated_band_index > index:
+                    self.isolated_band_index -= 1
                 self.static_version += 1
 
     def clear_bands(self):
         with self.lock:
             self.bands.clear()
+            self.isolated_band_index = None
             self.static_version += 1
 
-    def get_active_bands(self) -> list[EQBand]:
-        solo_bands = [b for b in self.bands if b.enabled and b.solo]
-        if solo_bands:
-            return solo_bands
+    def get_active_bands(self, target_bus: str | None = None) -> list[EQBand]:
+        iso_idx = self._resolve_isolated_band_index()
+        if iso_idx is not None:
+            b = self.bands[iso_idx]
+            if target_bus == "A" and b.target_output not in ("A", "A+B"):
+                return []
+            if target_bus == "B" and b.target_output not in ("B", "A+B"):
+                return []
+            return [b]
+
+        if target_bus == "A":
+            return [b for b in self.bands if b.enabled and b.target_output in ("A", "A+B")]
+        if target_bus == "B":
+            return [b for b in self.bands if b.enabled and b.target_output in ("B", "A+B")]
         return [b for b in self.bands if b.enabled]
 
-    def process_block(self, indata: np.ndarray) -> np.ndarray:
+    def process_dual_block(self, indata: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Procesa `indata` generando dos bloques estéreo independientes `(out_A, out_B)`:
+        - `out_A`: procesado con todas las bandas activas cuyo `target_output` sea "A" o "A+B" (usando `zi_A`).
+        - `out_B`: procesado con todas las bandas activas cuyo `target_output` sea "B" o "A+B" (usando `zi_B`).
+        Soporta Isolate (`isolated_band_index`) y procesamiento por canal (`LR`, `L`, `R`, `Mid`, `Side`).
+        """
+        if indata.ndim == 1:
+            stereo_in = np.column_stack((indata, indata))
+        elif indata.shape[1] == 1:
+            stereo_in = np.repeat(indata, 2, axis=1)
+        else:
+            stereo_in = indata[:, 0:2]
+
         if self.bypass:
-            return indata.copy()
+            out_f32 = stereo_in.astype(np.float32, copy=True)
+            return out_f32, out_f32.copy()
 
         with self.lock:
-            active_bands = self.get_active_bands()
-            # Si ninguna banda activa altera el audio ni tiene Dynamic EQ activo, evita copiar/filtrar en vano
+            iso_idx = self._resolve_isolated_band_index()
+
+            # --- MODO ISOLATE (SOLO DE FRECUENCIA BAND-PASS) ---
+            if iso_idx is not None:
+                iso_band = self.bands[iso_idx]
+                in_f64 = stereo_in.astype(np.float64, copy=True)
+
+                # Escalar suavemente según la ganancia de monitoreo y de la banda
+                band_boost = min(12.0, max(-12.0, iso_band.gain_db * 0.5)) if iso_band.supports_gain else 0.0
+                mon_gain_db = float(np.clip(band_boost + self.output_gain_db, -24.0, 12.0))
+                gain_scale = 10.0 ** (mon_gain_db / 20.0)
+
+                if iso_band.target_output in ("A", "A+B"):
+                    out_A = _apply_isolate_channel_mode(
+                        iso_band.iso_sos, in_f64, iso_band.iso_zi_A, iso_band.channel_mode,
+                        zi_mid=iso_band.iso_zi_mid_A, zi_side=iso_band.iso_zi_side_A
+                    ) * gain_scale
+                else:
+                    out_A = np.zeros_like(in_f64)
+
+                if iso_band.target_output in ("B", "A+B"):
+                    out_B = _apply_isolate_channel_mode(
+                        iso_band.iso_sos, in_f64, iso_band.iso_zi_B, iso_band.channel_mode,
+                        zi_mid=iso_band.iso_zi_mid_B, zi_side=iso_band.iso_zi_side_B
+                    ) * gain_scale
+                else:
+                    out_B = np.zeros_like(in_f64)
+
+                np.clip(out_A, -4.0, 4.0, out=out_A)
+                np.clip(out_B, -4.0, 4.0, out=out_B)
+                return out_A.astype(np.float32), out_B.astype(np.float32)
+
+            # --- MODO NORMAL DUAL BUS (OUT A + OUT B) ---
+            enabled_bands = [b for b in self.bands if b.enabled]
             any_filtering = any(
                 b.is_dynamic_active or abs(b.gain_db) > 0.01 or not b.supports_gain
-                for b in active_bands
+                for b in enabled_bands
             )
             if not any_filtering and abs(self.output_gain_db) < 0.01:
                 for b in self.bands:
@@ -477,20 +845,35 @@ class ParametricEQEngine:
                         b.current_dyn_offset_db *= 0.85
                     else:
                         b.current_dyn_offset_db = 0.0
-                return indata.copy()
+                passthrough = stereo_in.astype(np.float32, copy=True)
+                return passthrough, passthrough.copy()
 
-            out = indata.astype(np.float64, copy=True)
-            frames = out.shape[0]
+            out_A = stereo_in.astype(np.float64, copy=True)
+            out_B = stereo_in.astype(np.float64, copy=True)
+            frames = out_A.shape[0]
             block_duration = frames / self.sr
-            mono_in = (out[:, 0] + out[:, 1]) * 0.5 if (out.ndim > 1 and out.shape[1] > 1) else (out[:, 0] if out.ndim > 1 else out)
+
+            mono_in = 0.5 * (stereo_in[:, 0] + stereo_in[:, 1])
+            side_in = 0.5 * (stereo_in[:, 0] - stereo_in[:, 1])
 
             for band in self.bands:
-                if not band.enabled or (band not in active_bands):
-                    band.current_dyn_offset_db = 0.0 if abs(band.current_dyn_offset_db) < 0.01 else band.current_dyn_offset_db * 0.85
+                if not band.enabled:
+                    band.current_dyn_offset_db = (
+                        0.0 if abs(band.current_dyn_offset_db) < 0.01 else band.current_dyn_offset_db * 0.85
+                    )
                     continue
 
                 if band.is_dynamic_active:
-                    band_signal, band.sc_zi = sosfilt(band.sc_sos, mono_in, zi=band.sc_zi)
+                    if band.channel_mode == "L":
+                        sc_in = stereo_in[:, 0]
+                    elif band.channel_mode == "R":
+                        sc_in = stereo_in[:, 1]
+                    elif band.channel_mode == "Side":
+                        sc_in = side_in
+                    else:
+                        sc_in = mono_in
+
+                    band_signal, band.sc_zi = sosfilt(band.sc_sos, sc_in, zi=band.sc_zi)
                     rms = np.sqrt(np.mean(band_signal ** 2))
                     level_db = 20.0 * np.log10(rms + 1e-10)
 
@@ -526,15 +909,41 @@ class ParametricEQEngine:
                     band.sos_inst = band.sos_static
 
                 if band.is_dynamic_active or abs(band.gain_db) > 0.01 or not band.supports_gain:
-                    out, band.zi = sosfilt(band.sos_inst, out, axis=0, zi=band.zi)
+                    if band.target_output in ("A", "A+B"):
+                        _apply_sos_channel_mode(
+                            band.sos_inst, out_A, band.zi_A, band.channel_mode,
+                            zi_mid=band.zi_mid_A, zi_side=band.zi_side_A
+                        )
+                    if band.target_output in ("B", "A+B"):
+                        _apply_sos_channel_mode(
+                            band.sos_inst, out_B, band.zi_B, band.channel_mode,
+                            zi_mid=band.zi_mid_B, zi_side=band.zi_side_B
+                        )
 
             if abs(self.output_gain_db) >= 0.01:
-                out *= 10.0 ** (self.output_gain_db / 20.0)
+                gain_lin = 10.0 ** (self.output_gain_db / 20.0)
+                out_A *= gain_lin
+                out_B *= gain_lin
 
-            np.clip(out, -4.0, 4.0, out=out)
-            return out.astype(np.float32)
+            np.clip(out_A, -4.0, 4.0, out=out_A)
+            np.clip(out_B, -4.0, 4.0, out=out_B)
+            return out_A.astype(np.float32), out_B.astype(np.float32)
 
-    def get_combined_responses_db(self, z1: np.ndarray, z2: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    def process_block(self, indata: np.ndarray) -> np.ndarray:
+        """Procesa un bloque devolviendo la salida principal `out_A` (compatible con llamadas de 1 bus)."""
+        out_A, _ = self.process_dual_block(indata)
+        if indata.ndim == 1:
+            return out_A[:, 0]
+        if indata.shape[1] == 1:
+            return out_A[:, 0:1]
+        return out_A
+
+    def get_combined_responses_db(
+        self,
+        z1: np.ndarray,
+        z2: np.ndarray,
+        target_bus: str | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
         with self.lock:
             n = len(z1)
             total_static = np.zeros(n, dtype=np.float64)
@@ -543,7 +952,17 @@ class ParametricEQEngine:
             if self.bypass:
                 return total_static, total_dyn
 
-            active_bands = self.get_active_bands()
+            iso_idx = self._resolve_isolated_band_index()
+            if iso_idx is not None:
+                iso_b = self.bands[iso_idx]
+                if target_bus == "A" and iso_b.target_output not in ("A", "A+B"):
+                    return np.full(n, -120.0, dtype=np.float64), np.full(n, -120.0, dtype=np.float64)
+                if target_bus == "B" and iso_b.target_output not in ("B", "A+B"):
+                    return np.full(n, -120.0, dtype=np.float64), np.full(n, -120.0, dtype=np.float64)
+                iso_resp = iso_b.get_isolate_freq_response_db(z1, z2) + self.output_gain_db
+                return iso_resp, iso_resp.copy()
+
+            active_bands = self.get_active_bands(target_bus=target_bus)
             for band in active_bands:
                 static_db = band.get_static_freq_response_db(z1, z2)
                 total_static += static_db
