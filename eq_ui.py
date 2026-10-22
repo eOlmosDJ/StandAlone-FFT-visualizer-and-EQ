@@ -4,7 +4,7 @@ import numpy as np
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QComboBox, QFrame, QMenu, QColorDialog, QDialog, QToolTip,
-    QGraphicsOpacityEffect, QListView
+    QGraphicsOpacityEffect, QListView, QSlider
 )
 from PyQt6.QtCore import Qt, QEvent, QPoint, QPointF, QRectF, pyqtSignal
 from PyQt6.QtGui import (
@@ -1561,6 +1561,9 @@ class ProQ4Overlay(QWidget):
         self._ghost_has_pos = False
         self._proposed_band = None
 
+        self._current_y_floor = -132.0
+        self._current_y_ceil = 12.0
+
         # Variables para auto-cierre del menú de nodo por distancia (> 55px por > 0.3s)
         self._callout_away_since = None
 
@@ -1582,17 +1585,32 @@ class ProQ4Overlay(QWidget):
         """
         return self.eq_range_db * 1.20
 
+    def update_y_range(self, y_floor: float, y_ceil: float):
+        """
+        Sincroniza el ViewBox de EQ (eq_vb) con el ViewBox principal de la FFT.
+        Mantiene la correspondencia visual matemática exacta:
+        v_EQ = (v_FFT + 60.0) * (self.eq_range_db / 60.0).
+        """
+        self._current_y_floor = float(y_floor)
+        self._current_y_ceil = float(y_ceil)
+        scale = self.eq_range_db / 60.0
+        ymin = (self._current_y_floor + 60.0) * scale
+        ymax = (self._current_y_ceil + 60.0) * scale
+        self.eq_vb.setYRange(ymin, ymax, padding=0.0)
+        self._update_vb_geometry()
+        if hasattr(self, "zero_line"):
+            self.update_eq_curves(force=True)
+
     def set_eq_range_db(self, range_db: float):
         new_r = 30.0 if float(range_db) >= 20.0 else 12.0
         if abs(new_r - self.eq_range_db) > 1e-3:
             self.eq_range_db = new_r
-            lim = self._effective_eq_vb_limit()
-            self.eq_vb.setYRange(-lim, lim, padding=0.0)
-            self.update_eq_curves(force=True)
+            self.update_y_range(self._current_y_floor, self._current_y_ceil)
             self.eq_range_changed.emit(self.eq_range_db)
 
     def toggle_eq_range_db(self):
         self.set_eq_range_db(30.0 if self.eq_range_db <= 12.0 else 12.0)
+        return self.eq_range_db
 
     def _rebuild_eval_freqs(self):
         self.nyquist = max(1000.0, self.eq_engine.sr / 2.0)
@@ -1626,8 +1644,7 @@ class ProQ4Overlay(QWidget):
         self.eq_vb.setMouseEnabled(x=False, y=False)
         self.plot_item.scene().addItem(self.eq_vb)
         self.eq_vb.setXLink(self.plot_item.vb)
-        lim = self._effective_eq_vb_limit()
-        self.eq_vb.setYRange(-lim, lim, padding=0.0)
+        self.update_y_range(self._current_y_floor, self._current_y_ceil)
 
         self.plot_item.vb.sigResized.connect(self._update_vb_geometry)
         self._update_vb_geometry()
@@ -1994,10 +2011,7 @@ class ProQ4Overlay(QWidget):
         self.is_x_log = bool(is_x_log)
         self.eq_engine.sr = float(sr)
         self._rebuild_eval_freqs()
-        lim = self._effective_eq_vb_limit()
-        self.eq_vb.setYRange(-lim, lim, padding=0.0)
-        self._update_vb_geometry()
-        self.update_eq_curves(force=True)
+        self.update_y_range(self._current_y_floor, self._current_y_ceil)
 
     def freq_to_x(self, freq: float) -> float:
         f = float(np.clip(freq, 10.0, self.nyquist))
@@ -3230,3 +3244,483 @@ class FloatingBandHUD(QWidget):
 
 # Alias de compatibilidad
 EQControlPanel = FloatingBandHUD
+
+
+class LimiterGRMiniWidget(QWidget):
+    """
+    Mini-widget indicador de Reducción de Ganancia (GR) en tiempo real estilo Fruity Limiter.
+    Ubicado en la cabecera del osciloscopio junto a los controles del limitador.
+    """
+
+    clicked = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(82, 20)
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip("Reducción de Ganancia (GR) en tiempo real del Limitador Master")
+        self.gr_db = 0.0
+
+    def set_gr(self, gr_db: float):
+        new_gr = float(min(0.0, gr_db))
+        if abs(new_gr - self.gr_db) > 0.04:
+            self.gr_db = new_gr
+            self.update()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        event.accept()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        w = self.width()
+        h = self.height()
+
+        # Fondo del widget padre (#101216) para WA_OpaquePaintEvent
+        painter.fillRect(0, 0, w, h, QColor("#101216"))
+
+        # Fondo cápsula
+        bg_col = QColor("#16181E")
+        border_col = QColor("#D500F9" if self.gr_db < -0.2 else "#2B303C")
+        painter.setPen(QPen(border_col, 1))
+        painter.setBrush(QBrush(bg_col))
+        painter.drawRoundedRect(QRectF(0.5, 0.5, w - 1, h - 1), 4.0, 4.0)
+
+        # Barra de atenuación (Rango 0 dB a -18 dB)
+        ratio = float(np.clip(-self.gr_db / 18.0, 0.0, 1.0))
+        if ratio > 0.01:
+            bar_w = int(round(ratio * (w - 6)))
+            bar_grad = QLinearGradient(3, 0, 3 + bar_w, 0)
+            bar_grad.setColorAt(0.0, QColor("#AA00FF"))
+            bar_grad.setColorAt(1.0, QColor("#D500F9"))
+            painter.fillRect(QRectF(3, 2, bar_w, h - 4), bar_grad)
+
+        # Texto GR
+        font = QFont("Segoe UI", 8, QFont.Weight.Bold)
+        painter.setFont(font)
+        text_col = QColor("#FFFFFF" if self.gr_db < -0.2 else "#787C85")
+        painter.setPen(text_col)
+        txt = f"GR {self.gr_db:.1f}" if self.gr_db < -0.05 else "GR 0.0"
+        painter.drawText(QRectF(0, 0, w, h), Qt.AlignmentFlag.AlignCenter, txt)
+
+
+class LimiterControlPopup(QWidget):
+    """
+    Panel flotante no-modal de controles para el Limitador Master estilo 'Fruity Limiter'.
+    Permite ajustar Threshold, Ceiling, Attack, Release y visualizar la reducción de ganancia en vivo.
+    """
+
+    def __init__(self, eq_engine, overlay_ref=None, app_ref=None, parent=None):
+        super().__init__(parent, Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
+        self.eq_engine = eq_engine
+        self.overlay_ref = overlay_ref
+        self.app_ref = app_ref
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+        self.setFixedWidth(340)
+
+        self.setStyleSheet("""
+            QWidget {
+                background-color: #16181E;
+                color: #ECEFF4;
+                font-family: "Segoe UI", sans-serif;
+                font-size: 11px;
+            }
+            QSlider::groove:horizontal {
+                height: 4px;
+                background: #252830;
+                border-radius: 2px;
+            }
+            QSlider::sub-page:horizontal {
+                background: #D500F9;
+                border-radius: 2px;
+            }
+            QSlider::handle:horizontal {
+                background: #FFFFFF;
+                border: 1px solid #D500F9;
+                width: 12px;
+                margin-top: -4px;
+                margin-bottom: -4px;
+                border-radius: 6px;
+            }
+            QPushButton#toggleBtn {
+                background-color: #D500F9;
+                color: #FFFFFF;
+                font-weight: bold;
+                border: 1px solid #EA80FC;
+                border-radius: 4px;
+                padding: 4px 10px;
+                font-size: 11px;
+            }
+            QPushButton#toggleBtn:checked {
+                background-color: #D500F9;
+                color: #FFFFFF;
+            }
+            QPushButton#actionBtn {
+                background-color: #242730;
+                color: #B0B5C0;
+                border: 1px solid #363C48;
+                border-radius: 4px;
+                padding: 3px 10px;
+                font-size: 10px;
+            }
+            QPushButton#actionBtn:hover {
+                background-color: #2F3340;
+                color: #FFFFFF;
+            }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(10)
+
+        # Encabezado
+        hdr_row = QHBoxLayout()
+        title_lbl = QLabel("🛡 Limitador Master (Fruity Limiter)")
+        title_lbl.setStyleSheet("font-weight: bold; font-size: 11px; color: #E5E9F0;")
+        hdr_row.addWidget(title_lbl)
+        hdr_row.addStretch(1)
+
+        close_btn = QPushButton("✕")
+        close_btn.setFixedSize(18, 18)
+        close_btn.setStyleSheet("""
+            QPushButton {
+                background: transparent;
+                color: #8C919B;
+                border: none;
+                font-weight: bold;
+                font-size: 11px;
+            }
+            QPushButton:hover {
+                color: #FF5252;
+            }
+        """)
+        close_btn.clicked.connect(self.close)
+        hdr_row.addWidget(close_btn)
+        layout.addLayout(hdr_row)
+
+        # Fila de Activación y Medidor GR en vivo
+        act_row = QHBoxLayout()
+        self.toggle_btn = QPushButton("Limitador: ACTIVO")
+        self.toggle_btn.setObjectName("toggleBtn")
+        self.toggle_btn.setCheckable(True)
+        self.toggle_btn.setChecked(self.eq_engine.limiter_a.enabled)
+        self.toggle_btn.clicked.connect(self._on_toggle_clicked)
+        act_row.addWidget(self.toggle_btn)
+        act_row.addStretch(1)
+
+        self.gr_lbl = QLabel("GR: 0.0 dB")
+        self.gr_lbl.setStyleSheet("font-size: 12px; font-weight: bold; color: #8C919B;")
+        act_row.addWidget(self.gr_lbl)
+        layout.addLayout(act_row)
+
+        # Barra visual de GR
+        self.meter_bar = QWidget()
+        self.meter_bar.setFixedHeight(8)
+        self.meter_bar.setStyleSheet("background-color: #21242C; border-radius: 3px;")
+        layout.addWidget(self.meter_bar)
+
+        # Separador
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet("color: #262A34; margin: 1px 0;")
+        layout.addWidget(sep)
+
+        # 4 Sliders de parámetros
+        # 1. THR (Threshold): -30.0 dB a 0.0 dB
+        self.thr_slider, self.thr_val_lbl = self._create_param_row(
+            layout, "THR (Umbral):",
+            vmin=-300, vmax=0,
+            init_val=int(round(self.eq_engine.limiter_a.threshold_db * 10)),
+            fmt_fn=lambda v: f"{v / 10.0:.1f} dB",
+            callback=self._on_thr_changed,
+        )
+
+        # 2. CEIL (Ceiling): -12.0 dB a 0.0 dB
+        self.ceil_slider, self.ceil_val_lbl = self._create_param_row(
+            layout, "CEIL (Techo):",
+            vmin=-120, vmax=0,
+            init_val=int(round(self.eq_engine.limiter_a.ceiling_db * 10)),
+            fmt_fn=lambda v: f"{v / 10.0:.1f} dB",
+            callback=self._on_ceil_changed,
+        )
+
+        # 3. ATT (Attack): 0.1 ms a 100.0 ms
+        self.att_slider, self.att_val_lbl = self._create_param_row(
+            layout, "ATT (Ataque):",
+            vmin=1, vmax=1000,
+            init_val=int(round(self.eq_engine.limiter_a.attack_ms * 10)),
+            fmt_fn=lambda v: f"{v / 10.0:.1f} ms",
+            callback=self._on_att_changed,
+        )
+
+        # 4. REL (Release): 1.0 ms a 500.0 ms
+        self.rel_slider, self.rel_val_lbl = self._create_param_row(
+            layout, "REL (Relajación):",
+            vmin=1, vmax=500,
+            init_val=int(round(self.eq_engine.limiter_a.release_ms)),
+            fmt_fn=lambda v: f"{v} ms",
+            callback=self._on_rel_changed,
+        )
+
+        # Botones inferiores: Restaurar y Listo
+        bot_row = QHBoxLayout()
+        reset_btn = QPushButton("Restaurar por defecto")
+        reset_btn.setObjectName("actionBtn")
+        reset_btn.clicked.connect(self._reset_defaults)
+        bot_row.addWidget(reset_btn)
+        bot_row.addStretch(1)
+
+        done_btn = QPushButton("Listo")
+        done_btn.setObjectName("actionBtn")
+        done_btn.clicked.connect(self.close)
+        bot_row.addWidget(done_btn)
+        layout.addLayout(bot_row)
+
+        self._update_toggle_style()
+
+    def _create_param_row(self, parent_layout, label_text, vmin, vmax, init_val, fmt_fn, callback):
+        row = QHBoxLayout()
+        lbl = QLabel(label_text)
+        lbl.setFixedWidth(110)
+        lbl.setStyleSheet("color: #D8DEE9; font-size: 10px;")
+        row.addWidget(lbl)
+
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(vmin, vmax)
+        slider.setValue(init_val)
+        row.addWidget(slider, 1)
+
+        val_lbl = QLabel(fmt_fn(init_val))
+        val_lbl.setFixedWidth(55)
+        val_lbl.setStyleSheet("color: #D500F9; font-weight: bold; font-size: 10px;")
+        val_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        row.addWidget(val_lbl)
+
+        slider.valueChanged.connect(lambda v: (val_lbl.setText(fmt_fn(v)), callback(v)))
+        parent_layout.addLayout(row)
+        return slider, val_lbl
+
+    def _update_toggle_style(self):
+        enabled = self.eq_engine.limiter_a.enabled
+        if enabled:
+            self.toggle_btn.setText("Limitador: ACTIVO")
+            self.toggle_btn.setStyleSheet("""
+                background-color: #D500F9;
+                color: #FFFFFF;
+                font-weight: bold;
+                border: 1px solid #EA80FC;
+                border-radius: 4px;
+                padding: 4px 10px;
+            """)
+        else:
+            self.toggle_btn.setText("Limitador: APAGADO")
+            self.toggle_btn.setStyleSheet("""
+                background-color: #262932;
+                color: #7E8594;
+                font-weight: bold;
+                border: 1px solid #3E4350;
+                border-radius: 4px;
+                padding: 4px 10px;
+            """)
+
+    def _on_toggle_clicked(self, checked: bool):
+        self.eq_engine.limiter_a.enabled = checked
+        self.eq_engine.limiter_b.enabled = checked
+        self._update_toggle_style()
+        if self.overlay_ref:
+            self.overlay_ref.invalidate_cache()
+        if self.app_ref:
+            self.app_ref.schedule_config_save()
+
+    def _on_thr_changed(self, v: int):
+        val_db = v / 10.0
+        self.eq_engine.limiter_a.threshold_db = val_db
+        self.eq_engine.limiter_b.threshold_db = val_db
+        self.eq_engine.limiter_a._update_coefficients()
+        self.eq_engine.limiter_b._update_coefficients()
+        if self.overlay_ref:
+            self.overlay_ref.invalidate_cache()
+        if self.app_ref:
+            self.app_ref.schedule_config_save()
+
+    def _on_ceil_changed(self, v: int):
+        val_db = v / 10.0
+        self.eq_engine.limiter_a.ceiling_db = val_db
+        self.eq_engine.limiter_b.ceiling_db = val_db
+        self.eq_engine.limiter_a._update_coefficients()
+        self.eq_engine.limiter_b._update_coefficients()
+        if self.app_ref:
+            self.app_ref.schedule_config_save()
+
+    def _on_att_changed(self, v: int):
+        val_ms = v / 10.0
+        self.eq_engine.limiter_a.attack_ms = val_ms
+        self.eq_engine.limiter_b.attack_ms = val_ms
+        self.eq_engine.limiter_a._update_coefficients()
+        self.eq_engine.limiter_b._update_coefficients()
+        if self.app_ref:
+            self.app_ref.schedule_config_save()
+
+    def _on_rel_changed(self, v: int):
+        val_ms = float(v)
+        self.eq_engine.limiter_a.release_ms = val_ms
+        self.eq_engine.limiter_b.release_ms = val_ms
+        self.eq_engine.limiter_a._update_coefficients()
+        self.eq_engine.limiter_b._update_coefficients()
+        if self.app_ref:
+            self.app_ref.schedule_config_save()
+
+    def set_live_gr(self, gr_db: float):
+        if not self.isVisible():
+            return
+        if gr_db < -0.05:
+            self.gr_lbl.setText(f"GR: {gr_db:.1f} dB")
+            self.gr_lbl.setStyleSheet("font-size: 12px; font-weight: bold; color: #D500F9;")
+            ratio = float(np.clip(-gr_db / 18.0, 0.0, 1.0))
+            self.meter_bar.setStyleSheet(f"""
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #AA00FF, stop:{ratio} #D500F9, stop:{min(1.0, ratio + 0.001)} #21242C, stop:1 #21242C);
+                border-radius: 3px;
+            """)
+        else:
+            self.gr_lbl.setText("GR: 0.0 dB")
+            self.gr_lbl.setStyleSheet("font-size: 12px; font-weight: bold; color: #787C85;")
+            self.meter_bar.setStyleSheet("background-color: #21242C; border-radius: 3px;")
+
+    update_meter = set_live_gr
+
+    def _reset_defaults(self):
+        self.toggle_btn.setChecked(True)
+        self._on_toggle_clicked(True)
+
+        self.thr_slider.blockSignals(True)
+        self.thr_slider.setValue(0)
+        self.thr_val_lbl.setText("0.0 dB")
+        self.thr_slider.blockSignals(False)
+        self._on_thr_changed(0)
+
+        self.ceil_slider.blockSignals(True)
+        self.ceil_slider.setValue(-1)
+        self.ceil_val_lbl.setText("-0.1 dB")
+        self.ceil_slider.blockSignals(False)
+        self._on_ceil_changed(-1)
+
+        self.att_slider.blockSignals(True)
+        self.att_slider.setValue(20)
+        self.att_val_lbl.setText("2.0 ms")
+        self.att_slider.blockSignals(False)
+        self._on_att_changed(20)
+
+        self.rel_slider.blockSignals(True)
+        self.rel_slider.setValue(50)
+        self.rel_val_lbl.setText("50 ms")
+        self.rel_slider.blockSignals(False)
+        self._on_rel_changed(50)
+
+
+class MiniOscilloscopeWidget(QWidget):
+    """
+    Mini-Osciloscopio a 60 FPS reales y 0% CPU con Scroll Blitting de 1 píxel.
+    Acumula picos O(1) entre frames visuales sin bucles en Python ni sobrecarga de GPU.
+    """
+    clicked = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(240, 22)
+        self._pixmap = QPixmap(self.size())
+        self._pixmap.fill(Qt.GlobalColor.transparent)
+        self._pending_min = 0.0
+        self._pending_max = 0.0
+        self._pending_gr_db = 0.0
+        self._has_new_data = False
+        self._accum_steps = 0.0
+        self._step_per_frame = 1.0  # Se ajusta según 1s, 5s, 10s
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip("Clic para desplegar / plegar el Osciloscopio detallado")
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+            event.accept()
+
+    def set_time_window(self, seconds: float, fps: float = 45.0):
+        # Cuántos píxeles debe avanzar por frame para cubrir el ancho en 'seconds'
+        total_frames = max(1.0, float(seconds) * fps)
+        self._step_per_frame = self.width() / total_frames
+
+    def push_audio_peaks(self, vmin: float, vmax: float, gr_db: float):
+        # Acumula el pico más extremo entre frames visuales (O(1), sin np.roll)
+        if not self._has_new_data:
+            self._pending_min = vmin
+            self._pending_max = vmax
+            self._pending_gr_db = gr_db
+            self._has_new_data = True
+        else:
+            if vmin < self._pending_min: self._pending_min = vmin
+            if vmax > self._pending_max: self._pending_max = vmax
+            if gr_db < self._pending_gr_db: self._pending_gr_db = gr_db
+
+    def tick_render(self, wave_color: QColor):
+        if not self._has_new_data:
+            return
+        self._accum_steps += self._step_per_frame
+        dx = int(self._accum_steps)
+        if dx < 1:
+            return
+        self._accum_steps -= dx
+
+        w, h = self.width(), self.height()
+        mid_y = h * 0.5
+
+        # 1. Desplazar imagen existente dx píxeles a la izquierda (0% CPU)
+        self._pixmap.scroll(-dx, 0, self._pixmap.rect())
+
+        p = QPainter(self._pixmap)
+        # 2. Limpiar solo la franja derecha nueva de ancho dx
+        p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+        p.fillRect(w - dx, 0, dx, h, Qt.GlobalColor.transparent)
+        p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+
+        # 3. Dibujar onda en la franja nueva
+        y1 = int(np.clip(mid_y - self._pending_max * (mid_y - 2), 1, h - 1))
+        y2 = int(np.clip(mid_y - self._pending_min * (mid_y - 2), 1, h - 1))
+        p.setPen(QPen(wave_color, 1))
+        for x in range(w - dx, w):
+            p.drawLine(x, y1, x, max(y1 + 1, y2))
+
+        # 4. Dibujar Reducción de Ganancia (Limitador) en púrpura desde el techo
+        if self._pending_gr_db < -0.1:
+            gr_h = int(min(h * 0.6, abs(self._pending_gr_db) * 1.2))
+            p.fillRect(w - dx, 0, dx, max(2, gr_h), QColor(213, 0, 249, 210))
+
+        p.end()
+        self._has_new_data = False
+        self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        clip = QPainterPath()
+        clip.addRoundedRect(QRectF(self.rect()), 9.0, 9.0)
+        p.setClipPath(clip)
+        p.drawPixmap(0, 0, self._pixmap)
+
+    def invalidate_canvas(self):
+        self._pixmap.fill(Qt.GlobalColor.transparent)
+        self.update()
+
+    def set_current_gr(self, gr_db: float):
+        self._pending_gr_db = float(gr_db)
+
+    def refresh_scope(self):
+        self.tick_render(QColor("#00E5FF"))
+
+
+# Aliases de compatibilidad
+CompactScopeGLWidget = MiniOscilloscopeWidget
+_CompactScopeCanvas = MiniOscilloscopeWidget
+OverlayMaskWidget = MiniOscilloscopeWidget

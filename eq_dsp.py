@@ -600,6 +600,169 @@ class EQBand:
         return b
 
 
+class MasterLimiter:
+    """
+    Limitador Master de Picos en Tiempo Real estilo 'Fruity Limiter'.
+    - Previene clipping digital asegurando que la salida no supere `ceiling_db`.
+    - Envelope follower con constantes de tiempo de Attack y Release.
+    - Expone `last_gr_db` y `last_gr_linear` para la visualización en el osciloscopio y vúmetro de reducción de ganancia.
+    """
+
+    def __init__(
+        self,
+        sr: float = 48000.0,
+        ceiling_db: float = -0.1,
+        threshold_db: float = 0.0,
+        attack_ms: float = 2.0,
+        release_ms: float = 50.0,
+        enabled: bool = True,
+    ):
+        self.sr = float(sr)
+        self.ceiling_db = float(ceiling_db)
+        self.threshold_db = float(threshold_db)
+        self.attack_ms = float(attack_ms)
+        self.release_ms = float(release_ms)
+        self.enabled = bool(enabled)
+
+        self.current_gain_linear = 1.0
+        self.last_gr_db = 0.0
+        self.last_gr_linear = 1.0
+
+        self._update_coefficients()
+
+    def set_sample_rate(self, sr: float):
+        self.sr = max(1000.0, float(sr))
+        self._update_coefficients()
+
+    def _update_coefficients(self):
+        self.thresh_lin = float(10.0 ** (self.threshold_db / 20.0))
+        self.ceil_lin = float(10.0 ** (self.ceiling_db / 20.0))
+
+        # Sub-bloque de 8 muestras para suavizado ultrarrápido sin aliasing
+        self.sub_size = 8
+        dt = self.sub_size / self.sr
+        att_sec = max(1e-5, self.attack_ms / 1000.0)
+        rel_sec = max(1e-4, self.release_ms / 1000.0)
+        self.alpha_att = float(np.exp(-dt / att_sec))
+        self.alpha_rel = float(np.exp(-dt / rel_sec))
+
+    def set_params(
+        self,
+        ceiling_db: float | None = None,
+        threshold_db: float | None = None,
+        attack_ms: float | None = None,
+        release_ms: float | None = None,
+        enabled: bool | None = None,
+    ):
+        if ceiling_db is not None:
+            self.ceiling_db = float(ceiling_db)
+        if threshold_db is not None:
+            self.threshold_db = float(threshold_db)
+        if attack_ms is not None:
+            self.attack_ms = float(attack_ms)
+        if release_ms is not None:
+            self.release_ms = float(release_ms)
+        if enabled is not None:
+            self.enabled = bool(enabled)
+        self._update_coefficients()
+
+    def process(self, block: np.ndarray) -> np.ndarray:
+        if not self.enabled or block.size == 0:
+            self.last_gr_db = 0.0
+            self.last_gr_linear = 1.0
+            return block
+
+        frames = block.shape[0]
+        # Pico absoluto por muestra en canales L y R
+        if block.ndim > 1:
+            peak_env = np.max(np.abs(block[:, 0:2]), axis=1)
+        else:
+            peak_env = np.abs(block)
+
+        max_peak = float(np.max(peak_env))
+        # Si la señal está por debajo del umbral y la ganancia ya se recuperó completamente:
+        if max_peak <= self.thresh_lin and self.current_gain_linear >= 0.999:
+            self.current_gain_linear = 1.0
+            self.last_gr_db = 0.0
+            self.last_gr_linear = 1.0
+            return block
+
+        # Ganancia objetivo instantánea
+        target_lin = np.where(
+            peak_env > self.thresh_lin,
+            np.minimum(1.0, self.ceil_lin / (peak_env + 1e-12)),
+            1.0,
+        )
+
+        sub_sz = self.sub_size
+        n_sub = frames // sub_sz
+        if n_sub > 0:
+            rem = frames % sub_sz
+            main_len = n_sub * sub_sz
+            target_sub = np.min(target_lin[:main_len].reshape(n_sub, sub_sz), axis=1)
+
+            gr_sub = np.empty(n_sub, dtype=np.float32)
+            g = self.current_gain_linear
+            a_att = self.alpha_att
+            a_rel = self.alpha_rel
+
+            for k in range(n_sub):
+                tgt = target_sub[k]
+                if tgt < g:
+                    g = a_att * g + (1.0 - a_att) * tgt
+                else:
+                    g = a_rel * g + (1.0 - a_rel) * tgt
+                gr_sub[k] = g
+
+            self.current_gain_linear = g
+            gr_linear = np.repeat(gr_sub, sub_sz)
+            if rem > 0:
+                gr_linear = np.concatenate((gr_linear, np.full(rem, g, dtype=np.float32)))
+        else:
+            dt_s = 1.0 / self.sr
+            a_att_s = float(np.exp(-dt_s / max(1e-5, self.attack_ms / 1000.0)))
+            a_rel_s = float(np.exp(-dt_s / max(1e-4, self.release_ms / 1000.0)))
+            gr_linear = np.empty(frames, dtype=np.float32)
+            g = self.current_gain_linear
+            for k in range(frames):
+                tgt = target_lin[k]
+                if tgt < g:
+                    g = a_att_s * g + (1.0 - a_att_s) * tgt
+                else:
+                    g = a_rel_s * g + (1.0 - a_rel_s) * tgt
+                gr_linear[k] = g
+            self.current_gain_linear = g
+
+        out_block = block * gr_linear[:, None] if block.ndim > 1 else block * gr_linear
+        # Garantía absoluta anti-clipping: jamás supera el ceiling configurado
+        np.clip(out_block, -self.ceil_lin, self.ceil_lin, out=out_block)
+
+        min_g = float(np.min(gr_linear))
+        self.last_gr_linear = min_g
+        self.last_gr_db = float(20.0 * np.log10(max(min_g, 1e-6)))
+
+        return out_block
+
+    def to_dict(self) -> dict:
+        return {
+            "enabled": self.enabled,
+            "ceiling_db": round(self.ceiling_db, 2),
+            "threshold_db": round(self.threshold_db, 2),
+            "attack_ms": round(self.attack_ms, 2),
+            "release_ms": round(self.release_ms, 2),
+        }
+
+    def load_from_dict(self, data: dict):
+        if not isinstance(data, dict):
+            return
+        self.enabled = bool(data.get("enabled", True))
+        self.ceiling_db = float(np.clip(data.get("ceiling_db", -0.1), -12.0, 0.0))
+        self.threshold_db = float(np.clip(data.get("threshold_db", 0.0), -30.0, 0.0))
+        self.attack_ms = float(np.clip(data.get("attack_ms", 2.0), 0.1, 100.0))
+        self.release_ms = float(np.clip(data.get("release_ms", 50.0), 1.0, 500.0))
+        self._update_coefficients()
+
+
 class ParametricEQEngine:
     """
     Motor DSP de Ecualización Paramétrica y Dinámica en Tiempo Real con:
@@ -618,6 +781,8 @@ class ParametricEQEngine:
         self.static_version = 1
         self.bands: list[EQBand] = []
         self.init_default_bands()
+        self.limiter_a = MasterLimiter(sr=self.sr)
+        self.limiter_b = MasterLimiter(sr=self.sr)
 
     def mark_dirty(self):
         self.static_version += 1
@@ -651,6 +816,7 @@ class ParametricEQEngine:
                 "bypass": self.bypass,
                 "output_gain_db": round(self.output_gain_db, 2),
                 "bands": [b.to_dict() for b in self.bands],
+                "limiter": self.limiter_a.to_dict(),
             }
 
     def load_from_dict(self, data: dict):
@@ -660,6 +826,9 @@ class ParametricEQEngine:
             self.bypass = bool(data.get("bypass", False))
             self.output_gain_db = float(np.clip(data.get("output_gain_db", 0.0), -24.0, 24.0))
             self.isolated_band_index = None
+            if "limiter" in data and isinstance(data["limiter"], dict):
+                self.limiter_a.load_from_dict(data["limiter"])
+                self.limiter_b.load_from_dict(data["limiter"])
             bands_raw = data.get("bands")
             if isinstance(bands_raw, list) and len(bands_raw) > 0:
                 loaded_bands = []
@@ -705,6 +874,8 @@ class ParametricEQEngine:
             for b in self.bands:
                 b.update_coefficients(sr=self.sr, channels=self.channels)
                 b.reset_state()
+            self.limiter_a.set_sample_rate(self.sr)
+            self.limiter_b.set_sample_rate(self.sr)
             self.static_version += 1
 
     def add_band(
@@ -829,8 +1000,8 @@ class ParametricEQEngine:
                 else:
                     out_B = np.zeros_like(in_f64)
 
-                np.clip(out_A, -4.0, 4.0, out=out_A)
-                np.clip(out_B, -4.0, 4.0, out=out_B)
+                out_A = self.limiter_a.process(out_A)
+                out_B = self.limiter_b.process(out_B)
                 return out_A.astype(np.float32), out_B.astype(np.float32)
 
             # --- MODO NORMAL DUAL BUS (OUT A + OUT B) ---
@@ -845,8 +1016,9 @@ class ParametricEQEngine:
                         b.current_dyn_offset_db *= 0.85
                     else:
                         b.current_dyn_offset_db = 0.0
-                passthrough = stereo_in.astype(np.float32, copy=True)
-                return passthrough, passthrough.copy()
+                out_A = self.limiter_a.process(stereo_in.astype(np.float64, copy=True))
+                out_B = self.limiter_b.process(stereo_in.astype(np.float64, copy=True))
+                return out_A.astype(np.float32), out_B.astype(np.float32)
 
             out_A = stereo_in.astype(np.float64, copy=True)
             out_B = stereo_in.astype(np.float64, copy=True)
@@ -925,8 +1097,8 @@ class ParametricEQEngine:
                 out_A *= gain_lin
                 out_B *= gain_lin
 
-            np.clip(out_A, -4.0, 4.0, out=out_A)
-            np.clip(out_B, -4.0, 4.0, out=out_B)
+            out_A = self.limiter_a.process(out_A)
+            out_B = self.limiter_b.process(out_B)
             return out_A.astype(np.float32), out_B.astype(np.float32)
 
     def process_block(self, indata: np.ndarray) -> np.ndarray:

@@ -87,15 +87,18 @@ Process, sculpt, and equalize Windows system audio in real time with ultra-low l
 
 ---
 
-### 5. Ultra-Low CPU Oscilloscope (Scroll-Blitting)
-- **Compact View:** Sleek Liquid Glass capsule in the top bar displaying the live waveform.
-- **Expanded View:** $164\text{ px}$ deep analysis panel showing Left (cyan) and Right (gold) post-EQ channels with second grid markers.
-- **Hardware Scroll-Blitting (`QPixmap.scroll`):** Instead of redrawing 10 seconds of waveform each frame, the offscreen canvas scrolls left by $dx$ pixels and only paints the newest vertical slice ($< 1\%$ CPU utilization).
-- **Time Window Toggle:** Quick toggle between `5s` and `10s` history.
+### 5. Master Peak Limiter & Dynamic Gain Reduction
+- **Studio Peak Limiter (`eq_dsp.py`):** Vectorized NumPy envelope follower with adjustable `Ceiling` (-0.1 dB), `Threshold` (0.0 dB), `Attack` (2.0 ms), and `Release` (50.0 ms) applied independently to both output buses (`Out A` and `Out B`) to prevent clipping.
+- **Live Gain Reduction Overlay:** Real-time purple/magenta envelope rendered directly over the oscilloscope waveform showing instantaneous gain reduction (GR) in dB.
+- **Liquid Glass GR Meter & LED Glow:** Dedicated toolbar mini meter with live numerical readout (`-X.X dB`) and adaptive luminous glow on the mini-scope capsule when limiting is active.
 
----
+### 6. Ultra-Low CPU Oscilloscope & Auto-Headroom FFT
+- **Compact Mini-Scope:** High-framerate Liquid Glass capsule in the top bar displaying real-time audio waveforms and limiter gain reduction.
+- **Expanded Analysis Panel:** Clean oscilloscope panel displaying Left (cyan) and Right (gold) channels alongside limiter action without audio interruptions.
+- **Zero-Glitch Auto-Headroom:** When opening the oscilloscope, the FFT Y-axis scale automatically expands headroom to `+18 dBFS` so the active spectrum and 0 dBFS reference line drop smoothly below the oscilloscope panel. Closing the scope restores standard range without cutting audio.
+- **Time Window Selector:** Instant switching between `1s`, `5s`, and `10s` history buffers.
 
-### 6. Full-Bleed Studio UI & Apple Liquid Glass Aesthetics
+### 7. Full-Bleed Studio UI & Apple Liquid Glass Aesthetics
 - **100% Full-Bleed Canvas:** Zero margins (`0px`) on left, top, bottom, and right. FFT and EQ curves seamlessly touch $x = 0$ on the left and the stereo meter on the right.
 - **Unified Dual Right dB Scales:**
   - **Far-Right Column (`#787C85`):** Signal level scale ($0, -10, -20 \dots -120\text{ dBFS}$).

@@ -1,5 +1,16 @@
 import sys
 import os
+
+# En Windows, fijar explícitamente el AppUserModelID al inicio absoluto ANTES de importar
+# cualquier subsistema GUI (PyQt6 / OpenGL) o multimedia para que Windows Explorer y
+# la barra de tareas asocien siempre el icono personalizado al proceso de la aplicación.
+if sys.platform == "win32":
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("bdj.ffteq.audioanalyzer.1.0")
+    except Exception:
+        pass
+
 import json
 import math
 import queue
@@ -15,7 +26,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import QTimer, Qt, QRectF, QPoint, QPointF, pyqtSignal
 from PyQt6.QtGui import (
     QColor, QCursor, QPainter, QPainterPath, QPen, QBrush,
-    QLinearGradient, QPolygonF, QFont, QPixmap, QIcon
+    QLinearGradient, QPolygonF, QFont, QFontMetrics, QPixmap, QIcon
 )
 import pyqtgraph as pg
 
@@ -26,7 +37,10 @@ try:
 except Exception:
     pg.setConfigOptions(antialias=True)
 
-from eq_ui import ProQ4Overlay, FloatingBandHUD, LiquidGlassButton, style_dark_combobox
+from eq_ui import (
+    ProQ4Overlay, FloatingBandHUD, LiquidGlassButton, style_dark_combobox,
+    LimiterControlPopup, LimiterGRMiniWidget, MiniOscilloscopeWidget, CompactScopeGLWidget
+)
 from fft_analyzer import FFTSpectrumAnalyzer
 from eq_dsp import ParametricEQEngine
 
@@ -35,6 +49,35 @@ def get_resource_path(relative_path: str) -> str:
     """Obtiene la ruta absoluta hacia un recurso, compatible con desarrollo y PyInstaller."""
     base_path = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base_path, relative_path)
+
+
+def apply_windows_taskbar_icon(hwnd: int, icon_path: str):
+    """Asegura que el HWND nativo de Windows reciba explícitamente los iconos grande y pequeño vía Win32 API."""
+    if sys.platform != "win32" or not hwnd or not icon_path or not os.path.exists(icon_path):
+        return
+    try:
+        import ctypes
+        WM_SETICON = 0x0080
+        ICON_SMALL = 0
+        ICON_BIG = 1
+        IMAGE_ICON = 1
+        LR_LOADFROMFILE = 0x00000010
+        LR_DEFAULTSIZE = 0x00000040
+        abs_path = os.path.abspath(icon_path)
+
+        # Cargar HICON explícito de tamaño nativo/grande (Barra de tareas / Alt-Tab) y 16x16 (Barra de título)
+        hicon_big = ctypes.windll.user32.LoadImageW(
+            None, abs_path, IMAGE_ICON, 0, 0, LR_LOADFROMFILE | LR_DEFAULTSIZE
+        )
+        hicon_small = ctypes.windll.user32.LoadImageW(
+            None, abs_path, IMAGE_ICON, 16, 16, LR_LOADFROMFILE
+        )
+        if hicon_big:
+            ctypes.windll.user32.SendMessageW(hwnd, WM_SETICON, ICON_BIG, hicon_big)
+        if hicon_small:
+            ctypes.windll.user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, hicon_small)
+    except Exception:
+        pass
 
 
 DEFAULT_PRESET_NAME = "Gris Puro de Estudio (Default)"
@@ -173,11 +216,57 @@ def save_full_config(config_payload: dict) -> bool:
     return False
 
 
+SIGNAL_KEYS = [
+    "L_in", "R_in", "LR_in",
+    "L_outA", "R_outA", "LR_outA",
+    "L_outB", "R_outB", "LR_outB",
+]
+
+SIGNAL_LABELS = {
+    "L_in": "L In (Pre-EQ)",
+    "R_in": "R In (Pre-EQ)",
+    "LR_in": "L+R In (Pre-EQ)",
+    "L_outA": "L Out 1 (Bus A)",
+    "R_outA": "R Out 1 (Bus A)",
+    "LR_outA": "L+R Out 1 (Bus A)",
+    "L_outB": "L Out 2 (Bus B)",
+    "R_outB": "R Out 2 (Bus B)",
+    "LR_outB": "L+R Out 2 (Bus B)",
+}
+
+SHORT_SIGNAL_LABELS = {
+    "L_in": "L In",
+    "R_in": "R In",
+    "LR_in": "L+R In",
+    "L_outA": "L Out 1",
+    "R_outA": "R Out 1",
+    "LR_outA": "L+R Out 1",
+    "L_outB": "L Out 2",
+    "R_outB": "R Out 2",
+    "LR_outB": "L+R Out 2",
+}
+
+DEFAULT_SIGNAL_COLORS = {
+    "L_in": "#64B5F6",
+    "R_in": "#BA68C8",
+    "LR_in": "#8E95A4",
+    "L_outA": "#00B0FF",
+    "R_outA": "#FFB300",
+    "LR_outA": "#00E5FF",
+    "L_outB": "#69F0AE",
+    "R_outB": "#FFD54F",
+    "LR_outB": "#00E676",
+}
+
+DEFAULT_ACTIVE_SIGNALS = {"LR_in", "LR_outA", "LR_outB"}
+
+
 class WaveformEnvelopeBuffer:
     """
-    Buffer circular ultraliviano de Envolvente Min/Max (Downsampling en Entrada).
-    - Por cada bloque de audio entrante (512 muestras, ~10.6 ms), almacena únicamente
-      (min_l, max_l, min_r, max_r, min_m, max_m).
+    Buffer circular ultraliviano de Envolvente Min/Max para 9 canales simultáneos.
+    - Por cada bloque de audio entrante (512 muestras, ~10.6 ms), extrae y almacena
+      (min, max) para las 9 señales:
+      [L_in, R_in, LR_in, L_outA, R_outA, LR_outA, L_outB, R_outB, LR_outB].
     - Lleva un contador monotónico `total_pushed` para alimentar el Scroll Blitting incremental
       (`QPixmap.scroll(-dx, 0)`) tanto en la vista compacta como en el panel desplegado.
     """
@@ -194,12 +283,17 @@ class WaveformEnvelopeBuffer:
         self.capacity_10s = int(math.ceil(10.0 * blocks_per_sec))
         self.capacity_5s = max(10, self.capacity_10s // 2)
 
-        self.min_l = np.zeros(self.capacity_10s, dtype=np.float32)
-        self.max_l = np.zeros(self.capacity_10s, dtype=np.float32)
-        self.min_r = np.zeros(self.capacity_10s, dtype=np.float32)
-        self.max_r = np.zeros(self.capacity_10s, dtype=np.float32)
-        self.min_m = np.zeros(self.capacity_10s, dtype=np.float32)
-        self.max_m = np.zeros(self.capacity_10s, dtype=np.float32)
+        self.min_data = np.zeros((9, self.capacity_10s), dtype=np.float32)
+        self.max_data = np.zeros((9, self.capacity_10s), dtype=np.float32)
+        self.gr_data = np.zeros(self.capacity_10s, dtype=np.float32)
+
+        # Vistas de conveniencia y compatibilidad hacia atrás
+        self.min_l = self.min_data[3]
+        self.max_l = self.max_data[3]
+        self.min_r = self.min_data[4]
+        self.max_r = self.max_data[4]
+        self.min_m = self.min_data[5]
+        self.max_m = self.max_data[5]
 
         self._silent_blocks = self.capacity_10s + 1
         self.is_at_rest = True
@@ -211,31 +305,72 @@ class WaveformEnvelopeBuffer:
             self._allocate_buffers()
 
     def current_capacity(self) -> int:
-        return self.capacity_5s if self.duration_sec == 5 else self.capacity_10s
+        dur = max(1.0, float(self.duration_sec))
+        return max(10, int(round((dur / 10.0) * self.capacity_10s)))
 
-    def push_blocks(self, blocks: list) -> bool:
+    def push_multi_blocks(
+        self,
+        pre_blocks: list,
+        post_blocks: list,
+        post2_blocks: list = None,
+        gr_db: float = 0.0,
+    ) -> bool:
         """
-        Procesa bloques entrantes extrayendo únicamente (min, max) por bloque.
-        Retorna True si el historial visible cambió y requiere repintado.
+        Procesa bloques entrantes de las 3 fuentes (Pre-EQ, Out 1 / Bus A, Out 2 / Bus B)
+        extrayendo la envolvente Min/Max de las 9 señales y el valor de Gain Reduction (GR).
         """
-        if not blocks:
+        n_blocks = max(
+            len(pre_blocks) if pre_blocks else 0,
+            len(post_blocks) if post_blocks else 0,
+            len(post2_blocks) if post2_blocks else 0,
+        )
+        if n_blocks == 0:
             return False
 
         any_active = False
-        for blk in blocks:
-            if blk.ndim > 1 and blk.shape[1] > 1:
-                ch_l = blk[:, 0]
-                ch_r = blk[:, 1]
-                mono = (ch_l + ch_r) * 0.5
-                l_min, l_max = float(np.min(ch_l)), float(np.max(ch_l))
-                r_min, r_max = float(np.min(ch_r)), float(np.max(ch_r))
-                m_min, m_max = float(np.min(mono)), float(np.max(mono))
+        for i in range(n_blocks):
+            # 1. Pre-EQ (Input)
+            if pre_blocks and i < len(pre_blocks) and pre_blocks[i] is not None:
+                b_in = pre_blocks[i]
+                in_l = b_in[:, 0]
+                in_r = b_in[:, 1] if b_in.ndim > 1 and b_in.shape[1] > 1 else in_l
+                in_m = (in_l + in_r) * 0.5
             else:
-                ch = blk[:, 0] if blk.ndim > 1 else blk
-                l_min = r_min = m_min = float(np.min(ch))
-                l_max = r_max = m_max = float(np.max(ch))
+                in_l = in_r = in_m = None
 
-            peak = max(abs(l_min), abs(l_max), abs(r_min), abs(r_max))
+            # 2. Post-EQ 1 (Bus A)
+            if post_blocks and i < len(post_blocks) and post_blocks[i] is not None:
+                b_out1 = post_blocks[i]
+                out1_l = b_out1[:, 0]
+                out1_r = b_out1[:, 1] if b_out1.ndim > 1 and b_out1.shape[1] > 1 else out1_l
+                out1_m = (out1_l + out1_r) * 0.5
+            else:
+                out1_l = out1_r = out1_m = None
+
+            # 3. Post-EQ 2 (Bus B)
+            if post2_blocks and i < len(post2_blocks) and post2_blocks[i] is not None:
+                b_out2 = post2_blocks[i]
+                out2_l = b_out2[:, 0]
+                out2_r = b_out2[:, 1] if b_out2.ndim > 1 and b_out2.shape[1] > 1 else out2_l
+                out2_m = (out2_l + out2_r) * 0.5
+            else:
+                out2_l = out2_r = out2_m = None
+
+            channels = (in_l, in_r, in_m, out1_l, out1_r, out1_m, out2_l, out2_r, out2_m)
+            mins = np.zeros(9, dtype=np.float32)
+            maxs = np.zeros(9, dtype=np.float32)
+            peak = 0.0
+
+            for ch_idx, ch_arr in enumerate(channels):
+                if ch_arr is not None and len(ch_arr) > 0:
+                    mn = float(np.min(ch_arr))
+                    mx = float(np.max(ch_arr))
+                    mins[ch_idx] = mn
+                    maxs[ch_idx] = mx
+                    p = max(abs(mn), abs(mx))
+                    if p > peak:
+                        peak = p
+
             if peak < 1e-4:
                 self._silent_blocks += 1
             else:
@@ -244,34 +379,29 @@ class WaveformEnvelopeBuffer:
 
             if self._silent_blocks > self.capacity_10s and not any_active:
                 if not self.is_at_rest:
-                    self.min_l.fill(0.0)
-                    self.max_l.fill(0.0)
-                    self.min_r.fill(0.0)
-                    self.max_r.fill(0.0)
-                    self.min_m.fill(0.0)
-                    self.max_m.fill(0.0)
+                    self.min_data.fill(0.0)
+                    self.max_data.fill(0.0)
+                    self.gr_data.fill(0.0)
                     self.is_at_rest = True
                     self.total_pushed += 1
                     return True
                 continue
 
             self.is_at_rest = False
-            self.min_l[:-1] = self.min_l[1:]
-            self.max_l[:-1] = self.max_l[1:]
-            self.min_r[:-1] = self.min_r[1:]
-            self.max_r[:-1] = self.max_r[1:]
-            self.min_m[:-1] = self.min_m[1:]
-            self.max_m[:-1] = self.max_m[1:]
+            self.min_data[:, :-1] = self.min_data[:, 1:]
+            self.max_data[:, :-1] = self.max_data[:, 1:]
+            self.gr_data[:-1] = self.gr_data[1:]
 
-            self.min_l[-1] = np.clip(l_min, -1.0, 1.0)
-            self.max_l[-1] = np.clip(l_max, -1.0, 1.0)
-            self.min_r[-1] = np.clip(r_min, -1.0, 1.0)
-            self.max_r[-1] = np.clip(r_max, -1.0, 1.0)
-            self.min_m[-1] = np.clip(m_min, -1.0, 1.0)
-            self.max_m[-1] = np.clip(m_max, -1.0, 1.0)
+            self.min_data[:, -1] = np.clip(mins, -1.0, 1.0)
+            self.max_data[:, -1] = np.clip(maxs, -1.0, 1.0)
+            self.gr_data[-1] = float(np.clip(gr_db, -60.0, 0.0))
             self.total_pushed += 1
 
         return not self.is_at_rest
+
+    def push_blocks(self, blocks: list) -> bool:
+        """Compatibilidad con llamadas previas."""
+        return self.push_multi_blocks([], blocks, [])
 
     def get_visible_slice(self):
         count = self.current_capacity()
@@ -283,6 +413,14 @@ class WaveformEnvelopeBuffer:
             self.min_m[-count:],
             self.max_m[-count:],
         )
+
+    def get_multi_slice(self, count: int | None = None):
+        c = self.current_capacity() if count is None else int(count)
+        return self.min_data[:, -c:], self.max_data[:, -c:]
+
+    def get_gr_slice(self, count: int | None = None) -> np.ndarray:
+        c = self.current_capacity() if count is None else int(count)
+        return self.gr_data[-c:]
 
 
 class StereoDelayLine:
@@ -489,153 +627,16 @@ class SecondaryOutputRingBuffer:
                 self.is_prebuffering = True
 
 
-class _CompactScopeCanvas(QWidget):
-    """
-    Lienzo interno del mini-osciloscopio en la barra superior usando Scroll Blitting (`QPixmap.scroll`):
-    - Mantiene `self.wave_canvas` (`QPixmap`) en memoria.
-    - En cada frame desplaza con `self.wave_canvas.scroll(-dx, 0, self.wave_canvas.rect())` y pinta
-      únicamente la franja derecha nueva de ancho `dx`.
-    """
-
-    clicked = pyqtSignal()
-
-    def __init__(self, env_buffer: WaveformEnvelopeBuffer, parent=None):
-        super().__init__(parent)
-        self.env_buffer = env_buffer
-        self.wave_canvas: QPixmap | None = None
-        self._last_pushed_seq: int = -1
-        self._px_accum: float = 0.0
-        self._cached_dur: int = -1
-        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setToolTip("Clic para desplegar / plegar el Osciloscopio detallado")
-
-    def invalidate_canvas(self):
-        self.wave_canvas = None
-        self.update()
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self.wave_canvas = None
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.clicked.emit()
-        event.accept()
-
-    def _seed_full_canvas(self):
-        w = max(10, self.width())
-        h = max(10, self.height())
-        self._cached_dur = self.env_buffer.duration_sec
-        self._last_pushed_seq = self.env_buffer.total_pushed
-        self._px_accum = 0.0
-
-        pix = QPixmap(w, h)
-        pix.fill(QColor("#121212"))
-        p = QPainter(pix)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
-
-        mid_y = h // 2
-        p.setPen(QPen(QColor(255, 255, 255, 35), 1))
-        p.drawLine(0, mid_y, w - 1, mid_y)
-
-        _, _, _, _, min_m, max_m = self.env_buffer.get_visible_slice()
-        n_raw = len(min_m)
-        if n_raw >= 2 and not self.env_buffer.is_at_rest:
-            amp = (h * 0.5) - 2.0
-            n_pts = min(180, max(16, w - 4), n_raw)
-            idx = np.linspace(0, n_raw - 1, n_pts, dtype=np.int32)
-            xs = np.linspace(1.0, w - 2.0, n_pts)
-            y_top = mid_y - max_m[idx] * amp
-            y_bot = mid_y - min_m[idx] * amp
-
-            poly = QPolygonF()
-            for i in range(n_pts):
-                xv = float(xs[i])
-                poly.append(QPointF(xv, float(y_top[i])))
-                poly.append(QPointF(xv, float(y_bot[i])))
-            p.setPen(QPen(QColor("#00E5FF"), 1))
-            p.drawPolyline(poly)
-
-        p.end()
-        self.wave_canvas = pix
-
-    def _advance_scroll_canvas(self):
-        if (
-            self.wave_canvas is None
-            or self.wave_canvas.size() != self.size()
-            or self._cached_dur != self.env_buffer.duration_sec
-        ):
-            self._seed_full_canvas()
-            return
-
-        new_blocks = self.env_buffer.total_pushed - self._last_pushed_seq
-        if new_blocks <= 0:
-            return
-        self._last_pushed_seq = self.env_buffer.total_pushed
-
-        if self.env_buffer.is_at_rest:
-            self._seed_full_canvas()
-            return
-
-        w = self.wave_canvas.width()
-        h = self.wave_canvas.height()
-        cap = max(1, self.env_buffer.current_capacity())
-        if new_blocks >= cap // 2:
-            self._seed_full_canvas()
-            return
-
-        exact_px = (new_blocks / float(cap)) * w + self._px_accum
-        dx = int(exact_px)
-        if dx < 1:
-            self._px_accum = exact_px
-            return
-        self._px_accum = exact_px - dx
-        dx = min(dx, w - 2)
-
-        # Scroll Blitting hacia la izquierda en `dx` píxeles
-        self.wave_canvas.scroll(-dx, 0, self.wave_canvas.rect())
-
-        p = QPainter(self.wave_canvas)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
-        x0 = w - dx
-        p.fillRect(x0, 0, dx, h, QColor("#121212"))
-        mid_y = h // 2
-        p.setPen(QPen(QColor(255, 255, 255, 35), 1))
-        p.drawLine(x0, mid_y, w - 1, mid_y)
-
-        n_slice = min(len(self.env_buffer.min_m), new_blocks + 1)
-        min_seg = self.env_buffer.min_m[-n_slice:]
-        max_seg = self.env_buffer.max_m[-n_slice:]
-        amp = (h * 0.5) - 2.0
-
-        poly = QPolygonF()
-        for col in range(dx):
-            frac = col / float(max(1, dx - 1)) if dx > 1 else 1.0
-            si = int(round(frac * (len(min_seg) - 1)))
-            xv = float(x0 + col)
-            yt = float(mid_y - max_seg[si] * amp)
-            yb = float(mid_y - min_seg[si] * amp)
-            poly.append(QPointF(xv, yt))
-            poly.append(QPointF(xv, yb))
-
-        p.setPen(QPen(QColor("#00E5FF"), 1))
-        p.drawPolyline(poly)
-        p.end()
-
-    def paintEvent(self, event):
-        self._advance_scroll_canvas()
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
-        painter.drawPixmap(0, 0, self.wave_canvas)
-        painter.setPen(QPen(QColor("#2E2E2E"), 1))
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawRect(0, 0, self.width() - 1, self.height() - 1)
+# Compatibilidad hacia atrás
+_CompactScopeCanvas = MiniOscilloscopeWidget
+CompactScopeGLWidget = MiniOscilloscopeWidget
 
 
 class WaveformScopeWidget(QWidget):
     """
     Vista Compacta Integrada en la Top Bar Flotante con estética Apple Liquid Glass.
+    Incluye Mini-Osciloscopio a 60 FPS reales y 0% CPU con Scroll Blitting de 1 píxel,
+    control de tiempo (1s / 5s / 10s) y resplandor 'LED' de alerta del Limitador Master.
     """
 
     toggleExpandedRequested = pyqtSignal()
@@ -644,6 +645,8 @@ class WaveformScopeWidget(QWidget):
     def __init__(self, env_buffer: WaveformEnvelopeBuffer, parent=None):
         super().__init__(parent)
         self.env_buffer = env_buffer
+        self._limit_glow_alpha: float = 0.0
+        self.current_duration_sec: int = 10
         self.setFixedSize(338, 30)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
 
@@ -651,15 +654,18 @@ class WaveformScopeWidget(QWidget):
         row.setContentsMargins(7, 3, 6, 3)
         row.setSpacing(4)
 
-        self.canvas = _CompactScopeCanvas(self.env_buffer, self)
-        self.canvas.setFixedSize(256, 22)
-        self.canvas.clicked.connect(self.toggleExpandedRequested.emit)
-        row.addWidget(self.canvas)
+        self.mini_scope = MiniOscilloscopeWidget(self)
+        self.mini_scope.setFixedSize(240, 22)
+        self.mini_scope.set_time_window(10.0)
+        self.mini_scope.clicked.connect(self.toggleExpandedRequested.emit)
+        self.canvas = self.mini_scope  # compat alias
+        row.addWidget(self.mini_scope)
 
         self.dur_btn = LiquidGlassButton("10s", self, pill_radius=10.0)
         self.dur_btn.setFixedSize(36, 22)
-        self.dur_btn.setToolTip("Alternar historial del osciloscopio entre 5s y 10s")
-        self.dur_btn.clicked.connect(self._toggle_duration)
+        self.dur_btn.setToolTip("Alternar tiempo del osciloscopio: 1s -> 5s -> 10s")
+        self.dur_btn.clicked.connect(self._cycle_duration)
+        self.btn_scope_time = self.dur_btn  # compat alias
         row.addWidget(self.dur_btn)
 
         self.expand_btn = LiquidGlassButton("▾", self, active_tint_color="#00E5FF", pill_radius=10.0)
@@ -668,22 +674,42 @@ class WaveformScopeWidget(QWidget):
         self.expand_btn.clicked.connect(self.toggleExpandedRequested.emit)
         row.addWidget(self.expand_btn)
 
-    def _toggle_duration(self):
-        new_dur = 5 if self.env_buffer.duration_sec == 10 else 10
+    def update_gr(self, gr_db: float):
+        """Actualiza el nivel de reducción de ganancia y modula el glow del LED analógico."""
+        if gr_db < -0.2:
+            self._limit_glow_alpha = 1.0
+        else:
+            self._limit_glow_alpha = max(0.0, self._limit_glow_alpha - 0.08)
+
+        self.mini_scope.set_current_gr(gr_db)
+        if self._limit_glow_alpha > 0.0:
+            self.update()
+
+    def _cycle_duration(self):
+        """Alterna cíclicamente el tiempo entre 1s -> 5s -> 10s -> 1s."""
+        cycle_map = {1: 5, 5: 10, 10: 1}
+        new_dur = cycle_map.get(self.current_duration_sec, 10)
         self.set_duration(new_dur)
         self.durationChanged.emit(new_dur)
 
     def set_duration(self, sec: int):
-        self.env_buffer.duration_sec = 5 if int(sec) == 5 else 10
-        self.dur_btn.setText(f"{self.env_buffer.duration_sec}s")
-        self.canvas.invalidate_canvas()
+        sec = int(sec)
+        if sec not in (1, 3, 5, 10):
+            sec = 10
+        self.current_duration_sec = sec
+        self.dur_btn.setText(f"{sec}s")
+        self.mini_scope.set_time_window(float(sec))
+        if hasattr(self, "env_buffer") and self.env_buffer is not None:
+            self.env_buffer.duration_sec = sec
 
     def set_expanded_indicator(self, expanded: bool):
         self.expand_btn.setText("▴" if expanded else "▾")
         self.expand_btn.setChecked(expanded)
 
     def refresh_scope(self):
-        self.canvas.update()
+        self.mini_scope.refresh_scope()
+        if self._limit_glow_alpha > 0.0:
+            self.update()
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -698,6 +724,13 @@ class WaveformScopeWidget(QWidget):
         painter.setBrush(QBrush(fill_grad))
         painter.drawRoundedRect(rect, 14.0, 14.0)
 
+        # "LED" de Alerta: Resplandor (Glow) en la cápsula Liquid Glass
+        if self._limit_glow_alpha > 0.0:
+            glow_pen = QPen(QColor(213, 0, 249, int(150 * self._limit_glow_alpha)), 1.8)
+            painter.setPen(glow_pen)
+            painter.setBrush(QBrush(QColor(213, 0, 249, int(35 * self._limit_glow_alpha))))
+            painter.drawRoundedRect(rect, 14.0, 14.0)
+
         spec_grad = QLinearGradient(rect.left(), rect.top(), rect.right(), rect.bottom())
         spec_grad.setColorAt(0.0, QColor(255, 255, 255, 115))
         spec_grad.setColorAt(0.5, QColor(255, 255, 255, 32))
@@ -707,35 +740,390 @@ class WaveformScopeWidget(QWidget):
         painter.drawRoundedRect(rect, 14.0, 14.0)
 
 
+class ScopeSignalSettingsPopup(QWidget):
+    """
+    Popup flotante no-modal para seleccionar qué señales se visualizan en el osciloscopio desplegado,
+    personalizar sus colores (vía QColorDialog) y ajustar la opacidad global de las curvas.
+    """
+
+    def __init__(self, overlay_widget: "WaveformOverlayWidget", parent=None):
+        super().__init__(parent, Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
+        self.overlay = overlay_widget
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+        self.setFixedWidth(460)
+        self.setStyleSheet("""
+            QWidget {
+                background-color: #181A20;
+                color: #ECEFF4;
+                font-family: "Segoe UI", sans-serif;
+                font-size: 11px;
+            }
+            QCheckBox {
+                color: #D8DEE9;
+                spacing: 6px;
+            }
+            QCheckBox::indicator {
+                width: 13px;
+                height: 13px;
+                border: 1px solid #3E4452;
+                border-radius: 3px;
+                background-color: #21252B;
+            }
+            QCheckBox::indicator:checked {
+                background-color: #00E5FF;
+                border: 1px solid #00B0FF;
+            }
+            QSlider::groove:horizontal {
+                height: 4px;
+                background: #2B303C;
+                border-radius: 2px;
+            }
+            QSlider::sub-page:horizontal {
+                background: #00E5FF;
+                border-radius: 2px;
+            }
+            QSlider::handle:horizontal {
+                background: #FFFFFF;
+                border: 1px solid #00B0FF;
+                width: 12px;
+                margin-top: -4px;
+                margin-bottom: -4px;
+                border-radius: 6px;
+            }
+            QPushButton#actionBtn {
+                background-color: #262B34;
+                color: #C0C5D0;
+                border: 1px solid #363C48;
+                border-radius: 4px;
+                padding: 3px 10px;
+                font-size: 10px;
+            }
+            QPushButton#actionBtn:hover {
+                background-color: #323846;
+                color: #FFFFFF;
+            }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(8)
+
+        # Encabezado
+        hdr_row = QHBoxLayout()
+        title_lbl = QLabel("Configuración de Señales y Opacidad")
+        title_lbl.setStyleSheet("font-weight: bold; font-size: 11px; color: #E5E9F0;")
+        hdr_row.addWidget(title_lbl)
+        hdr_row.addStretch(1)
+        close_btn = QPushButton("✕")
+        close_btn.setFixedSize(18, 18)
+        close_btn.setStyleSheet("""
+            QPushButton {
+                background: transparent;
+                color: #8C919B;
+                border: none;
+                font-weight: bold;
+                font-size: 11px;
+            }
+            QPushButton:hover {
+                color: #FF5252;
+            }
+        """)
+        close_btn.clicked.connect(self.close)
+        hdr_row.addWidget(close_btn)
+        layout.addLayout(hdr_row)
+
+        # 3 Columnas: Entrada Pre-EQ, Salida 1 (Bus A), Salida 2 (Bus B)
+        cols_row = QHBoxLayout()
+        cols_row.setSpacing(10)
+
+        groups_data = [
+            ("Entrada (Pre-EQ)", ["L_in", "R_in", "LR_in"]),
+            ("Salida 1 (Bus A)", ["L_outA", "R_outA", "LR_outA"]),
+            ("Salida 2 (Bus B)", ["L_outB", "R_outB", "LR_outB"]),
+        ]
+
+        self.checkboxes = {}
+        self.swatches = {}
+
+        for group_title, keys in groups_data:
+            col_box = QVBoxLayout()
+            col_box.setSpacing(5)
+            grp_lbl = QLabel(group_title)
+            grp_lbl.setStyleSheet("color: #7E8594; font-weight: bold; font-size: 10px;")
+            col_box.addWidget(grp_lbl)
+
+            for key in keys:
+                item_row = QHBoxLayout()
+                item_row.setSpacing(6)
+                chk = QCheckBox(SHORT_SIGNAL_LABELS[key])
+                chk.setChecked(key in self.overlay.active_signals)
+                chk.toggled.connect(lambda chked, k=key: self._on_chk_toggled(k, chked))
+                self.checkboxes[key] = chk
+                item_row.addWidget(chk, 1)
+
+                swatch = QPushButton()
+                swatch.setFixedSize(20, 15)
+                swatch.setCursor(Qt.CursorShape.PointingHandCursor)
+                col_hex = self.overlay.signal_colors.get(key, "#FFFFFF")
+                swatch.setStyleSheet(f"background-color: {col_hex}; border: 1px solid #444C5C; border-radius: 3px;")
+                swatch.clicked.connect(lambda _, k=key, s=swatch: self._on_pick_color(k, s))
+                self.swatches[key] = swatch
+                item_row.addWidget(swatch)
+
+                col_box.addLayout(item_row)
+
+            cols_row.addLayout(col_box)
+
+        layout.addLayout(cols_row)
+
+        # Separador horizontal
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet("color: #2A2E38; margin: 2px 0;")
+        layout.addWidget(sep)
+
+        # Fila de Opacidad Global
+        opac_row = QHBoxLayout()
+        opac_row.setSpacing(8)
+        opac_lbl = QLabel("Opacidad de curvas:")
+        opac_lbl.setStyleSheet("color: #D8DEE9; font-size: 10px;")
+        opac_row.addWidget(opac_lbl)
+
+        self.opac_slider = QSlider(Qt.Orientation.Horizontal)
+        self.opac_slider.setRange(15, 100)
+        self.opac_slider.setValue(self.overlay.opacity_pct)
+        self.opac_val_lbl = QLabel(f"{self.overlay.opacity_pct}%")
+        self.opac_val_lbl.setFixedWidth(34)
+        self.opac_val_lbl.setStyleSheet("color: #00E5FF; font-weight: bold; font-size: 10px;")
+
+        self.opac_slider.valueChanged.connect(self._on_opacity_slider_changed)
+        opac_row.addWidget(self.opac_slider, 1)
+        opac_row.addWidget(self.opac_val_lbl)
+        layout.addLayout(opac_row)
+
+        # Botones inferiores: Restaurar por defecto y Cerrar
+        bottom_row = QHBoxLayout()
+        reset_btn = QPushButton("Restaurar por defecto")
+        reset_btn.setObjectName("actionBtn")
+        reset_btn.clicked.connect(self._reset_defaults)
+        bottom_row.addWidget(reset_btn)
+        bottom_row.addStretch(1)
+
+        done_btn = QPushButton("Listo")
+        done_btn.setObjectName("actionBtn")
+        done_btn.clicked.connect(self.close)
+        bottom_row.addWidget(done_btn)
+        layout.addLayout(bottom_row)
+
+    def _on_chk_toggled(self, key: str, checked: bool):
+        if checked:
+            self.overlay.active_signals.add(key)
+        else:
+            self.overlay.active_signals.discard(key)
+        self.overlay.invalidate_cache()
+        if hasattr(self.overlay, "app_ref") and self.overlay.app_ref:
+            self.overlay.app_ref.schedule_config_save()
+
+    def _on_pick_color(self, key: str, swatch_btn: QPushButton):
+        curr_hex = self.overlay.signal_colors.get(key, "#FFFFFF")
+        dlg = QColorDialog(QColor(curr_hex), self)
+        dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
+        if dlg.exec():
+            new_hex = dlg.selectedColor().name()
+            self.overlay.signal_colors[key] = new_hex
+            swatch_btn.setStyleSheet(f"background-color: {new_hex}; border: 1px solid #444C5C; border-radius: 3px;")
+            self.overlay.invalidate_cache()
+            if hasattr(self.overlay, "app_ref") and self.overlay.app_ref:
+                self.overlay.app_ref.schedule_config_save()
+
+    def _on_opacity_slider_changed(self, val: int):
+        self.opac_val_lbl.setText(f"{val}%")
+        self.overlay.set_opacity_pct(val)
+        if hasattr(self.overlay, "app_ref") and self.overlay.app_ref:
+            self.overlay.app_ref.schedule_config_save()
+
+    def _reset_defaults(self):
+        self.overlay.reset_signals_to_default()
+        for k, chk in self.checkboxes.items():
+            chk.blockSignals(True)
+            chk.setChecked(k in self.overlay.active_signals)
+            chk.blockSignals(False)
+        for k, sw in self.swatches.items():
+            col = self.overlay.signal_colors.get(k, "#FFFFFF")
+            sw.setStyleSheet(f"background-color: {col}; border: 1px solid #444C5C; border-radius: 3px;")
+        self.opac_slider.blockSignals(True)
+        self.opac_slider.setValue(self.overlay.opacity_pct)
+        self.opac_slider.blockSignals(False)
+        self.opac_val_lbl.setText(f"{self.overlay.opacity_pct}%")
+        self.overlay.invalidate_cache()
+        if hasattr(self.overlay, "app_ref") and self.overlay.app_ref:
+            self.overlay.app_ref.schedule_config_save()
+
+
 class WaveformOverlayWidget(QWidget):
     """
     Panel desplegable del Osciloscopio con Aislamiento OpenGL y Scroll Blitting (`QPixmap.scroll`):
-    1. Aislamiento del Widget: `self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)`
-       e insertado directamente en el `QVBoxLayout` principal (desplazando el gráfico FFT hacia abajo)
-       para no superponerse jamás con transparencia sobre el lienzo `OpenGL`.
-    2. Scroll Blitting (`self.wave_canvas.scroll(-dx, 0, self.wave_canvas.rect())`):
-       En lugar de redibujar 10 segundos de onda en cada cuadro, desplaza `self.wave_canvas` hacia la
-       izquierda `dx` píxeles y pinta únicamente la franja vertical nueva de ancho `dx` en el extremo
-       derecho con los valores `min/max` recién llegados, volcando en `paintEvent` con
-       `painter.drawPixmap(0, 0, self.wave_canvas)` (< 1% de uso de CPU).
+    1. Fondo 100% opaco (`#101216`) con `WA_OpaquePaintEvent = True` para evitar solapamientos
+       o transparencias costosas sobre el lienzo OpenGL.
+    2. Scroll Blitting multi-canal (< 1% CPU): Desplaza `self.wave_canvas` hacia la izquierda `dx`
+       píxeles y dibuja únicamente la franja nueva de ancho `dx` para todas las señales activadas.
+    3. Selector interactivo `⚙ Señales y Color ▾` y control de opacidad en la cabecera.
     """
 
     collapseRequested = pyqtSignal()
 
-    def __init__(self, env_buffer: WaveformEnvelopeBuffer, parent=None):
+    def __init__(self, env_buffer: WaveformEnvelopeBuffer, parent=None, app_ref=None):
         super().__init__(parent)
         self.env_buffer = env_buffer
+        self.app_ref = app_ref
         self.wave_canvas: QPixmap | None = None
         self._hud_overlay_cache: QPixmap | None = None
         self._last_pushed_seq: int = -1
         self._px_accum: float = 0.0
         self._cached_dur: int = -1
 
+        self.active_signals = set(DEFAULT_ACTIVE_SIGNALS)
+        self.signal_colors = dict(DEFAULT_SIGNAL_COLORS)
+        self.opacity_pct = 75
+        self.opacity_alpha = int(75 * 255 / 100)
+        self.settings_popup: ScopeSignalSettingsPopup | None = None
+        self.limiter_popup: LimiterControlPopup | None = None
+
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
-        self.setFixedHeight(168)
+        self.setFixedHeight(164)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setToolTip("Clic para plegar el osciloscopio de vuelta a la barra superior")
+
+        self.settings_btn = QPushButton("⚙ Señales y Color ▾", self)
+        self.settings_btn.setFixedSize(126, 20)
+        self.settings_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.settings_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #20242C;
+                color: #D8DEE9;
+                border: 1px solid #363C48;
+                border-radius: 9px;
+                padding: 1px 6px;
+                font-size: 10px;
+                font-weight: 600;
+            }
+            QPushButton:hover {
+                background-color: #2B303C;
+                border: 1px solid #4E5666;
+                color: #FFFFFF;
+            }
+            QPushButton:pressed {
+                background-color: #1A1D24;
+            }
+        """)
+        self.settings_btn.clicked.connect(self._toggle_settings_popup)
+
+        self.limiter_btn = QPushButton("🛡 Limitador ▾", self)
+        self.limiter_btn.setFixedSize(116, 20)
+        self.limiter_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.limiter_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #20242C;
+                color: #EA80FC;
+                border: 1px solid #7B1FA2;
+                border-radius: 9px;
+                padding: 1px 6px;
+                font-size: 10px;
+                font-weight: 600;
+            }
+            QPushButton:hover {
+                background-color: #2E1B38;
+                border: 1px solid #D500F9;
+                color: #FFFFFF;
+            }
+            QPushButton:pressed {
+                background-color: #1A1D24;
+            }
+        """)
+        self.limiter_btn.clicked.connect(self._toggle_limiter_popup)
+
+        self.gr_meter_widget = LimiterGRMiniWidget(self)
+        self.gr_meter_widget.clicked.connect(self._toggle_limiter_popup)
+
+        self.dur_btn = QPushButton(f"{self.env_buffer.duration_sec}s", self)
+        self.dur_btn.setFixedSize(38, 20)
+        self.dur_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.dur_btn.setToolTip("Alternar ventana de tiempo: 1s -> 5s -> 10s")
+        self.dur_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #20242C;
+                color: #00E5FF;
+                border: 1px solid #363C48;
+                border-radius: 9px;
+                padding: 1px 6px;
+                font-size: 10px;
+                font-weight: 600;
+            }
+            QPushButton:hover {
+                background-color: #2B303C;
+                border: 1px solid #00E5FF;
+                color: #FFFFFF;
+            }
+            QPushButton:pressed {
+                background-color: #1A1D24;
+            }
+        """)
+        self.dur_btn.clicked.connect(self._cycle_duration)
+
         self.hide()
+
+    def _cycle_duration(self):
+        if self.app_ref and hasattr(self.app_ref, "scope_widget"):
+            self.app_ref.scope_widget._cycle_duration()
+
+    def set_opacity_pct(self, pct: int):
+        self.opacity_pct = int(np.clip(pct, 15, 100))
+        self.opacity_alpha = int(self.opacity_pct * 255 / 100)
+        self.invalidate_cache()
+
+    def reset_signals_to_default(self):
+        self.active_signals = set(DEFAULT_ACTIVE_SIGNALS)
+        self.signal_colors = dict(DEFAULT_SIGNAL_COLORS)
+        self.set_opacity_pct(75)
+
+    def set_active_signals(self, signals):
+        self.active_signals = set(s for s in signals if s in SIGNAL_KEYS)
+        self.invalidate_cache()
+
+    def set_signal_colors(self, colors: dict):
+        for k, col in colors.items():
+            if k in SIGNAL_KEYS and isinstance(col, str):
+                self.signal_colors[k] = col
+        self.invalidate_cache()
+
+    def _toggle_settings_popup(self):
+        if self.settings_popup is not None and self.settings_popup.isVisible():
+            self.settings_popup.close()
+            return
+        if self.settings_popup is None:
+            self.settings_popup = ScopeSignalSettingsPopup(self)
+        pos = self.settings_btn.mapToGlobal(QPoint(0, self.settings_btn.height() + 2))
+        self.settings_popup.move(pos)
+        self.settings_popup.show()
+        self.settings_popup.raise_()
+
+    def _toggle_limiter_popup(self):
+        if self.limiter_popup is not None and self.limiter_popup.isVisible():
+            self.limiter_popup.close()
+            return
+        if self.limiter_popup is None:
+            eq_engine = self.app_ref.eq_engine if (self.app_ref and hasattr(self.app_ref, "eq_engine")) else None
+            self.limiter_popup = LimiterControlPopup(eq_engine=eq_engine, overlay_ref=self, app_ref=self.app_ref, parent=self)
+        pos = self.limiter_btn.mapToGlobal(QPoint(0, self.limiter_btn.height() + 2))
+        self.limiter_popup.move(pos)
+        self.limiter_popup.show()
+        self.limiter_popup.raise_()
+
+    def update_gr(self, gr_db: float):
+        if hasattr(self, "gr_meter_widget"):
+            self.gr_meter_widget.set_gr(gr_db)
+        if self.limiter_popup is not None and self.limiter_popup.isVisible():
+            self.limiter_popup.set_live_gr(gr_db)
 
     def invalidate_cache(self):
         self.wave_canvas = None
@@ -747,13 +1135,53 @@ class WaveformOverlayWidget(QWidget):
         super().resizeEvent(event)
         self.wave_canvas = None
         self._hud_overlay_cache = None
+        if hasattr(self, "settings_btn"):
+            self.settings_btn.move(40, 2)
+            self.settings_btn.raise_()
+        if hasattr(self, "limiter_btn"):
+            self.limiter_btn.move(172, 2)
+            self.limiter_btn.raise_()
+        if hasattr(self, "gr_meter_widget"):
+            self.gr_meter_widget.move(294, 2)
+            self.gr_meter_widget.raise_()
+        if hasattr(self, "dur_btn"):
+            self.dur_btn.move(382, 2)
+            self.dur_btn.raise_()
 
     def showEvent(self, event):
         super().showEvent(event)
         self.wave_canvas = None
+        if hasattr(self, "settings_btn"):
+            self.settings_btn.move(40, 2)
+            self.settings_btn.raise_()
+        if hasattr(self, "limiter_btn"):
+            self.limiter_btn.move(172, 2)
+            self.limiter_btn.raise_()
+        if hasattr(self, "gr_meter_widget"):
+            self.gr_meter_widget.move(294, 2)
+            self.gr_meter_widget.raise_()
+        if hasattr(self, "dur_btn"):
+            self.dur_btn.move(382, 2)
+            self.dur_btn.raise_()
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
+            if hasattr(self, "settings_btn") and self.settings_btn.geometry().contains(event.pos()):
+                event.accept()
+                return
+            if hasattr(self, "limiter_btn") and self.limiter_btn.geometry().contains(event.pos()):
+                event.accept()
+                return
+            if hasattr(self, "gr_meter_widget") and self.gr_meter_widget.geometry().contains(event.pos()):
+                event.accept()
+                return
+            if hasattr(self, "dur_btn") and self.dur_btn.geometry().contains(event.pos()):
+                event.accept()
+                return
+            if self.settings_popup and self.settings_popup.isVisible():
+                self.settings_popup.close()
+            if self.limiter_popup and self.limiter_popup.isVisible():
+                self.limiter_popup.close()
             self.collapseRequested.emit()
         event.accept()
 
@@ -761,19 +1189,19 @@ class WaveformOverlayWidget(QWidget):
         event.accept()
 
     def _draw_strip_bg(self, p: QPainter, x0: int, strip_w: int, h: int):
-        p.fillRect(x0, 0, strip_w, h, QColor("#151515"))
-        pad_t = 22
+        p.fillRect(x0, 0, strip_w, h, QColor("#101216"))
+        pad_t = 24
         pad_b = 20
         plot_h = max(10, h - pad_t - pad_b)
         mid_y = pad_t + plot_h // 2
         half_h = plot_h * 0.5
 
-        p.setPen(QPen(QColor("#252525"), 1))
+        p.setPen(QPen(QColor("#1F232B"), 1))
         for level in (-0.5, 0.5):
             y_g = int(round(mid_y - level * half_h))
             p.drawLine(x0, y_g, x0 + strip_w, y_g)
 
-        p.setPen(QPen(QColor("#444444"), 1))
+        p.setPen(QPen(QColor("#3A404D"), 1))
         p.drawLine(x0, mid_y, x0 + strip_w, mid_y)
 
     def _rebuild_hud_overlay_cache(self):
@@ -788,21 +1216,46 @@ class WaveformOverlayWidget(QWidget):
 
         pad_l = 38
         pad_r = 38
-        pad_t = 22
+        pad_t = 24
         pad_b = 20
         plot_w = max(10, w - pad_l - pad_r)
         plot_h = max(10, h - pad_t - pad_b)
+        mid_y = pad_t + plot_h * 0.5
+        half_h = plot_h * 0.5
 
-        # Máscaras laterales opacas y barras superior/inferior de leyenda
-        p.fillRect(0, 0, pad_l, h, QColor("#151515"))
-        p.fillRect(w - pad_r, 0, pad_r, h, QColor("#151515"))
-        p.fillRect(0, 0, w, pad_t, QColor("#151515"))
-        p.fillRect(0, h - pad_b, w, pad_b, QColor("#151515"))
+        # Máscaras laterales 100% opacas (#101216) y barras de leyenda
+        bg_col = QColor("#101216")
+        p.fillRect(0, 0, pad_l, h, bg_col)
+        p.fillRect(w - pad_r, 0, pad_r, h, bg_col)
+        p.fillRect(0, 0, w, pad_t, bg_col)
+        p.fillRect(0, h - pad_b, w, pad_b, bg_col)
 
         # Borde exterior y marco del área de onda
-        p.setPen(QPen(QColor("#2E2E2E"), 1))
+        p.setPen(QPen(QColor("#2A2E38"), 1))
         p.drawRect(0, 0, w - 1, h - 1)
         p.drawRect(pad_l, pad_t, plot_w, plot_h)
+
+        # Línea punteada horizontal del Threshold estilo Fruity Limiter
+        thr_db = 0.0
+        limiter_enabled = True
+        if self.app_ref and hasattr(self.app_ref, "eq_engine") and hasattr(self.app_ref.eq_engine, "limiter_a"):
+            thr_db = getattr(self.app_ref.eq_engine.limiter_a, "threshold_db", 0.0)
+            limiter_enabled = getattr(self.app_ref.eq_engine.limiter_a, "enabled", True)
+
+        if limiter_enabled:
+            thr_lin = min(1.0, max(0.01, 10.0 ** (thr_db / 20.0)))
+            y_thr_top = int(round(mid_y - thr_lin * half_h))
+            y_thr_bot = int(round(mid_y + thr_lin * half_h))
+
+            pen_thr = QPen(QColor(213, 0, 249, 140), 1, Qt.PenStyle.DashLine)
+            p.setPen(pen_thr)
+            p.drawLine(pad_l, y_thr_top, pad_l + plot_w, y_thr_top)
+            p.drawLine(pad_l, y_thr_bot, pad_l + plot_w, y_thr_bot)
+
+            font_thr = QFont("Segoe UI", 7, QFont.Weight.DemiBold)
+            p.setFont(font_thr)
+            p.setPen(QColor("#D500F9"))
+            p.drawText(QRectF(pad_l + 4.0, max(float(pad_t), y_thr_top - 12.0), 65.0, 11.0), Qt.AlignmentFlag.AlignLeft, f"THR {thr_db:.1f} dB")
 
         # Grilla temporal en segundos (-10s ... -5s ... 0s)
         font_grid = QFont("Segoe UI", 8)
@@ -817,17 +1270,29 @@ class WaveformOverlayWidget(QWidget):
             p.setPen(QColor("#8E95A4"))
             p.drawText(QRectF(x_s - 18.0, h - 18.0, 36.0, 15.0), Qt.AlignmentFlag.AlignCenter, lbl)
 
-        # Cabecera del panel (Leyenda L / R y aviso de plegado)
-        font_hdr = QFont("Segoe UI", 8, QFont.Weight.Bold)
-        p.setFont(font_hdr)
-        p.setPen(QColor("#00E5FF"))
-        p.drawText(QRectF(pad_l, 4.0, 130.0, 15.0), Qt.AlignmentFlag.AlignLeft, "● Canal L (Post-EQ)")
-        p.setPen(QColor("#FFB300"))
-        p.drawText(QRectF(pad_l + 135.0, 4.0, 130.0, 15.0), Qt.AlignmentFlag.AlignLeft, "● Canal R (Post-EQ)")
-        p.setPen(QColor("#9AA0A6"))
+        # Badges de señales activas junto a los botones
+        cur_x = 428.0
+        font_badge = QFont("Segoe UI", 8, QFont.Weight.DemiBold)
+        p.setFont(font_badge)
+        fm = QFontMetrics(font_badge)
+        for sig_key in SIGNAL_KEYS:
+            if sig_key in self.active_signals:
+                sig_col = QColor(self.signal_colors.get(sig_key, "#FFFFFF"))
+                badge_txt = SHORT_SIGNAL_LABELS.get(sig_key, sig_key)
+                txt_w = fm.horizontalAdvance(badge_txt) + 16.0
+                if cur_x + txt_w > w - pad_r - 210.0:
+                    break
+                p.setPen(sig_col)
+                p.drawText(QRectF(cur_x, 3.0, 10.0, 18.0), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "●")
+                p.setPen(QColor("#C0C5D0"))
+                p.drawText(QRectF(cur_x + 11.0, 3.0, txt_w - 11.0, 18.0), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, badge_txt)
+                cur_x += txt_w + 6.0
+
+        # Aviso de plegado a la derecha
+        p.setPen(QColor("#8E95A4"))
         p.drawText(
-            QRectF(w - pad_r - 230.0, 4.0, 230.0, 15.0),
-            Qt.AlignmentFlag.AlignRight,
+            QRectF(w - pad_r - 210.0, 3.0, 210.0, 18.0),
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
             f"Historial {dur}s  ▴ Clic para plegar",
         )
         p.end()
@@ -847,40 +1312,64 @@ class WaveformOverlayWidget(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
         self._draw_strip_bg(p, 0, w, h)
 
-        min_l, max_l, min_r, max_r, _, _ = self.env_buffer.get_visible_slice()
-        n_raw = len(min_l)
+        min_full, max_full = self.env_buffer.get_multi_slice()
+        gr_full = self.env_buffer.get_gr_slice()
+        n_raw = min_full.shape[1]
         if n_raw >= 2 and not self.env_buffer.is_at_rest:
-            pad_l = 38.0
-            pad_r = 38.0
-            pad_t = 22.0
-            pad_b = 20.0
-            plot_w = max(10.0, w - pad_l - pad_r)
-            plot_h = max(10.0, h - pad_t - pad_b)
-            mid_y = pad_t + plot_h * 0.5
+            pad_l = 38
+            pad_r = 38
+            pad_t = 24
+            pad_b = 20
+            plot_w = max(10, w - pad_l - pad_r)
+            plot_h = max(10, h - pad_t - pad_b)
+            mid_y = int(pad_t + plot_h * 0.5)
             half_h = plot_h * 0.5
 
             n_pts = min(360, max(32, int(plot_w) // 2), n_raw)
             idx = np.linspace(0, n_raw - 1, n_pts, dtype=np.int32)
             xs = np.linspace(pad_l, pad_l + plot_w, n_pts)
 
-            yr_top = mid_y - max_r[idx] * half_h
-            yr_bot = mid_y - min_r[idx] * half_h
-            yl_top = mid_y - max_l[idx] * half_h
-            yl_bot = mid_y - min_l[idx] * half_h
+            # Fruity Limiter Gain Reduction envelope
+            thr_db = 0.0
+            limiter_enabled = True
+            if self.app_ref and hasattr(self.app_ref, "eq_engine") and hasattr(self.app_ref.eq_engine, "limiter_a"):
+                thr_db = getattr(self.app_ref.eq_engine.limiter_a, "threshold_db", 0.0)
+                limiter_enabled = getattr(self.app_ref.eq_engine.limiter_a, "enabled", True)
 
-            poly_r = QPolygonF()
-            poly_l = QPolygonF()
-            for i in range(n_pts):
-                xv = float(xs[i])
-                poly_r.append(QPointF(xv, float(yr_top[i])))
-                poly_r.append(QPointF(xv, float(yr_bot[i])))
-                poly_l.append(QPointF(xv, float(yl_top[i])))
-                poly_l.append(QPointF(xv, float(yl_bot[i])))
+            if limiter_enabled and gr_full is not None and len(gr_full) >= n_raw:
+                thr_lin = min(1.0, max(0.01, 10.0 ** (thr_db / 20.0)))
+                y_thr_top = int(round(mid_y - thr_lin * half_h))
+                y_thr_bot = int(round(mid_y + thr_lin * half_h))
+                gr_pts = gr_full[idx]
 
-            p.setPen(QPen(QColor("#FFB300"), 1))
-            p.drawPolyline(poly_r)
-            p.setPen(QPen(QColor("#00E5FF"), 1))
-            p.drawPolyline(poly_l)
+                p.setPen(QPen(QColor(213, 0, 249, 190), 1))
+                for i in range(n_pts):
+                    gr_val = float(gr_pts[i])
+                    if gr_val < -0.05:
+                        comp_lin = min(1.0, max(0.001, 10.0 ** ((thr_db + gr_val) / 20.0)))
+                        y_ct = int(round(mid_y - comp_lin * half_h))
+                        y_cb = int(round(mid_y + comp_lin * half_h))
+                        xv = int(round(float(xs[i])))
+                        p.drawLine(xv, y_thr_top, xv, y_ct)
+                        p.drawLine(xv, y_thr_bot, xv, y_cb)
+
+            if len(self.active_signals) > 0:
+                for sig_key in SIGNAL_KEYS:
+                    if sig_key not in self.active_signals:
+                        continue
+                    sig_idx = SIGNAL_KEYS.index(sig_key)
+                    min_ch = min_full[sig_idx, idx]
+                    max_ch = max_full[sig_idx, idx]
+
+                    col_q = QColor(self.signal_colors.get(sig_key, "#FFFFFF"))
+                    col_q.setAlpha(self.opacity_alpha)
+                    p.setPen(QPen(col_q, 1))
+
+                    for i in range(n_pts):
+                        xv = int(round(float(xs[i])))
+                        y_top = int(round(mid_y - max_ch[i] * half_h))
+                        y_bot = int(round(mid_y - min_ch[i] * half_h))
+                        p.drawLine(xv, y_top, xv, max(y_top + 1, y_bot))
 
         p.end()
         self.wave_canvas = pix
@@ -901,24 +1390,22 @@ class WaveformOverlayWidget(QWidget):
         self._last_pushed_seq = self.env_buffer.total_pushed
 
         if self.env_buffer.is_at_rest:
-            self._seed_full_wave_canvas()
             return
 
         w = self.wave_canvas.width()
         h = self.wave_canvas.height()
         pad_l = 38
         pad_r = 38
-        pad_t = 22
+        pad_t = 24
         pad_b = 20
         plot_w = max(10, w - pad_l - pad_r)
         plot_h = max(10, h - pad_t - pad_b)
-        mid_y = pad_t + plot_h * 0.5
+        mid_y = int(pad_t + plot_h * 0.5)
         half_h = plot_h * 0.5
 
         cap = max(1, self.env_buffer.current_capacity())
         if new_blocks >= cap // 2:
-            self._seed_full_wave_canvas()
-            return
+            new_blocks = min(new_blocks, max(1, cap // 8))
 
         exact_px = (new_blocks / float(cap)) * plot_w + self._px_accum
         dx = int(exact_px)
@@ -939,27 +1426,56 @@ class WaveformOverlayWidget(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
         self._draw_strip_bg(p, x0, dx + pad_r, h)
 
-        n_slice = min(len(self.env_buffer.min_l), new_blocks + 1)
-        min_l_seg = self.env_buffer.min_l[-n_slice:]
-        max_l_seg = self.env_buffer.max_l[-n_slice:]
-        min_r_seg = self.env_buffer.min_r[-n_slice:]
-        max_r_seg = self.env_buffer.max_r[-n_slice:]
+        n_slice = min(self.env_buffer.min_data.shape[1], new_blocks + 1)
+        min_slice = self.env_buffer.min_data[:, -n_slice:]
+        max_slice = self.env_buffer.max_data[:, -n_slice:]
+        gr_slice = self.env_buffer.get_gr_slice(n_slice)
 
-        poly_r = QPolygonF()
-        poly_l = QPolygonF()
-        for col in range(dx):
-            frac = col / float(max(1, dx - 1)) if dx > 1 else 1.0
-            si = int(round(frac * (n_slice - 1)))
-            xv = float(x0 + col)
-            poly_r.append(QPointF(xv, float(mid_y - max_r_seg[si] * half_h)))
-            poly_r.append(QPointF(xv, float(mid_y - min_r_seg[si] * half_h)))
-            poly_l.append(QPointF(xv, float(mid_y - max_l_seg[si] * half_h)))
-            poly_l.append(QPointF(xv, float(mid_y - min_l_seg[si] * half_h)))
+        # Fruity Limiter Gain Reduction envelope para la franja desplazada
+        thr_db = 0.0
+        limiter_enabled = True
+        if self.app_ref and hasattr(self.app_ref, "eq_engine") and hasattr(self.app_ref.eq_engine, "limiter_a"):
+            thr_db = getattr(self.app_ref.eq_engine.limiter_a, "threshold_db", 0.0)
+            limiter_enabled = getattr(self.app_ref.eq_engine.limiter_a, "enabled", True)
 
-        p.setPen(QPen(QColor("#FFB300"), 1))
-        p.drawPolyline(poly_r)
-        p.setPen(QPen(QColor("#00E5FF"), 1))
-        p.drawPolyline(poly_l)
+        if limiter_enabled and gr_slice is not None and len(gr_slice) > 0:
+            thr_lin = min(1.0, max(0.01, 10.0 ** (thr_db / 20.0)))
+            y_thr_top = int(round(mid_y - thr_lin * half_h))
+            y_thr_bot = int(round(mid_y + thr_lin * half_h))
+            p.setPen(QPen(QColor(213, 0, 249, 190), 1))
+
+            for col in range(dx):
+                frac = col / float(max(1, dx - 1)) if dx > 1 else 1.0
+                si = int(round(frac * (n_slice - 1)))
+                gr_val = float(gr_slice[si])
+                if gr_val < -0.05:
+                    comp_lin = min(1.0, max(0.001, 10.0 ** ((thr_db + gr_val) / 20.0)))
+                    y_ct = int(round(mid_y - comp_lin * half_h))
+                    y_cb = int(round(mid_y + comp_lin * half_h))
+                    xv = x0 + col
+                    p.drawLine(xv, y_thr_top, xv, y_ct)
+                    p.drawLine(xv, y_thr_bot, xv, y_cb)
+
+        if len(self.active_signals) > 0:
+            for sig_key in SIGNAL_KEYS:
+                if sig_key not in self.active_signals:
+                    continue
+                sig_idx = SIGNAL_KEYS.index(sig_key)
+                min_seg = min_slice[sig_idx]
+                max_seg = max_slice[sig_idx]
+
+                col_q = QColor(self.signal_colors.get(sig_key, "#FFFFFF"))
+                col_q.setAlpha(self.opacity_alpha)
+                p.setPen(QPen(col_q, 1))
+
+                for col in range(dx):
+                    frac = col / float(max(1, dx - 1)) if dx > 1 else 1.0
+                    si = int(round(frac * (n_slice - 1)))
+                    xv = x0 + col
+                    y1 = int(round(mid_y - max_seg[si] * half_h))
+                    y2 = int(round(mid_y - min_seg[si] * half_h))
+                    p.drawLine(xv, y1, xv, max(y1 + 1, y2))
+
         p.end()
 
     def paintEvent(self, event):
@@ -1390,9 +1906,17 @@ class FullBleedEdgeMasksAndScalesItem(pg.GraphicsObject):
             first_tick = int(np.ceil(db_min / step_db) * step_db)
             x_dbfs_col = rect.right() - 34.0
 
+            scope_open = (
+                hasattr(self.app_ref, "scope_overlay")
+                and self.app_ref.scope_overlay is not None
+                and self.app_ref.scope_overlay.isVisible()
+            )
+            min_tick_y = rect.top() + (212.0 if scope_open else 42.0)
+            min_eq_tick_y = rect.top() + (216.0 if scope_open else 62.0)
+
             for db_val in range(first_tick, db_max + 1, step_db):
                 y_s = vb.mapViewToScene(QPointF(0.0, float(db_val))).y()
-                if rect.top() + 42.0 <= y_s <= rect.bottom() - 16.0:
+                if min_tick_y <= y_s <= rect.bottom() - 16.0:
                     painter.drawText(
                         QRectF(x_dbfs_col, y_s - 8.0, 29.0, 16.0),
                         Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
@@ -1414,7 +1938,7 @@ class FullBleedEdgeMasksAndScalesItem(pg.GraphicsObject):
             x_eq_col = rect.right() - 72.0
             for g_val in eq_ticks:
                 y_eq = eq_vb.mapViewToScene(QPointF(0.0, float(g_val))).y()
-                if rect.top() + 62.0 <= y_eq <= rect.bottom() - 16.0:
+                if min_eq_tick_y <= y_eq <= rect.bottom() - 16.0:
                     lbl_eq = f"+{g_val}" if g_val > 0 else f"{g_val}"
                     painter.drawText(
                         QRectF(x_eq_col, y_eq - 8.0, 32.0, 16.0),
@@ -1476,7 +2000,8 @@ class GraphStageContainer(QWidget):
             # Ubicado justo en la cabecera de la columna dorada de ganancia EQ (+12 dB / +30 dB)
             badge_w = self.eq_range_badge.width()
             badge_x = max(10, w - 38 - badge_w)
-            badge_y = 46
+            scope_open = (self.scope_overlay is not None and self.scope_overlay.isVisible())
+            badge_y = 216 if scope_open else 46
             self.eq_range_badge.move(badge_x, badge_y)
             self.eq_range_badge.raise_()
 
@@ -1505,8 +2030,16 @@ class AudioAnalyzerApp(QMainWindow):
         icon_path = get_resource_path(os.path.join("assets", "icon.ico"))
         if not os.path.exists(icon_path):
             icon_path = get_resource_path(os.path.join("assets", "logo.png"))
+        if not os.path.exists(icon_path):
+            icon_path = get_resource_path("icon.ico")
+        self._icon_path = icon_path
         if os.path.exists(icon_path):
             self.setWindowIcon(QIcon(icon_path))
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if hasattr(self, "_icon_path") and self._icon_path:
+            apply_windows_taskbar_icon(int(self.winId()), self._icon_path)
 
         screen = QApplication.primaryScreen()
         if screen is not None:
@@ -1776,7 +2309,7 @@ class AudioAnalyzerApp(QMainWindow):
         self.eq_range_badge.clicked.connect(self._on_toggle_eq_range_badge)
 
         # --- PANEL DESPLEGABLE DEL OSCILOSCOPIO CON SCROLL BLITTING ---
-        self.scope_overlay = WaveformOverlayWidget(self.scope_buffer, self.graph_container)
+        self.scope_overlay = WaveformOverlayWidget(self.scope_buffer, self.graph_container, app_ref=self)
         self.scope_overlay.collapseRequested.connect(self.toggle_expanded_scope)
 
         # --- HUD FLOTANTE SUPERPUESTO CON `GAIN` EN LA JOROBA ---
@@ -1814,12 +2347,41 @@ class AudioAnalyzerApp(QMainWindow):
     def toggle_expanded_scope(self):
         visible = not self.scope_overlay.isVisible()
         self.scope_overlay.setVisible(visible)
-        if visible:
-            self.scope_overlay.raise_()
-            self.scope_overlay.update()
         self.scope_widget.set_expanded_indicator(visible)
 
+        # Cambiar el rango de la FFT de forma instantánea sin recálculos bloqueantes ni cortes de audio
+        is_y_log = (self.y_scale_combo.currentText() == "Logarítmica (dB)")
+        if is_y_log:
+            y_floor = float(self.db_min - 12.0)
+            if visible:
+                self.scope_overlay.raise_()
+                h_graph = max(300.0, float(self.graph_container.height() if hasattr(self, "graph_container") else 600.0))
+                target_f_top = min(0.48, max(0.32, 232.0 / h_graph))
+                y_ceil = float(round((target_f_top / (1.0 - target_f_top)) * (-y_floor)))
+            else:
+                y_ceil = float(self.db_max + 12.0)
+
+            self.plot_widget.setYRange(y_floor, y_ceil, padding=0.0)
+            self.eq_overlay.update_y_range(y_floor, y_ceil)
+        else:
+            self.plot_widget.setYRange(0.0, 1.08, padding=0.0)
+            self.eq_overlay.update_y_range(-132.0, 12.0)
+
+        if visible:
+            self.scope_overlay.update()
+
+        if hasattr(self, "full_bleed_grid"):
+            self.full_bleed_grid.update()
+        if hasattr(self, "edge_masks_and_scales"):
+            self.edge_masks_and_scales.update()
+
+        self.graph_container._reposition_children()
+
+    toggle_oscilloscope_panel = toggle_expanded_scope
+
     def _on_scope_duration_changed(self, _sec: int):
+        if hasattr(self, "scope_overlay") and hasattr(self.scope_overlay, "dur_btn"):
+            self.scope_overlay.dur_btn.setText(f"{_sec}s")
         self.scope_overlay.invalidate_cache()
         self.schedule_config_save()
 
@@ -2426,6 +2988,9 @@ class AudioAnalyzerApp(QMainWindow):
                 "db_max": int(self.db_max),
                 "hold_percent": int(self.hold_slider.value()),
                 "scope_duration_sec": int(self.scope_buffer.duration_sec),
+                "scope_active_signals": list(self.scope_overlay.active_signals),
+                "scope_signal_colors": dict(self.scope_overlay.signal_colors),
+                "scope_opacity_pct": int(self.scope_overlay.opacity_pct),
                 "eq_range_db": float(self.eq_overlay.eq_range_db),
             },
             "eq": {
@@ -2520,8 +3085,22 @@ class AudioAnalyzerApp(QMainWindow):
                 self.hold_slider.setValue(int(np.clip(hold_s, 0, 99)))
 
             scope_dur = analyzer_cfg.get("scope_duration_sec")
-            if scope_dur in (5, 10):
+            if scope_dur in (1, 3, 5, 10):
                 self.scope_widget.set_duration(int(scope_dur))
+                if hasattr(self, "scope_overlay") and hasattr(self.scope_overlay, "dur_btn"):
+                    self.scope_overlay.dur_btn.setText(f"{int(scope_dur)}s")
+
+            scope_active = analyzer_cfg.get("scope_active_signals")
+            if isinstance(scope_active, list):
+                self.scope_overlay.set_active_signals(scope_active)
+
+            scope_colors = analyzer_cfg.get("scope_signal_colors")
+            if isinstance(scope_colors, dict):
+                self.scope_overlay.set_signal_colors(scope_colors)
+
+            scope_opac = analyzer_cfg.get("scope_opacity_pct")
+            if isinstance(scope_opac, (int, float)):
+                self.scope_overlay.set_opacity_pct(int(scope_opac))
 
             eq_rng = analyzer_cfg.get("eq_range_db")
             if eq_rng in (12, 12.0, 30, 30.0):
@@ -2708,16 +3287,25 @@ class AudioAnalyzerApp(QMainWindow):
             # Extender -12 dB por debajo de db_min (-132 dB) para la zona de fundido a -infinito
             # y +12 dB por encima de db_max (+12 dB) para alojar la barra flotante Liquid Glass
             y_floor = float(self.db_min - 12.0)
-            y_ceil = float(self.db_max + 12.0)
+            if hasattr(self, "scope_overlay") and self.scope_overlay is not None and self.scope_overlay.isVisible():
+                h_graph = max(300.0, float(self.graph_container.height() if hasattr(self, "graph_container") else 600.0))
+                # El osciloscopio desplegado termina en y = 210px. Con margen de respiro, target en y = 232px.
+                target_f_top = min(0.48, max(0.32, 232.0 / h_graph))
+                y_ceil = float(round((target_f_top / (1.0 - target_f_top)) * (-y_floor)))
+            else:
+                y_ceil = float(self.db_max + 12.0)
+
             self.plot_widget.setYRange(y_floor, y_ceil, padding=0.0)
             self.fft_curve_in.setFillLevel(y_floor)
             self.fft_curve_out1.setFillLevel(y_floor)
             self.fft_curve_out2.setFillLevel(y_floor)
+            self.eq_overlay.update_y_range(y_floor, y_ceil)
         else:
             self.plot_widget.setYRange(0.0, 1.08, padding=0.0)
             self.fft_curve_in.setFillLevel(0.0)
             self.fft_curve_out1.setFillLevel(0.0)
             self.fft_curve_out2.setFillLevel(0.0)
+            self.eq_overlay.update_y_range(-132.0, 12.0)
 
         self._update_curve_brush()
         self._pre_drawn_at_rest = False
@@ -2909,16 +3497,36 @@ class AudioAnalyzerApp(QMainWindow):
         self.eq_overlay.update_ghost_tick()
         self.eq_panel.update_live_Readouts()
 
+        gr_db = float(min(self.eq_engine.limiter_a.last_gr_db, self.eq_engine.limiter_b.last_gr_db))
+
+        # 1. Mini-Osciloscopio a 60 FPS reales y 0% CPU (Acumulación O(1) de picos sin bucles pesados)
+        if post_blocks:
+            vmin = 0.0
+            vmax = 0.0
+            for blk in post_blocks:
+                mono = (blk[:, 0] + blk[:, 1]) * 0.5 if blk.ndim > 1 and blk.shape[1] > 1 else blk[:, 0]
+                mn = float(np.min(mono))
+                mx = float(np.max(mono))
+                if mn < vmin: vmin = mn
+                if mx > vmax: vmax = mx
+        else:
+            vmin = vmax = 0.0
+
+        if hasattr(self, "scope_widget"):
+            self.scope_widget.update_gr(gr_db)
+            self.scope_widget.mini_scope.push_audio_peaks(vmin, vmax, gr_db)
+            self.scope_widget.mini_scope.tick_render(QColor("#00E5FF"))
+
+        # 2. Regla de Oro de Rendimiento: Solo actualizar el osciloscopio grande si está visible
+        if self.scope_overlay.isVisible() and post_blocks:
+            self.scope_overlay.update_gr(gr_db)
+            scope_changed = self.scope_buffer.push_multi_blocks(pre_blocks, post_blocks, post2_blocks, gr_db=gr_db)
+            self._scope_tick_counter = (self._scope_tick_counter + 1) % 2
+            if scope_changed and self._scope_tick_counter == 0:
+                self.scope_overlay.update()
+
         if not post_blocks:
             return
-
-        # Actualizar envolvente Min/Max del Osciloscopio con throttling a ~25 FPS (cada 2 ticks)
-        scope_changed = self.scope_buffer.push_blocks(post_blocks)
-        self._scope_tick_counter = (self._scope_tick_counter + 1) % 2
-        if scope_changed and self._scope_tick_counter == 0:
-            self.scope_widget.refresh_scope()
-            if self.scope_overlay.isVisible():
-                self.scope_overlay.update()
 
         latest_post = post_blocks[-1]
         eps = 1e-10
@@ -3039,12 +3647,13 @@ class AudioAnalyzerApp(QMainWindow):
 
 
 if __name__ == "__main__":
-    # Fijar el AppUserModelID para que Windows muestre el icono en la barra de tareas
-    try:
-        import ctypes
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("bdj.ffteq.standalone.v1.0")
-    except Exception:
-        pass
+    # Asegurar AppUserModelID para Windows
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("bdj.ffteq.audioanalyzer.1.0")
+        except Exception:
+            pass
 
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
@@ -3136,9 +3745,12 @@ if __name__ == "__main__":
     icon_path = get_resource_path(os.path.join("assets", "icon.ico"))
     if not os.path.exists(icon_path):
         icon_path = get_resource_path(os.path.join("assets", "logo.png"))
+    if not os.path.exists(icon_path):
+        icon_path = get_resource_path("icon.ico")
     if os.path.exists(icon_path):
         app.setWindowIcon(QIcon(icon_path))
 
     window = AudioAnalyzerApp()
     window.show()
+    apply_windows_taskbar_icon(int(window.winId()), icon_path)
     sys.exit(app.exec())
