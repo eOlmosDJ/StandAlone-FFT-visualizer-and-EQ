@@ -2036,11 +2036,6 @@ class AudioAnalyzerApp(QMainWindow):
         if os.path.exists(icon_path):
             self.setWindowIcon(QIcon(icon_path))
 
-    def showEvent(self, event):
-        super().showEvent(event)
-        if hasattr(self, "_icon_path") and self._icon_path:
-            apply_windows_taskbar_icon(int(self.winId()), self._icon_path)
-
         screen = QApplication.primaryScreen()
         if screen is not None:
             avail = screen.availableGeometry()
@@ -3645,6 +3640,14 @@ class AudioAnalyzerApp(QMainWindow):
         self.save_app_config()
         event.accept()
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        try:
+            if hasattr(self, "_icon_path") and self._icon_path:
+                apply_windows_taskbar_icon(int(self.winId()), self._icon_path)
+        except Exception:
+            pass
+
 
 if __name__ == "__main__":
     # Asegurar AppUserModelID para Windows
@@ -3752,5 +3755,8 @@ if __name__ == "__main__":
 
     window = AudioAnalyzerApp()
     window.show()
-    apply_windows_taskbar_icon(int(window.winId()), icon_path)
+    try:
+        apply_windows_taskbar_icon(int(window.winId()), icon_path)
+    except Exception:
+        pass
     sys.exit(app.exec())
