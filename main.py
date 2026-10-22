@@ -39,16 +39,8 @@ except Exception:
 
 from eq_ui import (
     ProQ4Overlay, FloatingBandHUD, LiquidGlassButton, style_dark_combobox,
-    LimiterControlPopup, LimiterGRMiniWidget, MiniOscilloscopeWidget, CompactScopeGLWidget,
-    GlassDialog, HAS_PYGLASS
+    LimiterControlPopup, LimiterGRMiniWidget, MiniOscilloscopeWidget, CompactScopeGLWidget
 )
-
-if HAS_PYGLASS:
-    try:
-        from pyglass.effect import GlassStyle, paint_glass
-    except Exception:
-        HAS_PYGLASS = False
-
 from fft_analyzer import FFTSpectrumAnalyzer
 from eq_dsp import ParametricEQEngine
 
@@ -724,46 +716,28 @@ class WaveformScopeWidget(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         rect = QRectF(0.75, 0.75, self.width() - 1.5, self.height() - 1.5)
 
-        if HAS_PYGLASS:
-            style = GlassStyle(
-                shadow_layers=3,
-                shadow_step=1.2,
-                shadow_alpha=10,
-                shadow_top=1.0,
-                shadow_bottom=2.5,
-                tint_top=44,
-                tint_bottom=16,
-                sheen_alpha=20,
-                sheen_extent=0.48,
-                rim_top=155,
-                rim_mid=32,
-                rim_bottom=85,
-                rim_width=1.2,
-            )
-            paint_glass(painter, rect, 14.0, None, style=style, reveal=1.0)
-        else:
-            fill_grad = QLinearGradient(0.0, rect.top(), 0.0, rect.bottom())
-            fill_grad.setColorAt(0.0, QColor(58, 62, 72, 175))
-            fill_grad.setColorAt(0.45, QColor(34, 36, 42, 165))
-            fill_grad.setColorAt(1.0, QColor(24, 26, 30, 185))
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QBrush(fill_grad))
-            painter.drawRoundedRect(rect, 14.0, 14.0)
-
-            spec_grad = QLinearGradient(rect.left(), rect.top(), rect.right(), rect.bottom())
-            spec_grad.setColorAt(0.0, QColor(255, 255, 255, 115))
-            spec_grad.setColorAt(0.5, QColor(255, 255, 255, 32))
-            spec_grad.setColorAt(1.0, QColor(255, 255, 255, 16))
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.setPen(QPen(QBrush(spec_grad), 1.2))
-            painter.drawRoundedRect(rect, 14.0, 14.0)
+        fill_grad = QLinearGradient(0.0, rect.top(), 0.0, rect.bottom())
+        fill_grad.setColorAt(0.0, QColor(58, 62, 72, 175))
+        fill_grad.setColorAt(0.45, QColor(34, 36, 42, 165))
+        fill_grad.setColorAt(1.0, QColor(24, 26, 30, 185))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(fill_grad))
+        painter.drawRoundedRect(rect, 14.0, 14.0)
 
         # "LED" de Alerta: Resplandor (Glow) en la cápsula Liquid Glass
         if self._limit_glow_alpha > 0.0:
-            glow_pen = QPen(QColor(213, 0, 249, int(170 * self._limit_glow_alpha)), 1.8)
+            glow_pen = QPen(QColor(213, 0, 249, int(150 * self._limit_glow_alpha)), 1.8)
             painter.setPen(glow_pen)
             painter.setBrush(QBrush(QColor(213, 0, 249, int(35 * self._limit_glow_alpha))))
             painter.drawRoundedRect(rect, 14.0, 14.0)
+
+        spec_grad = QLinearGradient(rect.left(), rect.top(), rect.right(), rect.bottom())
+        spec_grad.setColorAt(0.0, QColor(255, 255, 255, 115))
+        spec_grad.setColorAt(0.5, QColor(255, 255, 255, 32))
+        spec_grad.setColorAt(1.0, QColor(255, 255, 255, 16))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(QBrush(spec_grad), 1.2))
+        painter.drawRoundedRect(rect, 14.0, 14.0)
 
 
 class ScopeSignalSettingsPopup(QWidget):
@@ -775,17 +749,14 @@ class ScopeSignalSettingsPopup(QWidget):
     def __init__(self, overlay_widget: "WaveformOverlayWidget", parent=None):
         super().__init__(parent, Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
         self.overlay = overlay_widget
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
         self.setFixedWidth(460)
         self.setStyleSheet("""
             QWidget {
-                background: transparent;
+                background-color: #181A20;
                 color: #ECEFF4;
                 font-family: "Segoe UI", sans-serif;
                 font-size: 11px;
-            }
-            QLabel {
-                background: transparent;
             }
             QCheckBox {
                 color: #D8DEE9;
@@ -819,10 +790,22 @@ class ScopeSignalSettingsPopup(QWidget):
                 margin-bottom: -4px;
                 border-radius: 6px;
             }
+            QPushButton#actionBtn {
+                background-color: #262B34;
+                color: #C0C5D0;
+                border: 1px solid #363C48;
+                border-radius: 4px;
+                padding: 3px 10px;
+                font-size: 10px;
+            }
+            QPushButton#actionBtn:hover {
+                background-color: #323846;
+                color: #FFFFFF;
+            }
         """)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setContentsMargins(12, 10, 12, 10)
         layout.setSpacing(8)
 
         # Encabezado
@@ -920,67 +903,17 @@ class ScopeSignalSettingsPopup(QWidget):
 
         # Botones inferiores: Restaurar por defecto y Cerrar
         bottom_row = QHBoxLayout()
-        reset_btn = LiquidGlassButton("Restaurar por defecto", self, pill_radius=10.0)
+        reset_btn = QPushButton("Restaurar por defecto")
+        reset_btn.setObjectName("actionBtn")
         reset_btn.clicked.connect(self._reset_defaults)
         bottom_row.addWidget(reset_btn)
         bottom_row.addStretch(1)
 
-        done_btn = LiquidGlassButton("Listo", self, pill_radius=10.0)
+        done_btn = QPushButton("Listo")
+        done_btn.setObjectName("actionBtn")
         done_btn.clicked.connect(self.close)
         bottom_row.addWidget(done_btn)
         layout.addLayout(bottom_row)
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        rect = QRectF(4.0, 4.0, self.width() - 8.0, self.height() - 8.0)
-        r = 14.0
-
-        if HAS_PYGLASS:
-            style = GlassStyle(
-                shadow_layers=6,
-                shadow_step=1.8,
-                shadow_alpha=12,
-                shadow_top=3.0,
-                shadow_bottom=8.0,
-                tint_top=34,
-                tint_bottom=12,
-                sheen_alpha=22,
-                sheen_extent=0.45,
-                rim_top=180,
-                rim_mid=45,
-                rim_bottom=110,
-                rim_width=1.2,
-            )
-            paint_glass(painter, rect, r, None, style=style, reveal=1.0)
-        else:
-            for i in range(4, 0, -1):
-                painter.setPen(Qt.PenStyle.NoPen)
-                painter.setBrush(QColor(0, 0, 0, 18 * (5 - i)))
-                painter.drawRoundedRect(rect.adjusted(-i * 1.5, -i * 1.5 + 2, i * 1.5, i * 1.5 + 4), r + i * 1.5, r + i * 1.5)
-
-        # Fondo acrílico oscuro (#161820, alpha=245)
-        inner_path = QPainterPath()
-        inner_path.addRoundedRect(rect.adjusted(0.7, 0.7, -0.7, -0.7), r - 0.7, r - 0.7)
-        body_grad = QLinearGradient(0.0, rect.top(), 0.0, rect.bottom())
-        body_grad.setColorAt(0.0, QColor(30, 32, 42, 245))
-        body_grad.setColorAt(0.35, QColor(22, 24, 30, 246))
-        body_grad.setColorAt(1.0, QColor(16, 17, 22, 250))
-        painter.fillPath(inner_path, QBrush(body_grad))
-
-        # Borde Liquid Glass especular fino
-        spec_border = QLinearGradient(rect.left(), rect.top(), rect.right(), rect.bottom())
-        spec_border.setColorAt(0.0, QColor(255, 255, 255, 170))
-        spec_border.setColorAt(0.4, QColor(0, 229, 255, 90))
-        spec_border.setColorAt(1.0, QColor(0, 176, 255, 120))
-        painter.setPen(QPen(QBrush(spec_border), 1.25))
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawRoundedRect(rect, r, r)
-
-        # Reflejo superior fino de cristal
-        hi_pen = QPen(QColor(255, 255, 255, 60), 0.9)
-        painter.setPen(hi_pen)
-        painter.drawLine(QPointF(rect.left() + r, rect.top() + 1.8), QPointF(rect.right() - r, rect.top() + 1.8))
 
     def _on_chk_toggled(self, key: str, checked: bool):
         if checked:
@@ -1061,23 +994,80 @@ class WaveformOverlayWidget(QWidget):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setToolTip("Clic para plegar el osciloscopio de vuelta a la barra superior")
 
-        self.settings_btn = LiquidGlassButton("⚙ Señales y Color ▾", self, pill_radius=9.0)
+        self.settings_btn = QPushButton("⚙ Señales y Color ▾", self)
         self.settings_btn.setFixedSize(126, 20)
         self.settings_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.settings_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #20242C;
+                color: #D8DEE9;
+                border: 1px solid #363C48;
+                border-radius: 9px;
+                padding: 1px 6px;
+                font-size: 10px;
+                font-weight: 600;
+            }
+            QPushButton:hover {
+                background-color: #2B303C;
+                border: 1px solid #4E5666;
+                color: #FFFFFF;
+            }
+            QPushButton:pressed {
+                background-color: #1A1D24;
+            }
+        """)
         self.settings_btn.clicked.connect(self._toggle_settings_popup)
 
-        self.limiter_btn = LiquidGlassButton("🛡 Limitador ▾", self, active_tint_color="#D500F9", pill_radius=9.0)
+        self.limiter_btn = QPushButton("🛡 Limitador ▾", self)
         self.limiter_btn.setFixedSize(116, 20)
         self.limiter_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.limiter_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #20242C;
+                color: #EA80FC;
+                border: 1px solid #7B1FA2;
+                border-radius: 9px;
+                padding: 1px 6px;
+                font-size: 10px;
+                font-weight: 600;
+            }
+            QPushButton:hover {
+                background-color: #2E1B38;
+                border: 1px solid #D500F9;
+                color: #FFFFFF;
+            }
+            QPushButton:pressed {
+                background-color: #1A1D24;
+            }
+        """)
         self.limiter_btn.clicked.connect(self._toggle_limiter_popup)
 
         self.gr_meter_widget = LimiterGRMiniWidget(self)
         self.gr_meter_widget.clicked.connect(self._toggle_limiter_popup)
 
-        self.dur_btn = LiquidGlassButton(f"{self.env_buffer.duration_sec}s", self, active_tint_color="#00E5FF", pill_radius=9.0)
+        self.dur_btn = QPushButton(f"{self.env_buffer.duration_sec}s", self)
         self.dur_btn.setFixedSize(38, 20)
         self.dur_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.dur_btn.setToolTip("Alternar ventana de tiempo: 1s -> 5s -> 10s")
+        self.dur_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #20242C;
+                color: #00E5FF;
+                border: 1px solid #363C48;
+                border-radius: 9px;
+                padding: 1px 6px;
+                font-size: 10px;
+                font-weight: 600;
+            }
+            QPushButton:hover {
+                background-color: #2B303C;
+                border: 1px solid #00E5FF;
+                color: #FFFFFF;
+            }
+            QPushButton:pressed {
+                background-color: #1A1D24;
+            }
+        """)
         self.dur_btn.clicked.connect(self._cycle_duration)
 
         self.hide()
@@ -2442,11 +2432,12 @@ class AudioAnalyzerApp(QMainWindow):
             self._set_background_color(orig)
 
     def _build_audio_io_popup(self):
-        self.audio_popup = GlassDialog(self, radius=12.0)
+        self.audio_popup = QDialog(self, Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
         self.audio_popup.setStyleSheet("""
             QDialog {
-                background: transparent;
-                border: none;
+                background-color: #1C1C1C;
+                border: 1px solid #363636;
+                border-radius: 6px;
             }
             QLabel {
                 background: transparent;
@@ -2457,7 +2448,7 @@ class AudioAnalyzerApp(QMainWindow):
             }
         """)
         grid = QGridLayout(self.audio_popup)
-        grid.setContentsMargins(16, 14, 16, 14)
+        grid.setContentsMargins(12, 10, 12, 10)
         grid.setSpacing(8)
 
         grid.addWidget(QLabel("Dispositivo de Entrada:"), 0, 0)
@@ -2528,9 +2519,25 @@ class AudioAnalyzerApp(QMainWindow):
         self.delay_out1_spin.valueChanged.connect(self._on_user_delay_a_changed)
         delay_a_layout.addWidget(self.delay_out1_spin)
 
-        self.auto_sync_btn = LiquidGlassButton("⚡ Auto Sync", pill_radius=9.0, active_tint_color="#00E5FF")
+        self.auto_sync_btn = QPushButton("⚡ Auto Sync")
         self.auto_sync_btn.setToolTip("Calcula y sincroniza automáticamente la latencia acústica entre Salida 1 y Salida 2")
         self.auto_sync_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.auto_sync_btn.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(0, 229, 255, 0.12);
+                color: #00E5FF;
+                border: 1px solid #00E5FF;
+                border-radius: 5px;
+                padding: 3px 10px;
+                font-size: 10px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: rgba(0, 229, 255, 0.28);
+                color: #FFFFFF;
+                border-color: #33EBFF;
+            }
+        """)
         self.auto_sync_btn.clicked.connect(self.auto_sync_delays)
         delay_a_layout.addWidget(self.auto_sync_btn)
         delay_a_layout.addStretch()
@@ -2627,11 +2634,12 @@ class AudioAnalyzerApp(QMainWindow):
 
     def _build_analyzer_popup(self):
         """Panel del Analizador con FFT Samples, Curvas FFT (In, Out 1, Out 2) y Colores."""
-        self.analyzer_popup = GlassDialog(self, radius=12.0)
+        self.analyzer_popup = QDialog(self, Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
         self.analyzer_popup.setStyleSheet("""
             QDialog {
-                background: transparent;
-                border: none;
+                background-color: #1C1C1C;
+                border: 1px solid #363636;
+                border-radius: 6px;
             }
             QLabel {
                 background: transparent;
@@ -2640,9 +2648,23 @@ class AudioAnalyzerApp(QMainWindow):
                 font-size: 11px;
                 font-weight: bold;
             }
+            QPushButton {
+                background-color: #262930;
+                color: #ECEFF4;
+                border: 1px solid #3E4350;
+                border-radius: 4px;
+                padding: 5px 8px;
+                font-size: 11px;
+                text-align: left;
+            }
+            QPushButton:hover {
+                background-color: #323742;
+                border-color: #00E5FF;
+                color: #FFFFFF;
+            }
         """)
         grid = QGridLayout(self.analyzer_popup)
-        grid.setContentsMargins(16, 14, 16, 14)
+        grid.setContentsMargins(12, 10, 12, 10)
         grid.setSpacing(8)
 
         chk_row = QHBoxLayout()
@@ -2731,21 +2753,21 @@ class AudioAnalyzerApp(QMainWindow):
 
         # Botones de personalización de color de las curvas FFT
         colors_layout = QVBoxLayout()
-        colors_layout.setSpacing(5)
+        colors_layout.setSpacing(4)
 
-        btn_color_in = LiquidGlassButton("🎨 Color Curva Input (Pre)...", pill_radius=8.0)
+        btn_color_in = QPushButton("🎨 Color Curva Input (Pre)...")
         btn_color_in.clicked.connect(lambda: (self.analyzer_popup.close(), self._pick_curve_color("curve_in", "Curva Input (Pre)")))
         colors_layout.addWidget(btn_color_in)
 
-        btn_color_out1 = LiquidGlassButton("🎨 Color Curva Output 1 (Bus A)...", pill_radius=8.0)
+        btn_color_out1 = QPushButton("🎨 Color Curva Output 1 (Bus A)...")
         btn_color_out1.clicked.connect(lambda: (self.analyzer_popup.close(), self._pick_curve_color("curve_out1", "Curva Output 1 (Bus A)")))
         colors_layout.addWidget(btn_color_out1)
 
-        btn_color_out2 = LiquidGlassButton("🎨 Color Curva Output 2 (Bus B)...", pill_radius=8.0)
+        btn_color_out2 = QPushButton("🎨 Color Curva Output 2 (Bus B)...")
         btn_color_out2.clicked.connect(lambda: (self.analyzer_popup.close(), self._pick_curve_color("curve_out2", "Curva Output 2 (Bus B)")))
         colors_layout.addWidget(btn_color_out2)
 
-        colors_btn = LiquidGlassButton("⚙ Configuración Completa de Colores...", pill_radius=8.0)
+        colors_btn = QPushButton("⚙ Configuración Completa de Colores...")
         colors_btn.clicked.connect(lambda: (self.analyzer_popup.close(), self.open_color_settings()))
         colors_layout.addWidget(colors_btn)
 
@@ -3143,8 +3165,8 @@ class AudioAnalyzerApp(QMainWindow):
             self.mute_btn.setActiveTintColor("#FF5252")
         else:
             self.mute_btn.setText("🔊 Audio ON")
-            self.mute_btn.setTintColor("#00E676")
-            self.mute_btn.setActiveTintColor("#00E676")
+            self.mute_btn.setTintColor("#2ECC71")
+            self.mute_btn.setActiveTintColor("#2ECC71")
         self.mute_btn.update()
 
     def toggle_mute(self, checked=None):
