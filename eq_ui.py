@@ -22,32 +22,38 @@ from eq_dsp import (
     TARGET_OUTPUTS,
 )
 
+try:
+    from pyglass.effect import GlassStyle, paint_glass
+    HAS_PYGLASS = True
+except Exception:
+    HAS_PYGLASS = False
+
 
 def style_dark_combobox(combo: QComboBox):
-    """Fuerza a PyQt6 a renderizar la lista desplegable internamente con estética oscura de alto contraste."""
+    """Fuerza a PyQt6 a renderizar la lista desplegable internamente con estética Liquid Glass oscura de alto contraste."""
     list_view = QListView(combo)
     list_view.setStyleSheet("""
         QListView {
-            background-color: #181A20;
+            background-color: rgba(22, 25, 33, 245);
             color: #F0F2F5;
-            border: 1px solid #3A3F4B;
-            border-radius: 6px;
+            border: 1px solid rgba(255, 255, 255, 0.18);
+            border-radius: 8px;
             padding: 4px;
             outline: none;
         }
         QListView::item {
-            padding: 6px 10px;
-            border-radius: 4px;
-            color: #F0F2F5;
+            padding: 6px 12px;
+            border-radius: 5px;
+            color: #E2E6EF;
             background-color: transparent;
         }
         QListView::item:hover {
-            background-color: #2B303C;
+            background-color: rgba(43, 50, 64, 230);
             color: #FFFFFF;
         }
         QListView::item:selected {
             background-color: #00E5FF;
-            color: #0D0F14;
+            color: #0B0E14;
             font-weight: bold;
         }
     """)
@@ -153,9 +159,29 @@ class LiquidGlassButton(QPushButton):
         is_active = (self.isCheckable() and self.isChecked()) or (self._tint_color is not None)
         tint = self._active_tint_color if (self.isCheckable() and self.isChecked()) else self._tint_color
 
+        if HAS_PYGLASS:
+            # Estilo PyGlass sintonizado para cápsulas Liquid Glass
+            sh_alpha = 14 if self._hovered else 8
+            style = GlassStyle(
+                shadow_layers=3,
+                shadow_step=1.2,
+                shadow_alpha=sh_alpha,
+                shadow_top=1.0,
+                shadow_bottom=2.0,
+                tint_top=55 if self._hovered else 36,
+                tint_bottom=22 if self._hovered else 12,
+                sheen_alpha=28 if self._hovered else 16,
+                sheen_extent=0.50,
+                rim_top=180 if self._hovered else 145,
+                rim_mid=40 if self._hovered else 25,
+                rim_bottom=120 if self._hovered else 75,
+                rim_width=1.2,
+            )
+            paint_glass(painter, rect, r, None, style=style, reveal=1.0)
+
         # 1. Relleno Vítreo Vertical
-        fill_grad = QLinearGradient(0.0, 0.0, 0.0, h)
         if is_active and tint is not None and self.isEnabled():
+            fill_grad = QLinearGradient(0.0, 0.0, 0.0, h)
             top_a = 155 if self._hovered else 130
             mid_a = 110 if self._hovered else 85
             bot_a = 195
@@ -172,38 +198,50 @@ class LiquidGlassButton(QPushButton):
             fill_grad.setColorAt(0.0, c_top)
             fill_grad.setColorAt(0.48, c_mid)
             fill_grad.setColorAt(1.0, c_bot)
-        else:
+
+            painter.save()
+            clip_path = QPainterPath()
+            clip_path.addRoundedRect(rect, r, r)
+            painter.setClipPath(clip_path)
+            painter.fillRect(rect, QBrush(fill_grad))
+            painter.restore()
+
+            # Borde tintado
+            spec_grad = QLinearGradient(0.0, 0.0, w, h)
+            spec_grad.setColorAt(0.0, QColor(255, 255, 255, 175 if self._hovered else 150))
+            mid_spec = _brighten_color(tint, 0.25)
+            mid_spec.setAlpha(110)
+            bot_spec = _brighten_color(tint, 0.15)
+            bot_spec.setAlpha(145)
+            spec_grad.setColorAt(0.5, mid_spec)
+            spec_grad.setColorAt(1.0, bot_spec)
+            painter.setPen(QPen(QBrush(spec_grad), 1.2))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRoundedRect(rect, r, r)
+        elif not HAS_PYGLASS:
+            fill_grad = QLinearGradient(0.0, 0.0, 0.0, h)
             top_white_a = 55 if (self._hovered and self.isEnabled()) else 36
             mid_white_a = 22 if (self._hovered and self.isEnabled()) else 10
             fill_grad.setColorAt(0.0, QColor(255, 255, 255, top_white_a))
             fill_grad.setColorAt(0.45, QColor(255, 255, 255, mid_white_a))
             fill_grad.setColorAt(1.0, QColor(15, 17, 22, 185))
 
-        # 2. Borde Especular Diagonal Liquid Glass (1.2px)
-        spec_grad = QLinearGradient(0.0, 0.0, w, h)
-        spec_grad.setColorAt(0.0, QColor(255, 255, 255, 165 if self._hovered else 145))
-        if is_active and tint is not None and self.isEnabled():
-            mid_spec = _brighten_color(tint, 0.25)
-            mid_spec.setAlpha(95)
-            bot_spec = _brighten_color(tint, 0.15)
-            bot_spec.setAlpha(135)
-            spec_grad.setColorAt(0.5, mid_spec)
-            spec_grad.setColorAt(1.0, bot_spec)
-        else:
+            spec_grad = QLinearGradient(0.0, 0.0, w, h)
+            spec_grad.setColorAt(0.0, QColor(255, 255, 255, 165 if self._hovered else 145))
             spec_grad.setColorAt(0.5, QColor(255, 255, 255, 25))
             spec_grad.setColorAt(1.0, QColor(255, 255, 255, 65))
 
-        painter.setPen(QPen(QBrush(spec_grad), 1.2))
-        painter.setBrush(QBrush(fill_grad))
-        painter.drawRoundedRect(rect, r, r)
+            painter.setPen(QPen(QBrush(spec_grad), 1.2))
+            painter.setBrush(QBrush(fill_grad))
+            painter.drawRoundedRect(rect, r, r)
 
         # Reflejo superior interno de cristal (arco especular fino)
         if w > 16.0:
-            hi_pen = QPen(QColor(255, 255, 255, 65 if self._hovered else 42), 0.9)
+            hi_pen = QPen(QColor(255, 255, 255, 75 if self._hovered else 48), 0.9)
             painter.setPen(hi_pen)
             painter.drawLine(QPointF(r * 0.85, 2.1), QPointF(w - r * 0.85, 2.1))
 
-        # 3. Texto nítido centrado
+        # Texto nítido centrado
         font = QFont("Segoe UI", 8, QFont.Weight.Bold)
         painter.setFont(font)
         if not self.isEnabled():
@@ -216,6 +254,61 @@ class LiquidGlassButton(QPushButton):
 
         painter.setPen(txt_c)
         painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, self.text())
+
+
+class GlassDialog(QDialog):
+    """
+    Diálogo emergente flotante con estética Apple Liquid Glass usando pyglass.
+    Combina sombra difusa suave, tinte vítreo, brillo especular superior y fondo acrílico oscuro.
+    """
+    def __init__(self, parent=None, radius: float = 14.0):
+        super().__init__(parent, Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self._radius = float(radius)
+        if HAS_PYGLASS:
+            self._glass_style = GlassStyle(
+                shadow_layers=8,
+                shadow_step=2.2,
+                shadow_alpha=12,
+                shadow_top=4.0,
+                shadow_bottom=12.0,
+                tint_top=32,
+                tint_bottom=10,
+                sheen_alpha=24,
+                sheen_extent=0.45,
+                rim_top=195,
+                rim_mid=50,
+                rim_bottom=130,
+                rim_width=1.3,
+            )
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        rect = QRectF(6.0, 6.0, self.width() - 12.0, self.height() - 12.0)
+        r = self._radius
+
+        if HAS_PYGLASS:
+            paint_glass(painter, rect, r, None, style=self._glass_style, reveal=1.0)
+        else:
+            painter.setPen(Qt.PenStyle.NoPen)
+            for i in range(4, 0, -1):
+                painter.setBrush(QColor(0, 0, 0, 20 * (5 - i)))
+                painter.drawRoundedRect(rect.adjusted(-i * 1.5, -i * 1.5 + 2, i * 1.5, i * 1.5 + 4), r + i * 1.5, r + i * 1.5)
+
+        # Fondo acrílico oscuro (#161820, alpha=245)
+        inner_path = QPainterPath()
+        inner_path.addRoundedRect(rect.adjusted(0.7, 0.7, -0.7, -0.7), r - 0.7, r - 0.7)
+        body_grad = QLinearGradient(0.0, rect.top(), 0.0, rect.bottom())
+        body_grad.setColorAt(0.0, QColor(32, 35, 46, 244))
+        body_grad.setColorAt(0.35, QColor(22, 24, 30, 246))
+        body_grad.setColorAt(1.0, QColor(16, 17, 22, 250))
+        painter.fillPath(inner_path, QBrush(body_grad))
+
+        # Reflejo especular superior fino de cristal
+        hi_pen = QPen(QColor(255, 255, 255, 60), 1.0)
+        painter.setPen(hi_pen)
+        painter.drawLine(QPointF(rect.left() + r, rect.top() + 1.8), QPointF(rect.right() - r, rect.top() + 1.8))
 
 
 class PowerToggleButton(QPushButton):
@@ -550,20 +643,32 @@ class ProQKnob(QWidget):
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawEllipse(QPointF(cx, cy), cap_r + 1.0, cap_r + 1.0)
 
-        # 4. Capuchón Central 3D con gradiente vertical (#2E3138 a #1F2126)
+        # 4. Capuchón Central 3D con bisel especular tipo Liquid Glass
         cap_grad = QLinearGradient(cx, cy - cap_r, cx, cy + cap_r)
         if self.isEnabled():
             cap_grad.setColorAt(0.0, QColor("#2E3138"))
             cap_grad.setColorAt(1.0, QColor("#1F2126"))
-            bevel_color = QColor("#434750")
         else:
             cap_grad.setColorAt(0.0, QColor("#24262B"))
             cap_grad.setColorAt(1.0, QColor("#1A1B1F"))
-            bevel_color = QColor("#32343A")
 
-        painter.setPen(QPen(bevel_color, 1.0))
+        # Bisel especular diagonal vítreo
+        cap_spec = QLinearGradient(cx - cap_r, cy - cap_r, cx + cap_r, cy + cap_r)
+        cap_spec.setColorAt(0.0, QColor(255, 255, 255, 140 if self.isEnabled() else 50))
+        cap_spec.setColorAt(0.45, QColor(255, 255, 255, 25))
+        cap_spec.setColorAt(1.0, QColor(255, 255, 255, 75 if self.isEnabled() else 25))
+        painter.setPen(QPen(QBrush(cap_spec), 1.2))
         painter.setBrush(QBrush(cap_grad))
         painter.drawEllipse(QPointF(cx, cy), cap_r, cap_r)
+
+        # Reflejo especular superior de cristal en el capuchón
+        sheen_rect = QRectF(cx - cap_r * 0.72, cy - cap_r * 0.88, cap_r * 1.44, cap_r * 0.75)
+        sheen_grad = QLinearGradient(cx, cy - cap_r, cx, cy)
+        sheen_grad.setColorAt(0.0, QColor(255, 255, 255, 42 if self.isEnabled() else 14))
+        sheen_grad.setColorAt(1.0, QColor(255, 255, 255, 0))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(sheen_grad))
+        painter.drawEllipse(sheen_rect)
 
         # 5. Línea indicadora radial (tick) corta y nítida cerca del borde del capuchón
         angle_deg = 225.0 - norm * 270.0
@@ -871,20 +976,32 @@ class GainDynProQKnob(ProQKnob):
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawEllipse(QPointF(cx, cy), cap_r + 1.0, cap_r + 1.0)
 
-        # 8. Capuchón Central 3D (#2E3138 a #1F2126)
+        # 8. Capuchón Central 3D con bisel especular tipo Liquid Glass
         cap_grad = QLinearGradient(cx, cy - cap_r, cx, cy + cap_r)
         if self.isEnabled():
             cap_grad.setColorAt(0.0, QColor("#2E3138"))
             cap_grad.setColorAt(1.0, QColor("#1F2126"))
-            bevel_color = QColor("#454852")
         else:
             cap_grad.setColorAt(0.0, QColor("#25262B"))
             cap_grad.setColorAt(1.0, QColor("#1B1C20"))
-            bevel_color = QColor("#32343A")
 
-        painter.setPen(QPen(bevel_color, 1.0))
+        # Bisel especular diagonal vítreo
+        cap_spec = QLinearGradient(cx - cap_r, cy - cap_r, cx + cap_r, cy + cap_r)
+        cap_spec.setColorAt(0.0, QColor(255, 255, 255, 145 if self.isEnabled() else 55))
+        cap_spec.setColorAt(0.45, QColor(255, 255, 255, 28))
+        cap_spec.setColorAt(1.0, QColor(255, 255, 255, 80 if self.isEnabled() else 28))
+        painter.setPen(QPen(QBrush(cap_spec), 1.25))
         painter.setBrush(QBrush(cap_grad))
         painter.drawEllipse(QPointF(cx, cy), cap_r, cap_r)
+
+        # Reflejo especular superior de cristal en el capuchón
+        sheen_rect = QRectF(cx - cap_r * 0.72, cy - cap_r * 0.88, cap_r * 1.44, cap_r * 0.75)
+        sheen_grad = QLinearGradient(cx, cy - cap_r, cx, cy)
+        sheen_grad.setColorAt(0.0, QColor(255, 255, 255, 45 if self.isEnabled() else 15))
+        sheen_grad.setColorAt(1.0, QColor(255, 255, 255, 0))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(sheen_grad))
+        painter.drawEllipse(sheen_rect)
 
         # 9. Línea indicadora radial (tick) corta y nítida cerca del borde del capuchón
         angle_rad = math.radians(gain_deg)
@@ -1334,20 +1451,41 @@ class BandNodeCallout(QWidget):
 
         full_path = path.united(caret_path)
 
-        # Fondo oscuro #1A1D24 con alpha=235
-        painter.fillPath(full_path, QBrush(QColor(26, 29, 36, 235)))
+        # 1. Sombra exterior suave progresiva estilo pyglass
+        for i in range(4, 0, -1):
+            spread = i * 1.5
+            painter.setPen(QPen(QColor(0, 0, 0, int(15 * (5 - i))), spread))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawPath(full_path)
 
-        # Resplandor exterior sutil del color de la banda
+        # 2. Relleno Liquid Glass Oscuro (#22252F a #14161C, alpha=240)
+        body_grad = QLinearGradient(0.0, 0.0, 0.0, body_h + caret_h)
+        body_grad.setColorAt(0.0, QColor(36, 40, 52, 244))
+        body_grad.setColorAt(0.35, QColor(24, 27, 35, 240))
+        body_grad.setColorAt(1.0, QColor(16, 18, 24, 248))
+        painter.fillPath(full_path, QBrush(body_grad))
+
+        # 3. Resplandor / Tinte interior sutil con el color de la banda
         glow_c = QColor(self._band_color)
-        glow_c.setAlpha(45)
-        painter.setPen(QPen(glow_c, 3.0))
+        glow_c.setAlpha(40)
+        painter.setPen(QPen(glow_c, 2.5))
         painter.drawPath(full_path)
 
-        # Borde redondeado nítido
-        border_c = QColor(self._band_color)
-        border_c.setAlpha(180)
-        painter.setPen(QPen(border_c, 1.2))
+        # 4. Borde Especular Diagonal Liquid Glass
+        spec_border = QLinearGradient(0.0, 0.0, w, body_h + caret_h)
+        top_spec = _brighten_color(self._band_color, 0.65)
+        top_spec.setAlpha(225)
+        spec_border.setColorAt(0.0, top_spec)
+        spec_border.setColorAt(0.35, QColor(255, 255, 255, 75))
+        spec_border.setColorAt(0.70, QColor(self._band_color))
+        spec_border.setColorAt(1.0, _brighten_color(self._band_color, 0.25))
+        painter.setPen(QPen(QBrush(spec_border), 1.25))
         painter.drawPath(full_path)
+
+        # 5. Reflejo superior fino de cristal
+        hi_pen = QPen(QColor(255, 255, 255, 65), 0.9)
+        painter.setPen(hi_pen)
+        painter.drawLine(QPointF(8.0, 2.0), QPointF(w - 8.0, 2.0))
 
     def update_callout(self):
         if self._building:
@@ -2800,7 +2938,7 @@ class FloatingBandHUD(QWidget):
         bot_row.setContentsMargins(0, 0, 0, 0)
         bot_row.setSpacing(6)
 
-        self.prev_band_btn = QPushButton("‹", self.bottom_bar)
+        self.prev_band_btn = LiquidGlassButton("‹", self.bottom_bar, pill_radius=11.0)
         self.prev_band_btn.setFixedSize(24, 24)
         self.prev_band_btn.setToolTip("Banda anterior")
         self.prev_band_btn.clicked.connect(lambda: self._step_band(-1))
@@ -2812,19 +2950,19 @@ class FloatingBandHUD(QWidget):
         self.band_combo.currentIndexChanged.connect(self._on_band_combo_changed)
         bot_row.addWidget(self.band_combo)
 
-        self.next_band_btn = QPushButton("›", self.bottom_bar)
+        self.next_band_btn = LiquidGlassButton("›", self.bottom_bar, pill_radius=11.0)
         self.next_band_btn.setFixedSize(24, 24)
         self.next_band_btn.setToolTip("Banda siguiente")
         self.next_band_btn.clicked.connect(lambda: self._step_band(1))
         bot_row.addWidget(self.next_band_btn)
 
-        self.add_band_btn = QPushButton("+", self.bottom_bar)
+        self.add_band_btn = LiquidGlassButton("+", self.bottom_bar, pill_radius=11.0)
         self.add_band_btn.setFixedSize(24, 24)
         self.add_band_btn.setToolTip("Añadir nueva banda")
         self.add_band_btn.clicked.connect(self._on_add_band)
         bot_row.addWidget(self.add_band_btn)
 
-        self.del_band_btn = QPushButton("✕", self.bottom_bar)
+        self.del_band_btn = LiquidGlassButton("✕", self.bottom_bar, pill_radius=11.0)
         self.del_band_btn.setFixedSize(24, 24)
         self.del_band_btn.setToolTip("Eliminar banda seleccionada (Supr)")
         self.del_band_btn.clicked.connect(self._on_delete_band)
@@ -2926,35 +3064,45 @@ class FloatingBandHUD(QWidget):
         path.quadTo(QPointF(x_left, y_top), QPointF(x_left + r_corner, y_top))
         path.closeSubpath()
 
-        # 1. Relleno Liquid Glass Oscuro (#1E2028 a #14151A, alpha = 235)
+        # 0. Sombra exterior suave progresiva estilo pyglass siguiendo el contorno de la joroba
+        for i in range(5, 0, -1):
+            spread = i * 1.8
+            painter.setPen(QPen(QColor(0, 0, 0, int(14 * (6 - i))), spread))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawPath(path)
+
+        # 1. Relleno Liquid Glass Oscuro (#242834 a #121419, alpha = 242)
         body_grad = QLinearGradient(0.0, y_peak, 0.0, y_bot)
-        body_grad.setColorAt(0.0, QColor(34, 37, 46, 238))
-        body_grad.setColorAt(0.25, QColor(30, 32, 40, 235))
-        body_grad.setColorAt(1.0, QColor(20, 21, 26, 242))
+        body_grad.setColorAt(0.0, QColor(36, 40, 52, 244))
+        body_grad.setColorAt(0.25, QColor(28, 31, 39, 242))
+        body_grad.setColorAt(1.0, QColor(16, 17, 22, 248))
         painter.fillPath(path, QBrush(body_grad))
 
-        # 2. Resplandor exterior sutil del color de la banda activa
+        # 2. Resplandor / Tinte interior sutil con el color de la banda activa
         glow_c = QColor(self._active_band_color)
-        glow_c.setAlpha(45)
-        painter.setPen(QPen(glow_c, 3.2))
+        glow_c.setAlpha(36)
+        painter.setPen(QPen(glow_c, 2.8))
         painter.drawPath(path)
 
-        # 3. Borde especular fino (combina reflejo blanco superior Liquid Glass + color de banda)
-        spec_border = QLinearGradient(0.0, y_peak, 0.0, y_bot)
-        top_spec = _brighten_color(self._active_band_color, 0.65)
-        top_spec.setAlpha(220)
-        mid_spec = QColor(self._active_band_color)
-        mid_spec.setAlpha(155)
-        bot_spec = QColor(self._active_band_color)
-        bot_spec.setAlpha(195)
+        # 3. Borde especular diagonal fino (combina reflejo blanco superior Liquid Glass + color de banda)
+        spec_border = QLinearGradient(x_left, y_peak, x_right, y_bot)
+        top_spec = _brighten_color(self._active_band_color, 0.70)
+        top_spec.setAlpha(225)
         spec_border.setColorAt(0.0, top_spec)
-        spec_border.setColorAt(0.45, mid_spec)
-        spec_border.setColorAt(1.0, bot_spec)
+        spec_border.setColorAt(0.25, QColor(255, 255, 255, 80))
+        spec_border.setColorAt(0.65, QColor(self._active_band_color))
+        spec_border.setColorAt(1.0, _brighten_color(self._active_band_color, 0.30))
 
-        painter.setPen(QPen(QBrush(spec_border), 1.35))
+        painter.setPen(QPen(QBrush(spec_border), 1.30))
         painter.drawPath(path)
 
-        # 4. Separador sutil sobre la fila inferior de navegación de bandas
+        # 4. Reflejo especular superior en las alas horizontales
+        hi_pen = QPen(QColor(255, 255, 255, 65), 1.0)
+        painter.setPen(hi_pen)
+        painter.drawLine(QPointF(x_left + r_corner, y_top + 1.0), QPointF(ax1 - 6.0, y_top + 1.0))
+        painter.drawLine(QPointF(ax2 + 6.0, y_top + 1.0), QPointF(x_right - r_corner, y_top + 1.0))
+
+        # 5. Separador sutil sobre la fila inferior de navegación de bandas
         painter.setPen(QPen(QColor(255, 255, 255, 20), 1.0))
         painter.drawLine(QPointF(20.0, 151.0), QPointF(w - 20.0, 151.0))
 
@@ -3318,15 +3466,18 @@ class LimiterControlPopup(QWidget):
         self.eq_engine = eq_engine
         self.overlay_ref = overlay_ref
         self.app_ref = app_ref
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setFixedWidth(340)
 
         self.setStyleSheet("""
             QWidget {
-                background-color: #16181E;
+                background: transparent;
                 color: #ECEFF4;
                 font-family: "Segoe UI", sans-serif;
                 font-size: 11px;
+            }
+            QLabel {
+                background: transparent;
             }
             QSlider::groove:horizontal {
                 height: 4px;
@@ -3345,35 +3496,10 @@ class LimiterControlPopup(QWidget):
                 margin-bottom: -4px;
                 border-radius: 6px;
             }
-            QPushButton#toggleBtn {
-                background-color: #D500F9;
-                color: #FFFFFF;
-                font-weight: bold;
-                border: 1px solid #EA80FC;
-                border-radius: 4px;
-                padding: 4px 10px;
-                font-size: 11px;
-            }
-            QPushButton#toggleBtn:checked {
-                background-color: #D500F9;
-                color: #FFFFFF;
-            }
-            QPushButton#actionBtn {
-                background-color: #242730;
-                color: #B0B5C0;
-                border: 1px solid #363C48;
-                border-radius: 4px;
-                padding: 3px 10px;
-                font-size: 10px;
-            }
-            QPushButton#actionBtn:hover {
-                background-color: #2F3340;
-                color: #FFFFFF;
-            }
         """)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setContentsMargins(16, 14, 16, 14)
         layout.setSpacing(10)
 
         # Encabezado
@@ -3403,8 +3529,7 @@ class LimiterControlPopup(QWidget):
 
         # Fila de Activación y Medidor GR en vivo
         act_row = QHBoxLayout()
-        self.toggle_btn = QPushButton("Limitador: ACTIVO")
-        self.toggle_btn.setObjectName("toggleBtn")
+        self.toggle_btn = LiquidGlassButton("Limitador: ACTIVO", self, pill_radius=10.0, active_tint_color="#D500F9")
         self.toggle_btn.setCheckable(True)
         self.toggle_btn.setChecked(self.eq_engine.limiter_a.enabled)
         self.toggle_btn.clicked.connect(self._on_toggle_clicked)
@@ -3467,19 +3592,69 @@ class LimiterControlPopup(QWidget):
 
         # Botones inferiores: Restaurar y Listo
         bot_row = QHBoxLayout()
-        reset_btn = QPushButton("Restaurar por defecto")
-        reset_btn.setObjectName("actionBtn")
+        reset_btn = LiquidGlassButton("Restaurar por defecto", self, pill_radius=10.0)
         reset_btn.clicked.connect(self._reset_defaults)
         bot_row.addWidget(reset_btn)
         bot_row.addStretch(1)
 
-        done_btn = QPushButton("Listo")
-        done_btn.setObjectName("actionBtn")
+        done_btn = LiquidGlassButton("Listo", self, pill_radius=10.0)
         done_btn.clicked.connect(self.close)
         bot_row.addWidget(done_btn)
         layout.addLayout(bot_row)
 
         self._update_toggle_style()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        rect = QRectF(4.0, 4.0, self.width() - 8.0, self.height() - 8.0)
+        r = 14.0
+
+        if HAS_PYGLASS:
+            style = GlassStyle(
+                shadow_layers=6,
+                shadow_step=1.8,
+                shadow_alpha=12,
+                shadow_top=3.0,
+                shadow_bottom=8.0,
+                tint_top=34,
+                tint_bottom=12,
+                sheen_alpha=22,
+                sheen_extent=0.45,
+                rim_top=180,
+                rim_mid=45,
+                rim_bottom=110,
+                rim_width=1.2,
+            )
+            paint_glass(painter, rect, r, None, style=style, reveal=1.0)
+        else:
+            for i in range(4, 0, -1):
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor(0, 0, 0, 18 * (5 - i)))
+                painter.drawRoundedRect(rect.adjusted(-i * 1.5, -i * 1.5 + 2, i * 1.5, i * 1.5 + 4), r + i * 1.5, r + i * 1.5)
+
+        # Fondo acrílico oscuro (#161820, alpha=245)
+        inner_path = QPainterPath()
+        inner_path.addRoundedRect(rect.adjusted(0.7, 0.7, -0.7, -0.7), r - 0.7, r - 0.7)
+        body_grad = QLinearGradient(0.0, rect.top(), 0.0, rect.bottom())
+        body_grad.setColorAt(0.0, QColor(30, 32, 42, 245))
+        body_grad.setColorAt(0.35, QColor(22, 24, 30, 246))
+        body_grad.setColorAt(1.0, QColor(16, 17, 22, 250))
+        painter.fillPath(inner_path, QBrush(body_grad))
+
+        # Borde Liquid Glass con resplandor púrpura sutil del limitador
+        lim_accent = QLinearGradient(rect.left(), rect.top(), rect.right(), rect.bottom())
+        lim_accent.setColorAt(0.0, QColor(255, 255, 255, 140))
+        lim_accent.setColorAt(0.35, QColor(213, 0, 249, 90))
+        lim_accent.setColorAt(1.0, QColor(156, 39, 176, 110))
+        painter.setPen(QPen(QBrush(lim_accent), 1.25))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRoundedRect(rect, r, r)
+
+        # Reflejo superior fino de cristal
+        hi_pen = QPen(QColor(255, 255, 255, 60), 0.9)
+        painter.setPen(hi_pen)
+        painter.drawLine(QPointF(rect.left() + r, rect.top() + 1.8), QPointF(rect.right() - r, rect.top() + 1.8))
 
     def _create_param_row(self, parent_layout, label_text, vmin, vmax, init_val, fmt_fn, callback):
         row = QHBoxLayout()
@@ -3505,26 +3680,16 @@ class LimiterControlPopup(QWidget):
 
     def _update_toggle_style(self):
         enabled = self.eq_engine.limiter_a.enabled
+        self.toggle_btn.setChecked(enabled)
         if enabled:
             self.toggle_btn.setText("Limitador: ACTIVO")
-            self.toggle_btn.setStyleSheet("""
-                background-color: #D500F9;
-                color: #FFFFFF;
-                font-weight: bold;
-                border: 1px solid #EA80FC;
-                border-radius: 4px;
-                padding: 4px 10px;
-            """)
+            self.toggle_btn.setActiveTintColor("#D500F9")
+            self.toggle_btn.setTintColor("#D500F9")
         else:
             self.toggle_btn.setText("Limitador: APAGADO")
-            self.toggle_btn.setStyleSheet("""
-                background-color: #262932;
-                color: #7E8594;
-                font-weight: bold;
-                border: 1px solid #3E4350;
-                border-radius: 4px;
-                padding: 4px 10px;
-            """)
+            self.toggle_btn.setActiveTintColor(None)
+            self.toggle_btn.setTintColor(None)
+        self.toggle_btn.update()
 
     def _on_toggle_clicked(self, checked: bool):
         self.eq_engine.limiter_a.enabled = checked
