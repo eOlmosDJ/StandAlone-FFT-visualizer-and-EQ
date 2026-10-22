@@ -6,6 +6,7 @@ __pycache__/
 # PyInstaller / Packaging
 build/
 dist/
+Instalador/
 *.spec
 
 # Local application configurations and caches
