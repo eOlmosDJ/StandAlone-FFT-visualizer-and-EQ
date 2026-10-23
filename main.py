@@ -41,7 +41,7 @@ except Exception:
 from eq_ui import (
     ProQ4Overlay, FloatingBandHUD, LiquidGlassButton, style_dark_combobox,
     LimiterControlPopup, LimiterGRMiniWidget, MiniOscilloscopeWidget, CompactScopeGLWidget,
-    AutoGainMiniBar, CrossoverMenuWidget, EditInputSelector
+    AutoGainMiniBar, CrossoverMenuWidget, EditInputSelector, CrossoverLineItem
 )
 from fft_analyzer import FFTSpectrumAnalyzer
 from eq_dsp import (
@@ -2435,33 +2435,6 @@ class AudioAnalyzerApp(QMainWindow):
         self.fft_curve_out1.setZValue(-10)
         self.curve = self.fft_curve_out1  # compat alias
 
-        # Curvas y línea interactiva del Crossover de Salidas
-        self.fft_plot = self.plot_widget
-        pen_xover_a = pg.mkPen(color=QColor(0, 229, 255, 170), width=1.5, style=Qt.PenStyle.DashLine)
-        pen_xover_b = pg.mkPen(color=QColor(255, 171, 64, 170), width=1.5, style=Qt.PenStyle.DashLine)
-        self.xover_curve_a = self.plot_widget.plot(pen=pen_xover_a)
-        self.xover_curve_b = self.plot_widget.plot(pen=pen_xover_b)
-        self.xover_curve_a.setZValue(5)
-        self.xover_curve_b.setZValue(5)
-        self.xover_curve_a.setVisible(False)
-        self.xover_curve_b.setVisible(False)
-
-        pen_xover_line = pg.mkPen(color=QColor(255, 171, 64, 200), width=1.5, style=Qt.PenStyle.DashLine)
-        hover_xover_line = pg.mkPen(color=QColor(255, 213, 79, 255), width=2.0, style=Qt.PenStyle.SolidLine)
-        self.xover_line = pg.InfiniteLine(
-            pos=np.log10(self.crossover_state.get("freq_hz", 80.0)),
-            angle=90,
-            movable=True,
-            pen=pen_xover_line,
-            hoverPen=hover_xover_line,
-            label="XOVER: 80 Hz",
-            labelOpts={"position": 0.88, "color": (255, 171, 64), "fill": (20, 24, 32, 210), "movable": True}
-        )
-        self.xover_line.setZValue(6)
-        self.plot_widget.addItem(self.xover_line)
-        self.xover_line.sigPositionChanged.connect(self._on_xover_line_dragged)
-        self.xover_line.sigPositionChangeFinished.connect(self.schedule_config_save)
-
         # 4. Curva RTA (Promedio 10s) y Marcadores de Resonancia
         self.rta_curve_item = self.plot_widget.plot(
             pen=pg.mkPen(color=QColor("#FFD740"), width=2.0)
@@ -2480,6 +2453,31 @@ class AudioAnalyzerApp(QMainWindow):
 
         self.eq_overlay = ProQ4Overlay(self.plot_widget, self.eq_engine, self.graph_container)
         self.eq_overlay.band_modified.connect(self.recalculate_autogain_target)
+
+        # Curvas y línea interactiva del Crossover Digital de Salidas alojadas en el ViewBox de EQ
+        # para alineación matemática exacta centrada en +-0 dB y 60 FPS estables sin sobrecosto de CPU
+        self.fft_plot = self.plot_widget
+        pen_xover_a = pg.mkPen(color=QColor(0, 229, 255, 190), width=1.8, style=Qt.PenStyle.DashLine)
+        pen_xover_b = pg.mkPen(color=QColor(255, 171, 64, 190), width=1.8, style=Qt.PenStyle.DashLine)
+        self.xover_curve_a = pg.PlotDataItem(pen=pen_xover_a, connect='finite')
+        self.xover_curve_b = pg.PlotDataItem(pen=pen_xover_b, connect='finite')
+        self.xover_curve_a.setZValue(15)
+        self.xover_curve_b.setZValue(15)
+        self.xover_curve_a.setVisible(False)
+        self.xover_curve_b.setVisible(False)
+        self.eq_overlay.eq_vb.addItem(self.xover_curve_a)
+        self.eq_overlay.eq_vb.addItem(self.xover_curve_b)
+
+        f_init = float(self.crossover_state.get("freq_hz", 80.0))
+        is_x_log = (self.x_scale_combo.currentText() == "Logarítmica") if hasattr(self, "x_scale_combo") else True
+        clip_lim = max(36.0, self.eq_overlay._effective_eq_vb_limit() * 1.15)
+        self.xover_line = CrossoverLineItem(f_init, is_x_log=is_x_log)
+        self.xover_line.set_config(f_init, is_x_log=is_x_log, clip_lim=clip_lim)
+        self.xover_line.setVisible(False)
+        self.eq_overlay.eq_vb.addItem(self.xover_line)
+        self.xover_line.sigPositionChanged.connect(self._on_xover_line_dragged)
+        self.xover_line.sigPositionChangeFinished.connect(self.schedule_config_save)
+        self.eq_overlay.eq_range_changed.connect(lambda _: self.update_crossover_visuals())
 
         # Capa de viñetas (Top Gradient Mask + Bottom -inf Vignette) y Escalas Unificadas a la derecha
         self.edge_masks_and_scales = FullBleedEdgeMasksAndScalesItem(self)
@@ -3422,16 +3420,17 @@ class AudioAnalyzerApp(QMainWindow):
         self.update_crossover_visuals()
         self.schedule_config_save()
 
-    def _on_xover_line_dragged(self):
+    def _on_xover_line_dragged(self, freq_hz=None):
         if not hasattr(self, "crossover") or not self.crossover.enabled:
             return
-        is_x_log = (self.x_scale_combo.currentText() == "Logarítmica")
-        val = self.xover_line.value()
+        if freq_hz is None:
+            if hasattr(self, "xover_line"):
+                freq_hz = float(self.xover_line.freq_hz)
+            else:
+                return
+
         nyquist = max(1000.0, self.current_sr / 2.0)
-        if is_x_log:
-            freq_hz = float(np.clip(10.0 ** val, 20.0, min(20000.0, nyquist * 0.98)))
-        else:
-            freq_hz = float(np.clip(val, 20.0, min(20000.0, nyquist * 0.98)))
+        freq_hz = float(np.clip(freq_hz, 20.0, min(20000.0, nyquist * 0.98)))
 
         self.crossover_state["freq_hz"] = freq_hz
         self.crossover.set_config(self.crossover_state, self.current_sr)
@@ -3440,10 +3439,6 @@ class AudioAnalyzerApp(QMainWindow):
             self.crossover_widget.spin_freq.blockSignals(True)
             self.crossover_widget.spin_freq.setValue(freq_hz)
             self.crossover_widget.spin_freq.blockSignals(False)
-
-        lbl_txt = f"XOVER: {int(round(freq_hz))} Hz" if freq_hz < 1000.0 else f"XOVER: {freq_hz/1000.0:.1f} kHz"
-        if hasattr(self.xover_line, "label") and self.xover_line.label is not None:
-            self.xover_line.label.setText(lbl_txt)
 
         self._redraw_xover_curves()
 
@@ -3457,9 +3452,16 @@ class AudioAnalyzerApp(QMainWindow):
         nyquist = max(1000.0, self.current_sr / 2.0)
         n_pts = 160
         eval_freqs = np.geomspace(20.0, nyquist * 0.98, n_pts) if is_x_log else np.linspace(20.0, nyquist * 0.98, n_pts)
+        eval_x = np.log10(eval_freqs) if is_x_log else eval_freqs
         mag_a, mag_b = self.crossover.get_magnitude_db(eval_freqs)
-        self.xover_curve_a.setData(eval_freqs, mag_a)
-        self.xover_curve_b.setData(eval_freqs, mag_b)
+
+        # Límite vertical adaptado al ViewBox de EQ para que el cruce coincida exactamente con +-0 dB
+        clip_lim = max(36.0, self.eq_overlay._effective_eq_vb_limit() * 1.15) if hasattr(self, "eq_overlay") else 36.0
+        mag_a = np.clip(mag_a, -clip_lim, clip_lim)
+        mag_b = np.clip(mag_b, -clip_lim, clip_lim)
+
+        self.xover_curve_a.setData(eval_x, mag_a)
+        self.xover_curve_b.setData(eval_x, mag_b)
 
     def update_crossover_visuals(self):
         if not hasattr(self, "crossover") or not hasattr(self, "xover_line"):
@@ -3479,14 +3481,11 @@ class AudioAnalyzerApp(QMainWindow):
             return
 
         is_x_log = (self.x_scale_combo.currentText() == "Logarítmica")
-        f_hz = self.crossover.freq_hz
-        line_pos = float(np.log10(f_hz)) if is_x_log else float(f_hz)
+        f_hz = float(self.crossover.freq_hz)
+        clip_lim = max(36.0, self.eq_overlay._effective_eq_vb_limit() * 1.15) if hasattr(self, "eq_overlay") else 36.0
 
         self.xover_line.blockSignals(True)
-        self.xover_line.setValue(line_pos)
-        lbl_txt = f"XOVER: {int(round(f_hz))} Hz" if f_hz < 1000.0 else f"XOVER: {f_hz/1000.0:.1f} kHz"
-        if hasattr(self.xover_line, "label") and self.xover_line.label is not None:
-            self.xover_line.label.setText(lbl_txt)
+        self.xover_line.set_config(f_hz, is_x_log=is_x_log, clip_lim=clip_lim)
         self.xover_line.blockSignals(False)
 
         self._redraw_xover_curves()
@@ -4590,7 +4589,11 @@ class AudioAnalyzerApp(QMainWindow):
             out_B *= ag_lin
 
         # 6. Crossover Digital de Salidas (Out A / Out B)
-        if hasattr(self, "crossover"):
+        if hasattr(self, "crossover") and self.crossover.enabled:
+            # Si Out B no tiene ruteo independiente configurado pero el Crossover está activo,
+            # alimenta Out B con el master de Out A para que el Sub reciba la señal de bajas frecuencias
+            if not self.route_in1_to_b and not self.route_in2_to_b and (float(np.max(np.abs(out_B))) < 1e-6):
+                out_B = out_A.copy()
             out_A, out_B = self.crossover.process_outputs(out_A, out_B)
 
         # 7. Limitador Master (compartido unificado)

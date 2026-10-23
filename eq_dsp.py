@@ -1309,51 +1309,54 @@ class DualOutputCrossover:
                 self._zi_a = np.zeros((n_sec, 2), dtype=np.float64)
                 self._zi_b = np.zeros((n_sec, 2), dtype=np.float64)
 
-        # Detección de silencio total para eludir sosfilt en reposo y evitar gasto de CPU (0.001 ms)
+        # Detección ultra-rápida de silencio para eludir sosfilt en reposo y evitar gasto de CPU (0.001 ms)
         is_silent_a = float(np.max(np.abs(out_a))) < 1e-7
         is_silent_b = float(np.max(np.abs(out_b))) < 1e-7
-        zi_silent_a = float(np.max(np.abs(self._zi_a))) < 1e-14
-        zi_silent_b = float(np.max(np.abs(self._zi_b))) < 1e-14
 
         if self.routing_mode == "A_Tops_B_Sub":
-            if is_silent_a and zi_silent_a:
+            if is_silent_a:
                 proc_a = out_a
                 self._zi_a.fill(0.0)
             else:
                 proc_a, self._zi_a = sosfilt(sos_hp, out_a, axis=0, zi=self._zi_a)
-                # Anti-denormal flush instantáneo para aniquilar trampas de microcódigo CPU
-                self._zi_a[np.abs(self._zi_a) < 1e-15] = 0.0
+                # Anti-denormal DC offset flush instantáneo (O(1), 0 asignaciones de memoria)
+                self._zi_a += 1e-25
+                self._zi_a -= 1e-25
 
-            if is_silent_b and zi_silent_b:
+            if is_silent_b:
                 proc_b = out_b
                 self._zi_b.fill(0.0)
             else:
                 proc_b, self._zi_b = sosfilt(sos_lp, out_b, axis=0, zi=self._zi_b)
-                self._zi_b[np.abs(self._zi_b) < 1e-15] = 0.0
+                self._zi_b += 1e-25
+                self._zi_b -= 1e-25
 
         elif self.routing_mode == "A_Sub_B_Tops":
-            if is_silent_a and zi_silent_a:
+            if is_silent_a:
                 proc_a = out_a
                 self._zi_a.fill(0.0)
             else:
                 proc_a, self._zi_a = sosfilt(sos_lp, out_a, axis=0, zi=self._zi_a)
-                self._zi_a[np.abs(self._zi_a) < 1e-15] = 0.0
+                self._zi_a += 1e-25
+                self._zi_a -= 1e-25
 
-            if is_silent_b and zi_silent_b:
+            if is_silent_b:
                 proc_b = out_b
                 self._zi_b.fill(0.0)
             else:
                 proc_b, self._zi_b = sosfilt(sos_hp, out_b, axis=0, zi=self._zi_b)
-                self._zi_b[np.abs(self._zi_b) < 1e-15] = 0.0
+                self._zi_b += 1e-25
+                self._zi_b -= 1e-25
 
         else:  # "A_Full_B_Sub"
             proc_a = out_a
-            if is_silent_b and zi_silent_b:
+            if is_silent_b:
                 proc_b = out_b
                 self._zi_b.fill(0.0)
             else:
                 proc_b, self._zi_b = sosfilt(sos_lp, out_b, axis=0, zi=self._zi_b)
-                self._zi_b[np.abs(self._zi_b) < 1e-15] = 0.0
+                self._zi_b += 1e-25
+                self._zi_b -= 1e-25
 
         return proc_a.astype(np.float32, copy=False), proc_b.astype(np.float32, copy=False)
 
