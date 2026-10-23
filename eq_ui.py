@@ -4,9 +4,10 @@ import numpy as np
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QComboBox, QFrame, QMenu, QColorDialog, QDialog, QToolTip,
-    QGraphicsOpacityEffect, QListView, QSlider
+    QGraphicsOpacityEffect, QListView, QSlider, QGraphicsPathItem, QGraphicsItem,
+    QApplication
 )
-from PyQt6.QtCore import Qt, QEvent, QPoint, QPointF, QRectF, pyqtSignal
+from PyQt6.QtCore import Qt, QEvent, QPoint, QPointF, QRectF, pyqtSignal, QTimer
 from PyQt6.QtGui import (
     QColor, QFont, QPainter, QPainterPath, QPen, QBrush,
     QLinearGradient, QPolygonF, QPixmap, QIcon, QCursor
@@ -1514,6 +1515,63 @@ class GhostCurveItem(pg.GraphicsObject):
         painter.restore()
 
 
+class FFTInspectorItem(QGraphicsItem):
+    """
+    Mini-inspector flotante dibujado DENTRO de la escena OpenGL de la FFT (zValue alto):
+    línea 1 = Hz + dBFS instantáneo de la FFT; línea 2 opcional = ±dB del filtro propuesto.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.setZValue(1000)
+        self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self._line1 = ""
+        self._line2 = ""
+        self._line2_color = QColor("#00E5FF")
+        self._font = QFont("Segoe UI", 9)
+        self._font.setBold(True)
+        self._w = 120.0
+        self._h = 22.0
+
+    def set_content(self, line1: str, line2: str = "", line2_color: QColor | None = None):
+        if line1 == self._line1 and line2 == self._line2 and (line2_color is None or line2_color == self._line2_color):
+            return
+        self.prepareGeometryChange()
+        self._line1 = line1
+        self._line2 = line2
+        if line2_color is not None:
+            self._line2_color = QColor(line2_color)
+        from PyQt6.QtGui import QFontMetricsF
+        fm = QFontMetricsF(self._font)
+        w = fm.horizontalAdvance(line1)
+        if line2:
+            w = max(w, fm.horizontalAdvance(line2))
+        self._w = w + 18.0
+        self._h = (fm.height() * (2 if line2 else 1)) + 10.0
+        self.update()
+
+    def size(self):
+        return self._w, self._h
+
+    def boundingRect(self):
+        return QRectF(0.0, 0.0, self._w, self._h)
+
+    def paint(self, painter, option, widget=None):
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        r = QRectF(0.5, 0.5, self._w - 1.0, self._h - 1.0)
+        painter.setPen(QPen(QColor(255, 255, 255, 46), 1.0))
+        painter.setBrush(QBrush(QColor(14, 16, 22, 185)))
+        painter.drawRoundedRect(r, 6.0, 6.0)
+        painter.setFont(self._font)
+        from PyQt6.QtGui import QFontMetricsF
+        lh = QFontMetricsF(self._font).height()
+        painter.setPen(QColor("#E8ECF2"))
+        painter.drawText(QRectF(9.0, 5.0, self._w - 18.0, lh), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, self._line1)
+        if self._line2:
+            painter.setPen(self._line2_color)
+            painter.drawText(QRectF(9.0, 5.0 + lh, self._w - 18.0, lh), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, self._line2)
+
+
 class ProQ4Overlay(QWidget):
     """
     Capa visual interactiva estilo FabFilter Pro-Q 4 Full-Bleed:
@@ -1571,9 +1629,16 @@ class ProQ4Overlay(QWidget):
         self._init_secondary_viewbox()
         self._init_curves_and_nodes()
 
+        # Mini-inspector FFT (Hz + dBFS + ±dB filtro propuesto) renderizado en la escena OpenGL
+        self.fft_curves = []
+        self.fft_inspector = FFTInspectorItem()
+        self.plot_item.scene().addItem(self.fft_inspector)
+        self.fft_inspector.hide()
+
         self.node_callout = BandNodeCallout(self, self.plot_widget)
 
         self._viewport.installEventFilter(self)
+        self.setMouseTracking(True)
         self._viewport.setMouseTracking(True)
 
     def _effective_eq_vb_limit(self) -> float:
@@ -1770,7 +1835,102 @@ class ProQ4Overlay(QWidget):
         self._mouse_velocity_px = 0.0
         self.update_ghost_tick()
 
+    def _cursor_in_blocked_zone(self, local_pt: QPoint) -> bool:
+        if hasattr(self, "hud_container") and self.hud_container is not None:
+            hud = getattr(self.hud_container, "floating_hud", None)
+            if hud is not None and hud.isVisible() and hud.geometry().contains(local_pt):
+                return True
+            top_bar = getattr(self.hud_container, "top_bar", None)
+            if top_bar is not None and top_bar.isVisible() and top_bar.geometry().contains(local_pt):
+                return True
+            scope = getattr(self.hud_container, "scope_overlay", None)
+            if scope is not None and scope.isVisible() and scope.geometry().contains(local_pt):
+                return True
+        if hasattr(self, "node_callout") and self.node_callout.isVisible() and self.node_callout.geometry().contains(local_pt):
+            return True
+        return False
+
+    def _update_fft_inspector(self):
+        """Actualiza el mini-inspector OpenGL junto al cursor: Hz + dBFS de la FFT (+ ±dB del filtro propuesto)."""
+        insp = getattr(self, "fft_inspector", None)
+        if insp is None:
+            return
+        scene_pos = self._current_ghost_scene_pos
+        local_pt = self._current_ghost_mouse_pos
+        rect = self.plot_item.vb.sceneBoundingRect()
+        if (
+            local_pt.x() < -9000
+            or self.dragging_band_idx >= 0
+            or not rect.contains(scene_pos)
+            or self._find_band_near_scene_pos(scene_pos, max_dist_px=22.0) >= 0
+            or self._cursor_in_blocked_zone(local_pt)
+        ):
+            if insp.isVisible():
+                insp.hide()
+            return
+
+        main_pt = self.plot_item.vb.mapSceneToView(scene_pos)
+        freq_hz = float(10.0 ** main_pt.x()) if self.is_x_log else float(main_pt.x())
+        freq_hz = max(1.0, freq_hz)
+        f_txt = f"{freq_hz / 1000.0:.2f} kHz" if freq_hz >= 1000.0 else f"{freq_hz:.1f} Hz"
+
+        fft_txt = "-- dBFS"
+        for curve in self.fft_curves:
+            try:
+                if not curve.isVisible():
+                    continue
+                xd, yd = curve.getData()
+                if xd is None or yd is None or len(xd) < 2:
+                    continue
+                val = float(np.interp(main_pt.x(), xd, yd))
+                fft_txt = f"{val:.1f} dBFS"
+                break
+            except Exception:
+                continue
+        line1 = f"{f_txt}  |  {fft_txt}"
+
+        line2 = ""
+        col = None
+        if self._ghost_unlocked and self._ghost_fade > 0.05:
+            g_db = float(np.clip(self._ghost_db, -24.0, 24.0))
+            g_f = float(10.0 ** self._ghost_log_f) if self.is_x_log else float(self._ghost_log_f)
+            if g_f < 45.0:
+                g_type = "Low Cut" if abs(g_db) < 3.0 else "Low Shelf"
+            elif g_f > 10000.0:
+                g_type = "High Cut" if abs(g_db) < 3.0 else "High Shelf"
+            else:
+                g_type = "Notch" if g_db < -10.0 else "Bell"
+
+            from eq_dsp import BAND_COLORS
+            with self.eq_engine.lock:
+                nb = len(self.eq_engine.bands)
+            col = QColor(BAND_COLORS[nb % len(BAND_COLORS)])
+
+            if abs(g_db) < 0.05:
+                line2 = f"{g_type}: 0.0 dB"
+            elif g_db > 0:
+                line2 = f"{g_type}: +{g_db:.1f} dB"
+            else:
+                line2 = f"{g_type}: {g_db:.1f} dB"
+
+        insp.set_content(line1, line2, col)
+        w, h = insp.size()
+        x = scene_pos.x() + 14.0
+        y = scene_pos.y() - 24.0 - h
+        if y < rect.top() + 4.0:
+            y = scene_pos.y() + 18.0
+        if x + w > rect.right() - 4.0:
+            x = scene_pos.x() - w - 14.0
+        if x < rect.left() + 4.0:
+            x = rect.left() + 4.0
+        if y + h > rect.bottom() - 4.0:
+            y = rect.bottom() - 4.0 - h
+        insp.setPos(x, y)
+        if not insp.isVisible():
+            insp.show()
+
     def update_ghost_tick(self):
+        self._update_fft_inspector()
         # --- 1. ZONA SEGURA AMPLIA PARA EL MENÚ DE NODO (Nodo + Callout + Margen 45px) ---
         if hasattr(self, "node_callout") and self.node_callout.isVisible():
             node_pt = None
@@ -2184,11 +2344,14 @@ class ProQ4Overlay(QWidget):
                 else:
                     self._proposed_band = None
                     self._clear_ghost_curve()
+                self._update_fft_inspector()
 
         elif etype == QEvent.Type.Leave:
             self._current_ghost_mouse_pos = QPoint(-9999, -9999)
             self._current_ghost_scene_pos = QPointF(-9999, -9999)
             self._clear_ghost_curve()
+            if hasattr(self, "fft_inspector") and self.fft_inspector.isVisible():
+                self.fft_inspector.hide()
 
         elif etype == QEvent.Type.MouseButtonRelease:
             if event.button() == Qt.MouseButton.LeftButton and self.dragging_band_idx >= 0:
@@ -2626,15 +2789,114 @@ class ProQ4Overlay(QWidget):
                     self.node_callout.hide()
 
 
+class HUDOpenGLBackgroundItem(QGraphicsItem):
+    """
+    Fondo translúcido del HUD renderizado 100% en GPU dentro de la escena OpenGL de la FFT:
+    - Alpha-blending directo por hardware (rgba(16, 18, 24, 130) ~50% transparencia).
+    - Silueta con joroba superior envolviendo a GAIN en modo expandido o píldora compacta en modo minimizado.
+    - Borde fino y resplandor exterior suave sincronizados con el color de la banda activa.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.setZValue(25)
+        self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self._rect = QRectF(0.0, 0.0, 700.0, 196.0)
+        self._is_minimized = False
+        self._active_color = QColor("#00E5FF")
+        self._gain_center_x = 276.0
+        self._cached_path = QPainterPath()
+        self._rebuild_path()
+
+    def boundingRect(self) -> QRectF:
+        return self._rect.adjusted(-6.0, -6.0, 6.0, 6.0)
+
+    def set_state(self, scene_pos: QPointF, width: float, height: float, is_minimized: bool, active_color: QColor, gain_cx: float):
+        self.setPos(scene_pos)
+        c = QColor(active_color) if active_color else QColor("#00E5FF")
+        geom_changed = (
+            abs(self._rect.width() - width) > 0.5
+            or abs(self._rect.height() - height) > 0.5
+            or self._is_minimized != is_minimized
+            or abs(self._gain_center_x - gain_cx) > 0.5
+        )
+        if geom_changed:
+            self.prepareGeometryChange()
+            self._rect = QRectF(0.0, 0.0, width, height)
+            self._is_minimized = is_minimized
+            self._gain_center_x = gain_cx
+            self._active_color = c
+            self._rebuild_path()
+            self.update()
+        elif self._active_color != c:
+            self._active_color = c
+            self.update()
+
+    def _rebuild_path(self):
+        self._cached_path = QPainterPath()
+        w = float(self._rect.width())
+        h = float(self._rect.height())
+        pad = 2.0
+        r_corner = 10.0 if self._is_minimized else 18.0
+        x_left = pad
+        x_right = w - pad
+        y_bot = h - pad
+
+        if self._is_minimized:
+            self._cached_path.addRoundedRect(QRectF(x_left, pad, w - 2 * pad, h - 2 * pad), r_corner, r_corner)
+            return
+
+        y_top = 34.0
+        y_peak = 2.5
+        arch_cx = self._gain_center_x
+        arch_half_w = 104.0
+        ax1 = max(x_left + r_corner + 10.0, arch_cx - arch_half_w)
+        ax2 = min(x_right - r_corner - 10.0, arch_cx + arch_half_w)
+
+        p = self._cached_path
+        p.moveTo(x_left + r_corner, y_top)
+        p.lineTo(ax1, y_top)
+        p.cubicTo(
+            QPointF(ax1 + 38.0, y_top),
+            QPointF(arch_cx - 42.0, y_peak),
+            QPointF(arch_cx, y_peak),
+        )
+        p.cubicTo(
+            QPointF(arch_cx + 42.0, y_peak),
+            QPointF(ax2 - 38.0, y_top),
+            QPointF(ax2, y_top),
+        )
+        p.lineTo(x_right - r_corner, y_top)
+        p.quadTo(QPointF(x_right, y_top), QPointF(x_right, y_top + r_corner))
+        p.lineTo(x_right, y_bot - r_corner)
+        p.quadTo(QPointF(x_right, y_bot), QPointF(x_right - r_corner, y_bot))
+        p.lineTo(x_left + r_corner, y_bot)
+        p.quadTo(QPointF(x_left, y_bot), QPointF(x_left, y_bot - r_corner))
+        p.lineTo(x_left, y_top + r_corner)
+        p.quadTo(QPointF(x_left, y_top), QPointF(x_left + r_corner, y_top))
+        p.closeSubpath()
+
+    def paint(self, painter, option, widget=None):
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.fillPath(self._cached_path, QBrush(QColor(16, 18, 24, 130)))
+
+        glow = QColor(self._active_color)
+        glow.setAlpha(36)
+        painter.setPen(QPen(glow, 2.8))
+        painter.drawPath(self._cached_path)
+
+        border = QColor(self._active_color)
+        border.setAlpha(170)
+        painter.setPen(QPen(border, 1.2))
+        painter.drawPath(self._cached_path)
+
+
 class FloatingBandHUD(QWidget):
     """
     HUD Flotante Superpuesto estilo FabFilter Pro-Q 4 + Apple Liquid Glass Oscuro:
-    - La perilla grande de `GAIN` (diámetro 88px) está encastrada directamente en el notch
-      curvo superior ("joroba"), despejando por completo la zona central superior.
-    - El navegador de bandas (`<`, `Band 1`, `>`, `+`, `✕`, `⚡ DYN`, `🎧 Solo`) vive en una
-      fila inferior limpia en la base del HUD, debajo de las etiquetas `FREQ`, `GAIN`, `Q`.
-    - Cuerpo pintado con degradado oscuro profundo (#1E2028 a #14151A, alpha = 235) y borde
-      especular Liquid Glass combinado con un resplandor sutil del color de la banda activa.
+    - Fondo semitransparente composicionado en la GPU vía QGraphicsItem en OpenGL (0% CPU).
+    - Arrastrable libremente (Draggable) por todo el lienzo con memoria de posición.
+    - Modo minimizado compacto (36px) con controles esenciales en 1 fila + Auto-Expand con cursor.
     """
 
     parameters_changed = pyqtSignal()
@@ -2645,6 +2907,18 @@ class FloatingBandHUD(QWidget):
         self.overlay = overlay
         self._updating_ui = False
         self._active_band_color = QColor("#00E5FF")
+        self._is_minimized = False
+        self._auto_expand = False
+        self._user_custom_pos = None
+        self._drag_active = False
+        self._drag_start_cursor = QPoint()
+        self._drag_start_pos = QPoint()
+        self._bg_gl_item = None
+        self.plot_widget = None
+
+        self._leave_timer = QTimer(self)
+        self._leave_timer.setSingleShot(True)
+        self._leave_timer.timeout.connect(self._on_leave_timeout)
 
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setFixedSize(700, 196)
@@ -2693,13 +2967,171 @@ class FloatingBandHUD(QWidget):
         self.overlay.band_modified.connect(self._on_overlay_band_modified)
         self.refresh_from_engine()
 
+        self.installEventFilter(self)
+        self.expanded_container.installEventFilter(self)
+        self.compact_container.installEventFilter(self)
+        self.drag_grip_btn.installEventFilter(self)
+        self.compact_drag_grip.installEventFilter(self)
+
+    def attach_gl_background(self, plot_widget: pg.PlotWidget):
+        self.plot_widget = plot_widget
+        scene = plot_widget.plotItem.vb.scene()
+        if self._bg_gl_item is None:
+            self._bg_gl_item = HUDOpenGLBackgroundItem()
+            scene.addItem(self._bg_gl_item)
+        self.sync_bg_item()
+
+    def sync_bg_item(self):
+        if self._bg_gl_item is None:
+            return
+        if not self.isVisible():
+            self._bg_gl_item.hide()
+            return
+        if hasattr(self, "plot_widget") and self.plot_widget is not None:
+            scene_pos = self.plot_widget.mapToScene(self.pos())
+            self._bg_gl_item.set_state(
+                scene_pos,
+                float(self.width()),
+                float(self.height()),
+                self._is_minimized,
+                self._active_band_color,
+                self._gain_center_x(),
+            )
+            if not self._bg_gl_item.isVisible():
+                self._bg_gl_item.show()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.sync_bg_item()
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        if self._bg_gl_item is not None:
+            self._bg_gl_item.hide()
+
+    def moveEvent(self, event):
+        super().moveEvent(event)
+        self.sync_bg_item()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.sync_bg_item()
+
+    def set_minimized(self, minimized: bool):
+        if self._is_minimized == bool(minimized):
+            return
+        self._is_minimized = bool(minimized)
+        if self._is_minimized:
+            self.setFixedSize(700, 36)
+            self.expanded_container.hide()
+            self.compact_container.setGeometry(0, 0, 700, 36)
+            self.compact_container.show()
+        else:
+            self.setFixedSize(700, 196)
+            self.compact_container.hide()
+            self.expanded_container.setGeometry(0, 0, 700, 196)
+            self.expanded_container.show()
+            p = self.parent()
+            if p is not None:
+                max_y = p.height() - 196 - 10
+                if self.y() > max_y:
+                    self.move(self.x(), max(44, max_y))
+                    if self._user_custom_pos is not None:
+                        self._user_custom_pos = self.pos()
+        self.refresh_from_engine()
+        self.sync_bg_item()
+
+    def toggle_auto_expand(self, enabled: bool):
+        self._auto_expand = bool(enabled)
+        self.auto_expand_btn.setChecked(self._auto_expand)
+        self.compact_auto_btn.setChecked(self._auto_expand)
+
+    def enterEvent(self, event):
+        super().enterEvent(event)
+        self._leave_timer.stop()
+        if self._is_minimized and self._auto_expand:
+            self.set_minimized(False)
+
+    def leaveEvent(self, event):
+        super().leaveEvent(event)
+        if not self._is_minimized and self._auto_expand:
+            if not self._has_active_popup():
+                self._leave_timer.start(400)
+
+    def _has_active_popup(self) -> bool:
+        focus_w = QApplication.focusWidget()
+        if focus_w is not None and (self.isAncestorOf(focus_w) or isinstance(focus_w, QListView)):
+            return True
+        for cb in self.findChildren(QComboBox):
+            if cb.view() is not None and cb.view().isVisible():
+                return True
+        return False
+
+    def _on_leave_timeout(self):
+        if not self._is_minimized and self._auto_expand:
+            if not self._has_active_popup():
+                cursor_pos = self.mapFromGlobal(QCursor.pos())
+                if not self.rect().contains(cursor_pos):
+                    self.set_minimized(True)
+
+    def eventFilter(self, obj, event):
+        if obj in (self, self.expanded_container, self.compact_container, getattr(self, "drag_grip_btn", None), getattr(self, "compact_drag_grip", None)):
+            etype = event.type()
+            if etype == QEvent.Type.MouseButtonPress:
+                if event.button() == Qt.MouseButton.LeftButton:
+                    self._drag_active = True
+                    self._drag_start_cursor = event.globalPosition().toPoint()
+                    self._drag_start_pos = self.pos()
+                    return True
+            elif etype == QEvent.Type.MouseMove:
+                if getattr(self, "_drag_active", False):
+                    delta = event.globalPosition().toPoint() - self._drag_start_cursor
+                    new_pos = self._drag_start_pos + delta
+                    p = self.parent()
+                    pw = p.width() if p is not None else 1000
+                    ph = p.height() if p is not None else 700
+                    new_x = max(0, min(pw - self.width(), new_pos.x()))
+                    new_y = max(40, min(ph - self.height(), new_pos.y()))
+                    self._user_custom_pos = QPoint(new_x, new_y)
+                    self.move(new_x, new_y)
+                    self.sync_bg_item()
+                    return True
+            elif etype == QEvent.Type.MouseButtonRelease:
+                if event.button() == Qt.MouseButton.LeftButton and getattr(self, "_drag_active", False):
+                    self._drag_active = False
+                    return True
+        return super().eventFilter(obj, event)
+
     def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_active = True
+            self._drag_start_cursor = event.globalPosition().toPoint()
+            self._drag_start_pos = self.pos()
+            event.accept()
+            return
         event.accept()
 
     def mouseMoveEvent(self, event):
+        if getattr(self, "_drag_active", False):
+            delta = event.globalPosition().toPoint() - self._drag_start_cursor
+            new_pos = self._drag_start_pos + delta
+            p = self.parent()
+            pw = p.width() if p is not None else 1000
+            ph = p.height() if p is not None else 700
+            new_x = max(0, min(pw - self.width(), new_pos.x()))
+            new_y = max(40, min(ph - self.height(), new_pos.y()))
+            self._user_custom_pos = QPoint(new_x, new_y)
+            self.move(new_x, new_y)
+            self.sync_bg_item()
+            event.accept()
+            return
         event.accept()
 
     def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and getattr(self, "_drag_active", False):
+            self._drag_active = False
+            event.accept()
+            return
         event.accept()
 
     def mouseDoubleClickEvent(self, event):
@@ -2713,18 +3145,46 @@ class FloatingBandHUD(QWidget):
         return f"{v / 1000.0:.2f} kHz" if v >= 1000.0 else f"{v:.1f} Hz"
 
     def _build_ui(self):
-        # Posicionamiento determinístico para encastrar GAIN (88px) dentro de la joroba superior (y_peak=3, y_top=34)
-        # 1. Columna Izquierda: Power + Color Swatch en esquina superior izquierda del ala, Filter Shape y Slope debajo
-        self.band_enable_btn = PowerToggleButton(self)
+        # =====================================================================
+        # 1. CONTENEDOR EXPANDIDO (Altura 196px)
+        # =====================================================================
+        self.expanded_container = QWidget(self)
+        self.expanded_container.setGeometry(0, 0, 700, 196)
+
+        # Botón Minimizar, Auto-Expand y Agarre de Arrastre en la esquina superior derecha
+        self.drag_grip_btn = QLabel("⠿", self.expanded_container)
+        self.drag_grip_btn.setFixedSize(18, 18)
+        self.drag_grip_btn.move(672, 38)
+        self.drag_grip_btn.setCursor(Qt.CursorShape.SizeAllCursor)
+        self.drag_grip_btn.setToolTip("Arrastrar HUD")
+        self.drag_grip_btn.setStyleSheet("color: #727B8E; font-size: 13px; font-weight: bold;")
+
+        self.minimize_btn = QPushButton("—", self.expanded_container)
+        self.minimize_btn.setFixedSize(22, 18)
+        self.minimize_btn.move(646, 38)
+        self.minimize_btn.setToolTip("Minimizar HUD (Barra Compacta)")
+        self.minimize_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.minimize_btn.clicked.connect(lambda: self.set_minimized(True))
+
+        self.auto_expand_btn = QPushButton("📌 Auto", self.expanded_container)
+        self.auto_expand_btn.setCheckable(True)
+        self.auto_expand_btn.setFixedSize(58, 18)
+        self.auto_expand_btn.move(584, 38)
+        self.auto_expand_btn.setToolTip("Auto-expandir al pasar el cursor (vuelve a minimizar tras 0.4s)")
+        self.auto_expand_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.auto_expand_btn.clicked.connect(self.toggle_auto_expand)
+
+        # Columna Izquierda: Power + Color Swatch, Filter Shape y Slope
+        self.band_enable_btn = PowerToggleButton(self.expanded_container)
         self.band_enable_btn.setToolTip("Activar / Desactivar banda seleccionada")
         self.band_enable_btn.move(20, 44)
         self.band_enable_btn.clicked.connect(self._on_band_enable_toggled)
 
-        self.color_swatch = ColorSwatchButton("#00E5FF", self)
+        self.color_swatch = ColorSwatchButton("#00E5FF", self.expanded_container)
         self.color_swatch.move(50, 44)
         self.color_swatch.colorSelected.connect(self._on_swatch_color_selected)
 
-        self.type_combo = QComboBox(self)
+        self.type_combo = QComboBox(self.expanded_container)
         style_dark_combobox(self.type_combo)
         self.type_combo.addItems(FILTER_TYPES)
         self.type_combo.setFixedSize(112, 27)
@@ -2732,7 +3192,7 @@ class FloatingBandHUD(QWidget):
         self.type_combo.setToolTip("Forma del filtro (Filter Shape)")
         self.type_combo.currentTextChanged.connect(self._on_type_or_slope_changed)
 
-        self.slope_combo = QComboBox(self)
+        self.slope_combo = QComboBox(self.expanded_container)
         style_dark_combobox(self.slope_combo)
         self.slope_combo.setFixedSize(112, 27)
         self.slope_combo.move(20, 110)
@@ -2741,38 +3201,37 @@ class FloatingBandHUD(QWidget):
             self.slope_combo.addItem(f"{s} dB/oct", s)
         self.slope_combo.currentIndexChanged.connect(self._on_type_or_slope_changed)
 
-        # 2. Bloque Central: FREQ (60px), GAIN (88px encastrado en la joroba en y=14), THR y Q (60px)
+        # Bloque Central: FREQ, GAIN encastrada en la joroba, THR, Q
         self.freq_knob = ProQKnob(
             title="FREQ", min_val=10.0, max_val=24000.0, default_val=1000.0,
             fmt_func=self._fmt_freq, log_scale=True, bipolar=False,
-            accent_color="#00E5FF", diameter=60, parent=self
+            accent_color="#00E5FF", diameter=60, parent=self.expanded_container
         )
         self.freq_knob.move(146, 48)
         self.freq_knob.valueChanged.connect(self._on_knob_param_changed)
 
-        # GAIN de 88px alojada en el notch curvo superior (su mitad superior sube hasta y=14, dentro de la joroba!)
-        self.gain_dyn_knob = GainDynProQKnob(diameter=88, parent=self)
+        self.gain_dyn_knob = GainDynProQKnob(diameter=88, parent=self.expanded_container)
         self.gain_dyn_knob.move(232, 14)
         self.gain_dyn_knob.valueChanged.connect(self._on_knob_param_changed)
         self.gain_dyn_knob.dynRangeChanged.connect(self._on_dyn_range_knob_changed)
 
-        self.thresh_meter = DynThresholdMeter(parent=self)
+        self.thresh_meter = DynThresholdMeter(parent=self.expanded_container)
         self.thresh_meter.move(346, 44)
         self.thresh_meter.thresholdChanged.connect(self._on_threshold_meter_changed)
 
         self.q_knob = ProQKnob(
             title="Q", min_val=0.10, max_val=24.0, default_val=1.00,
             fmt_func=lambda v: f"{v:.2f}", log_scale=True, bipolar=False,
-            accent_color="#00E5FF", diameter=60, parent=self
+            accent_color="#00E5FF", diameter=60, parent=self.expanded_container
         )
         self.q_knob.move(398, 48)
         self.q_knob.valueChanged.connect(self._on_knob_param_changed)
 
-        # 3. Bloque Derecho: Perillas auxiliares A, R y OUT (diámetro 46px) con espaciado uniforme
+        # Bloque Derecho: A, R, OUT
         self.attack_knob = ProQKnob(
             title="A", min_val=0.5, max_val=500.0, default_val=15.0,
             fmt_func=lambda v: f"{v:.1f} ms" if v < 10 else f"{v:.0f} ms",
-            log_scale=True, bipolar=False, accent_color="#00E5FF", diameter=46, parent=self
+            log_scale=True, bipolar=False, accent_color="#00E5FF", diameter=46, parent=self.expanded_container
         )
         self.attack_knob.move(492, 56)
         self.attack_knob.valueChanged.connect(self._on_knob_param_changed)
@@ -2780,7 +3239,7 @@ class FloatingBandHUD(QWidget):
         self.release_knob = ProQKnob(
             title="R", min_val=5.0, max_val=2000.0, default_val=120.0,
             fmt_func=lambda v: f"{v:.0f} ms",
-            log_scale=True, bipolar=False, accent_color="#00E5FF", diameter=46, parent=self
+            log_scale=True, bipolar=False, accent_color="#00E5FF", diameter=46, parent=self.expanded_container
         )
         self.release_knob.move(556, 56)
         self.release_knob.valueChanged.connect(self._on_knob_param_changed)
@@ -2788,13 +3247,13 @@ class FloatingBandHUD(QWidget):
         self.out_gain_knob = ProQKnob(
             title="OUT", min_val=-24.0, max_val=24.0, default_val=0.0,
             fmt_func=lambda v: f"{v:+.1f} dB", log_scale=False, bipolar=True,
-            accent_color="#FFD54F", diameter=46, parent=self
+            accent_color="#FFD54F", diameter=46, parent=self.expanded_container
         )
         self.out_gain_knob.move(620, 56)
         self.out_gain_knob.valueChanged.connect(self._on_global_changed)
 
-        # 4. Fila Inferior Limpia en la Base del HUD (debajo de FREQ, GAIN, Q: y = 158..184)
-        self.bottom_bar = QWidget(self)
+        # Fila Inferior
+        self.bottom_bar = QWidget(self.expanded_container)
         self.bottom_bar.setGeometry(20, 156, 660, 28)
         bot_row = QHBoxLayout(self.bottom_bar)
         bot_row.setContentsMargins(0, 0, 0, 0)
@@ -2874,73 +3333,180 @@ class FloatingBandHUD(QWidget):
         self.band_solo_btn.clicked.connect(self._on_band_solo_toggled)
         bot_row.addWidget(self.band_solo_btn)
 
+        # =====================================================================
+        # 2. CONTENEDOR COMPACTO (Altura 36px)
+        # =====================================================================
+        self.compact_container = QWidget(self)
+        self.compact_container.setGeometry(0, 0, 700, 36)
+        self.compact_container.hide()
+        self.compact_widget = self.compact_container
+
+        comp_row = QHBoxLayout(self.compact_container)
+        comp_row.setContentsMargins(10, 4, 10, 4)
+        comp_row.setSpacing(6)
+
+        self.compact_drag_grip = QLabel("⠿", self.compact_container)
+        self.compact_drag_grip.setFixedSize(14, 24)
+        self.compact_drag_grip.setCursor(Qt.CursorShape.SizeAllCursor)
+        self.compact_drag_grip.setToolTip("Arrastrar HUD")
+        self.compact_drag_grip.setStyleSheet("color: #727B8E; font-size: 13px; font-weight: bold;")
+        comp_row.addWidget(self.compact_drag_grip)
+
+        # 1. Power ON/OFF + Color Swatch
+        self.compact_power_btn = PowerToggleButton(self.compact_container)
+        self.compact_power_btn.setToolTip("Activar / Desactivar banda")
+        self.compact_power_btn.clicked.connect(self._on_band_enable_toggled)
+        comp_row.addWidget(self.compact_power_btn)
+
+        self.compact_color_swatch = ColorSwatchButton("#00E5FF", self.compact_container)
+        self.compact_color_swatch.colorSelected.connect(self._on_swatch_color_selected)
+        comp_row.addWidget(self.compact_color_swatch)
+
+        # 2. Navegador < Band X > + y ✕
+        self.compact_prev_btn = QPushButton("‹", self.compact_container)
+        self.compact_prev_btn.setFixedSize(22, 22)
+        self.compact_prev_btn.setToolTip("Banda anterior")
+        self.compact_prev_btn.clicked.connect(lambda: self._step_band(-1))
+        comp_row.addWidget(self.compact_prev_btn)
+
+        self.compact_band_combo = QComboBox(self.compact_container)
+        style_dark_combobox(self.compact_band_combo)
+        self.compact_band_combo.setFixedSize(88, 22)
+        self.compact_band_combo.currentIndexChanged.connect(self._on_compact_band_combo_changed)
+        comp_row.addWidget(self.compact_band_combo)
+
+        self.compact_next_btn = QPushButton("›", self.compact_container)
+        self.compact_next_btn.setFixedSize(22, 22)
+        self.compact_next_btn.setToolTip("Banda siguiente")
+        self.compact_next_btn.clicked.connect(lambda: self._step_band(1))
+        comp_row.addWidget(self.compact_next_btn)
+
+        self.compact_add_btn = QPushButton("+", self.compact_container)
+        self.compact_add_btn.setFixedSize(22, 22)
+        self.compact_add_btn.setToolTip("Añadir nueva banda")
+        self.compact_add_btn.clicked.connect(self._on_add_band)
+        comp_row.addWidget(self.compact_add_btn)
+
+        self.compact_del_btn = QPushButton("✕", self.compact_container)
+        self.compact_del_btn.setFixedSize(22, 22)
+        self.compact_del_btn.setToolTip("Eliminar banda (Supr)")
+        self.compact_del_btn.clicked.connect(self._on_delete_band)
+        comp_row.addWidget(self.compact_del_btn)
+
+        comp_row.addSpacing(4)
+
+        # 3. Lectura rápida interactiva: Freq | Gain | Q
+        self.compact_readout = QLabel("1.00 kHz  |  0.0 dB  |  Q 1.00", self.compact_container)
+        self.compact_readout.setStyleSheet("""
+            color: #00E5FF;
+            font-size: 11px;
+            font-weight: bold;
+            padding: 0 4px;
+        """)
+        self.compact_readout.setToolTip("Lectura de parámetros de la banda activa")
+        comp_row.addWidget(self.compact_readout)
+
+        comp_row.addStretch(1)
+
+        # Selector rápido Out (A/B/A+B)
+        self.compact_target_out = QComboBox(self.compact_container)
+        style_dark_combobox(self.compact_target_out)
+        self.compact_target_out.setFixedSize(84, 22)
+        self.compact_target_out.setToolTip("Asignar a Bus de Salida")
+        for to_val, lbl in (
+            ("A+B", "A+B"),
+            ("A", "Out A"),
+            ("B", "Out B"),
+        ):
+            self.compact_target_out.addItem(lbl, to_val)
+        self.compact_target_out.currentIndexChanged.connect(self._on_compact_output_changed)
+        comp_row.addWidget(self.compact_target_out)
+
+        # 4. Botón Isolate + Auto + Expandir
+        self.compact_solo_btn = LiquidGlassButton("🎧", self.compact_container, pill_radius=10.0, active_tint_color="#00E5FF")
+        self.compact_solo_btn.setCheckable(True)
+        self.compact_solo_btn.setFixedSize(36, 22)
+        self.compact_solo_btn.setToolTip("Aislar banda (Solo Isolate)")
+        self.compact_solo_btn.clicked.connect(self._on_band_solo_toggled)
+        comp_row.addWidget(self.compact_solo_btn)
+
+        self.compact_auto_btn = QPushButton("📌", self.compact_container)
+        self.compact_auto_btn.setCheckable(True)
+        self.compact_auto_btn.setFixedSize(26, 22)
+        self.compact_auto_btn.setToolTip("Auto-expandir al pasar el cursor")
+        self.compact_auto_btn.clicked.connect(self.toggle_auto_expand)
+        comp_row.addWidget(self.compact_auto_btn)
+
+        self.compact_expand_btn = QPushButton("▲ Expandir", self.compact_container)
+        self.compact_expand_btn.setFixedSize(78, 22)
+        self.compact_expand_btn.setToolTip("Expandir panel HUD completo")
+        self.compact_expand_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.compact_expand_btn.clicked.connect(lambda: self.set_minimized(False))
+        comp_row.addWidget(self.compact_expand_btn)
+
     def _gain_center_x(self) -> float:
         return float(self.gain_dyn_knob.x() + self.gain_dyn_knob.width() * 0.5)
 
     def paintEvent(self, event):
-        """
-        Cuerpo del HUD estilo Liquid Glass Oscuro (#1E2028 a #14151A, alpha = 235) con la joroba
-        superior ("notch") alojando la mitad superior de la perilla grande de GAIN (88px).
-        """
+        # Si el fondo OpenGL está activo, el 100% de la transparencia se mezcla en la GPU
+        if self._bg_gl_item is not None:
+            return
+
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-
         w = float(self.width())
         h = float(self.height())
         pad = 2.5
-        r_corner = 18.0
-        y_top = 34.0     # Alas planas a y=34 para que GAIN (y=14) sobresalga dentro de la joroba
-        y_peak = 2.5     # Cima del arco convexo superior sobre GAIN
+        r_corner = 10.0 if self._is_minimized else 18.0
         y_bot = h - pad
         x_left = pad
         x_right = w - pad
 
-        arch_cx = self._gain_center_x()
-        arch_half_w = 104.0
-        ax1 = max(x_left + r_corner + 10.0, arch_cx - arch_half_w)
-        ax2 = min(x_right - r_corner - 10.0, arch_cx + arch_half_w)
-
         path = QPainterPath()
-        path.moveTo(x_left + r_corner, y_top)
-        path.lineTo(ax1, y_top)
+        if self._is_minimized:
+            path.addRoundedRect(QRectF(x_left, pad, w - 2 * pad, h - 2 * pad), r_corner, r_corner)
+        else:
+            y_top = 34.0
+            y_peak = 2.5
+            arch_cx = self._gain_center_x()
+            arch_half_w = 104.0
+            ax1 = max(x_left + r_corner + 10.0, arch_cx - arch_half_w)
+            ax2 = min(x_right - r_corner - 10.0, arch_cx + arch_half_w)
 
-        # Elevación curva convexa ("joroba") simétrica que envuelve la mitad superior de GAIN
-        path.cubicTo(
-            QPointF(ax1 + 38.0, y_top),
-            QPointF(arch_cx - 42.0, y_peak),
-            QPointF(arch_cx, y_peak),
-        )
-        path.cubicTo(
-            QPointF(arch_cx + 42.0, y_peak),
-            QPointF(ax2 - 38.0, y_top),
-            QPointF(ax2, y_top),
-        )
+            path.moveTo(x_left + r_corner, y_top)
+            path.lineTo(ax1, y_top)
+            path.cubicTo(
+                QPointF(ax1 + 38.0, y_top),
+                QPointF(arch_cx - 42.0, y_peak),
+                QPointF(arch_cx, y_peak),
+            )
+            path.cubicTo(
+                QPointF(arch_cx + 42.0, y_peak),
+                QPointF(ax2 - 38.0, y_top),
+                QPointF(ax2, y_top),
+            )
+            path.lineTo(x_right - r_corner, y_top)
+            path.quadTo(QPointF(x_right, y_top), QPointF(x_right, y_top + r_corner))
+            path.lineTo(x_right, y_bot - r_corner)
+            path.quadTo(QPointF(x_right, y_bot), QPointF(x_right - r_corner, y_bot))
+            path.lineTo(x_left + r_corner, y_bot)
+            path.quadTo(QPointF(x_left, y_bot), QPointF(x_left, y_bot - r_corner))
+            path.lineTo(x_left, y_top + r_corner)
+            path.quadTo(QPointF(x_left, y_top), QPointF(x_left + r_corner, y_top))
+            path.closeSubpath()
 
-        path.lineTo(x_right - r_corner, y_top)
-        path.quadTo(QPointF(x_right, y_top), QPointF(x_right, y_top + r_corner))
-        path.lineTo(x_right, y_bot - r_corner)
-        path.quadTo(QPointF(x_right, y_bot), QPointF(x_right - r_corner, y_bot))
-        path.lineTo(x_left + r_corner, y_bot)
-        path.quadTo(QPointF(x_left, y_bot), QPointF(x_left, y_bot - r_corner))
-        path.lineTo(x_left, y_top + r_corner)
-        path.quadTo(QPointF(x_left, y_top), QPointF(x_left + r_corner, y_top))
-        path.closeSubpath()
-
-        # 1. Relleno Liquid Glass Oscuro (#1E2028 a #14151A, alpha = 235)
-        body_grad = QLinearGradient(0.0, y_peak, 0.0, y_bot)
+        body_grad = QLinearGradient(0.0, 0.0, 0.0, y_bot)
         body_grad.setColorAt(0.0, QColor(34, 37, 46, 238))
         body_grad.setColorAt(0.25, QColor(30, 32, 40, 235))
         body_grad.setColorAt(1.0, QColor(20, 21, 26, 242))
         painter.fillPath(path, QBrush(body_grad))
 
-        # 2. Resplandor exterior sutil del color de la banda activa
         glow_c = QColor(self._active_band_color)
         glow_c.setAlpha(45)
         painter.setPen(QPen(glow_c, 3.2))
         painter.drawPath(path)
 
-        # 3. Borde especular fino (combina reflejo blanco superior Liquid Glass + color de banda)
-        spec_border = QLinearGradient(0.0, y_peak, 0.0, y_bot)
+        spec_border = QLinearGradient(0.0, 0.0, 0.0, y_bot)
         top_spec = _brighten_color(self._active_band_color, 0.65)
         top_spec.setAlpha(220)
         mid_spec = QColor(self._active_band_color)
@@ -2954,9 +3520,9 @@ class FloatingBandHUD(QWidget):
         painter.setPen(QPen(QBrush(spec_border), 1.35))
         painter.drawPath(path)
 
-        # 4. Separador sutil sobre la fila inferior de navegación de bandas
-        painter.setPen(QPen(QColor(255, 255, 255, 20), 1.0))
-        painter.drawLine(QPointF(20.0, 151.0), QPointF(w - 20.0, 151.0))
+        if not self._is_minimized:
+            painter.setPen(QPen(QColor(255, 255, 255, 20), 1.0))
+            painter.drawLine(QPointF(20.0, 151.0), QPointF(w - 20.0, 151.0))
 
     def _step_band(self, delta: int):
         with self.eq_engine.lock:
@@ -3006,6 +3572,16 @@ class FloatingBandHUD(QWidget):
                     self.band_combo.setCurrentIndex(idx)
                 self.band_combo.blockSignals(False)
 
+                if hasattr(self, "compact_band_combo"):
+                    self.compact_band_combo.blockSignals(True)
+                    self.compact_band_combo.clear()
+                    for i, b in enumerate(bands):
+                        dyn_tag = " ⚡" if b.is_dynamic_active else ""
+                        self.compact_band_combo.addItem(f"Band {i + 1}{dyn_tag}", i)
+                    if 0 <= idx < len(bands):
+                        self.compact_band_combo.setCurrentIndex(idx)
+                    self.compact_band_combo.blockSignals(False)
+
                 has_band = 0 <= idx < len(bands)
                 for w in (
                     self.del_band_btn, self.band_enable_btn, self.prev_band_btn,
@@ -3014,8 +3590,16 @@ class FloatingBandHUD(QWidget):
                     self.type_combo, self.slope_combo, self.freq_knob,
                     self.gain_dyn_knob, self.thresh_meter, self.q_knob,
                     self.dyn_toggle_btn, self.attack_knob, self.release_knob,
+                    getattr(self, "compact_del_btn", None),
+                    getattr(self, "compact_power_btn", None),
+                    getattr(self, "compact_prev_btn", None),
+                    getattr(self, "compact_next_btn", None),
+                    getattr(self, "compact_color_swatch", None),
+                    getattr(self, "compact_solo_btn", None),
+                    getattr(self, "compact_target_out", None),
                 ):
-                    w.setEnabled(has_band)
+                    if w is not None:
+                        w.setEnabled(has_band)
 
                 self.freq_knob.max_val = max(24000.0, self.eq_engine.sr * 0.495)
 
@@ -3025,10 +3609,20 @@ class FloatingBandHUD(QWidget):
                     self.color_swatch.setColor(b.color)
                     self.band_enable_btn.setAccentColor(b.color)
 
+                    if hasattr(self, "compact_color_swatch"):
+                        self.compact_color_swatch.setColor(b.color)
+                    if hasattr(self, "compact_power_btn"):
+                        self.compact_power_btn.setAccentColor(b.color)
+                        self.compact_power_btn.setChecked(b.enabled)
+
                     self.band_enable_btn.setChecked(b.enabled)
                     is_iso = bool(b.solo or self.eq_engine.isolated_band_index == idx)
                     self.band_solo_btn.setChecked(is_iso)
                     self.band_solo_btn.setActiveTintColor(b.color)
+                    if hasattr(self, "compact_solo_btn"):
+                        self.compact_solo_btn.setChecked(is_iso)
+                        self.compact_solo_btn.setActiveTintColor(b.color)
+
                     self.type_combo.setCurrentText(b.filter_type)
 
                     cm_idx = self.channel_mode_combo.findData(b.channel_mode)
@@ -3042,6 +3636,12 @@ class FloatingBandHUD(QWidget):
                         self.target_out_combo.blockSignals(True)
                         self.target_out_combo.setCurrentIndex(to_idx)
                         self.target_out_combo.blockSignals(False)
+                        if hasattr(self, "compact_target_out"):
+                            self.compact_target_out.blockSignals(True)
+                            c_to = self.compact_target_out.findData(b.target_output)
+                            if c_to >= 0:
+                                self.compact_target_out.setCurrentIndex(c_to)
+                            self.compact_target_out.blockSignals(False)
 
                     slope_idx = self.slope_combo.findData(b.slope)
                     if slope_idx >= 0:
@@ -3063,6 +3663,11 @@ class FloatingBandHUD(QWidget):
                     self.gain_dyn_knob.setDynEnabled(b.dyn_enabled)
                     self.q_knob.setValue(b.q)
 
+                    if hasattr(self, "compact_readout"):
+                        gain_txt = f"{b.gain_db:+.1f} dB" if b.supports_gain else b.filter_type
+                        self.compact_readout.setText(f"{self._fmt_freq(b.freq)}  |  {gain_txt}  |  Q {b.q:.2f}")
+                        self.compact_readout.setStyleSheet(f"color: {b.color}; font-size: 11px; font-weight: bold; padding: 0 4px;")
+
                     self.dyn_toggle_btn.setChecked(b.dyn_enabled)
                     self.dyn_toggle_btn.setActiveTintColor(b.color)
 
@@ -3076,13 +3681,22 @@ class FloatingBandHUD(QWidget):
                     self.release_knob.setValue(b.release_ms)
                 else:
                     self.slope_combo.setVisible(False)
+                    if hasattr(self, "compact_readout"):
+                        self.compact_readout.setText("Sin bandas activas")
+                        self.compact_readout.setStyleSheet("color: #727B8E; font-size: 11px; font-weight: bold; padding: 0 4px;")
 
                 self.out_gain_knob.setValue(self.eq_engine.output_gain_db)
             self.update()
+            self.sync_bg_item()
         finally:
             self._updating_ui = False
 
     def _on_band_combo_changed(self, index: int):
+        if self._updating_ui or index < 0:
+            return
+        self.select_band(index)
+
+    def _on_compact_band_combo_changed(self, index: int):
         if self._updating_ui or index < 0:
             return
         self.select_band(index)
@@ -3142,6 +3756,22 @@ class FloatingBandHUD(QWidget):
         self.overlay.update_eq_curves(force=True)
         self.parameters_changed.emit()
 
+    def _on_compact_output_changed(self):
+        if self._updating_ui:
+            return
+        idx = self.overlay.selected_band_idx
+        with self.eq_engine.lock:
+            if 0 <= idx < len(self.eq_engine.bands):
+                b = self.eq_engine.bands[idx]
+                to_val = str(self.compact_target_out.currentData())
+                if to_val in TARGET_OUTPUTS and b.target_output != to_val:
+                    b.target_output = to_val
+                    b.reset_state()
+                    self.eq_engine.mark_dirty()
+        self.refresh_from_engine()
+        self.overlay.update_eq_curves(force=True)
+        self.parameters_changed.emit()
+
     def _on_type_or_slope_changed(self):
         if self._updating_ui:
             return
@@ -3153,6 +3783,9 @@ class FloatingBandHUD(QWidget):
                 b.slope = int(self.slope_combo.currentData())
                 b.update_coefficients()
                 self.eq_engine.mark_dirty()
+                if hasattr(self, "compact_readout"):
+                    gain_txt = f"{b.gain_db:+.1f} dB" if b.supports_gain else b.filter_type
+                    self.compact_readout.setText(f"{self._fmt_freq(b.freq)}  |  {gain_txt}  |  Q {b.q:.2f}")
         self.refresh_from_engine()
         self.overlay.update_eq_curves(force=True)
         self.parameters_changed.emit()
@@ -3171,6 +3804,9 @@ class FloatingBandHUD(QWidget):
                 b.release_ms = self.release_knob.value()
                 b.update_coefficients()
                 self.eq_engine.mark_dirty()
+                if hasattr(self, "compact_readout"):
+                    gain_txt = f"{b.gain_db:+.1f} dB" if b.supports_gain else b.filter_type
+                    self.compact_readout.setText(f"{self._fmt_freq(b.freq)}  |  {gain_txt}  |  Q {b.q:.2f}")
         self.overlay.update_eq_curves(force=True)
         self.parameters_changed.emit()
 
@@ -3240,6 +3876,10 @@ class FloatingBandHUD(QWidget):
                 b = self.eq_engine.bands[idx]
                 self.gain_dyn_knob.setLiveDynOffset(b.current_dyn_offset_db if b.is_dynamic_active else 0.0)
                 self.thresh_meter.setLiveLevel(b.env_db if b.is_dynamic_active else -70.0)
+                if self._is_minimized and hasattr(self, "compact_readout"):
+                    gain_txt = f"{b.gain_db:+.1f} dB" if b.supports_gain else b.filter_type
+                    dyn_txt = f" (Δ {b.current_dyn_offset_db:+.1f})" if (b.is_dynamic_active and abs(b.current_dyn_offset_db) >= 0.1) else ""
+                    self.compact_readout.setText(f"{self._fmt_freq(b.freq)}  |  {gain_txt}{dyn_txt}  |  Q {b.q:.2f}")
 
 
 # Alias de compatibilidad

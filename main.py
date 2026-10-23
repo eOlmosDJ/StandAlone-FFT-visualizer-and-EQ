@@ -423,6 +423,31 @@ class WaveformEnvelopeBuffer:
         return self.gr_data[-c:]
 
 
+class PrecisionDelaySpinBox(QDoubleSpinBox):
+    """SpinBox de delay con paso 0.01 ms, Shift+rueda = 0.10 ms y edición libre por teclado."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setRange(0.00, 250.00)
+        self.setDecimals(2)
+        self.setSingleStep(0.01)
+        self.setKeyboardTracking(False)
+        self.setAccelerated(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setSuffix(" ms")
+
+    def wheelEvent(self, event):
+        if not self.hasFocus():
+            self.setFocus(Qt.FocusReason.MouseFocusReason)
+        delta = event.angleDelta().y() or event.angleDelta().x()
+        if delta == 0:
+            event.accept()
+            return
+        step = 0.10 if (event.modifiers() & Qt.KeyboardModifier.ShiftModifier) else 0.01
+        self.setValue(round(self.value() + (step if delta > 0 else -step), 2))
+        event.accept()
+
+
 class StereoDelayLine:
     """
     Línea de retardo circular estéreo de alta precisión y costo cero cuando delay=0 ms.
@@ -436,12 +461,25 @@ class StereoDelayLine:
         self.write_idx = 0
         self.delay_ms = 0.0
         self.delay_samples = 0
+        self.delay_int = 0
+        self.delay_frac = 0.0
         self.lock = threading.Lock()
+
+    def _recompute_delay(self) -> None:
+        # Retardo fraccionario sub-muestra: parte entera + fracción para interpolación lineal
+        exact = self.delay_ms * 0.001 * self.sample_rate
+        self.delay_int = int(np.floor(exact))
+        self.delay_frac = float(exact - self.delay_int)
+        if self.delay_frac < 1e-6:
+            self.delay_frac = 0.0
+        self.delay_samples = self.delay_int if (self.delay_int > 0 or self.delay_frac > 0.0) else 0
+        if self.delay_samples == 0 and self.delay_frac > 0.0:
+            self.delay_samples = 1  # fuerza la ruta de procesamiento (marcador != 0)
 
     def set_delay_ms(self, delay_ms: float) -> None:
         with self.lock:
-            self.delay_ms = max(0.0, float(delay_ms))
-            self.delay_samples = int(round(self.delay_ms * 0.001 * self.sample_rate))
+            self.delay_ms = min(250.0, max(0.0, float(delay_ms)))
+            self._recompute_delay()
 
     def set_sample_rate(self, sample_rate: int) -> None:
         with self.lock:
@@ -451,7 +489,7 @@ class StereoDelayLine:
                 self.capacity = int(math.ceil(0.250 * self.sample_rate)) + 8192
                 self.buffer = np.zeros((self.capacity, 2), dtype=np.float32)
                 self.write_idx = 0
-                self.delay_samples = int(round(self.delay_ms * 0.001 * self.sample_rate))
+            self._recompute_delay()
 
     def reset(self) -> None:
         with self.lock:
@@ -470,13 +508,17 @@ class StereoDelayLine:
             if n_frames > first_w:
                 self.buffer[: n_frames - first_w] = block[first_w:, :2]
 
-            # 2. Leer las muestras retrasadas desde (write_idx - delay_samples)
-            read_idx = (self.write_idx - self.delay_samples) % self.capacity
-            out = np.empty_like(block)
-            first_r = min(n_frames, self.capacity - read_idx)
-            out[:first_r] = self.buffer[read_idx : read_idx + first_r]
-            if n_frames > first_r:
-                out[first_r:] = self.buffer[: n_frames - first_r]
+            # 2. Leer las muestras retrasadas con interpolación lineal fraccionaria
+            n_ch = min(2, block.shape[1])
+            base = np.arange(n_frames)
+            idx0 = (self.write_idx - self.delay_int + base) % self.capacity
+            out = np.array(block, copy=True)
+            s0 = self.buffer[idx0]
+            if self.delay_frac > 0.0:
+                idx1 = (idx0 - 1) % self.capacity
+                f = np.float32(self.delay_frac)
+                s0 = (np.float32(1.0) - f) * s0 + f * self.buffer[idx1]
+            out[:, :n_ch] = s0[:, :n_ch]
 
             self.write_idx = (self.write_idx + n_frames) % self.capacity
             return out
@@ -2014,11 +2056,19 @@ class GraphStageContainer(QWidget):
         if self.floating_hud is not None:
             hud_w = self.floating_hud.width()
             hud_h = self.floating_hud.height()
-            hud_x = max(16, (w - 72 - hud_w) // 2)
-            # Posicionado justo encima de las etiquetas de frecuencia inferiores
-            hud_y = max(48, h - hud_h - 22)
+            custom = getattr(self.floating_hud, "_user_custom_pos", None)
+            if custom is not None:
+                # Posición elegida por el usuario (arrastre), limitada a los bordes del lienzo
+                hud_x = int(max(0, min(w - hud_w, custom.x())))
+                hud_y = int(max(44, min(h - hud_h, custom.y())))
+            else:
+                hud_x = max(16, (w - 72 - hud_w) // 2)
+                # Posicionado justo encima de las etiquetas de frecuencia inferiores
+                hud_y = max(48, h - hud_h - 22)
             self.floating_hud.move(hud_x, hud_y)
             self.floating_hud.raise_()
+            if hasattr(self.floating_hud, "sync_bg_item"):
+                self.floating_hud.sync_bg_item()
 
 
 class AudioAnalyzerApp(QMainWindow):
@@ -2310,6 +2360,10 @@ class AudioAnalyzerApp(QMainWindow):
         # --- HUD FLOTANTE SUPERPUESTO CON `GAIN` EN LA JOROBA ---
         self.eq_panel = FloatingBandHUD(self.eq_engine, self.eq_overlay, self.graph_container)
         self.eq_panel.parameters_changed.connect(self.schedule_config_save)
+        # Fondo semitransparente del HUD compuesto en la escena OpenGL de la FFT (blending en GPU)
+        self.eq_panel.attach_gl_background(self.plot_widget)
+        # Inspector flotante: curvas FFT para lectura de dBFS (prioridad Out 1 > In > Out 2)
+        self.eq_overlay.fft_curves = [self.fft_curve_out1, self.fft_curve_in, self.fft_curve_out2]
 
         self.graph_container.set_stage_widgets(
             self.plot_widget,
@@ -2494,11 +2548,7 @@ class AudioAnalyzerApp(QMainWindow):
         delay_a_layout = QHBoxLayout()
         delay_a_layout.setSpacing(8)
 
-        self.delay_out1_spin = QDoubleSpinBox()
-        self.delay_out1_spin.setRange(0.0, 200.0)
-        self.delay_out1_spin.setSingleStep(0.5)
-        self.delay_out1_spin.setDecimals(1)
-        self.delay_out1_spin.setSuffix(" ms")
+        self.delay_out1_spin = PrecisionDelaySpinBox()
         self.delay_out1_spin.setValue(0.0)
         self.delay_out1_spin.setFixedWidth(110)
         self.delay_out1_spin.setStyleSheet("""
@@ -2545,11 +2595,7 @@ class AudioAnalyzerApp(QMainWindow):
 
         # Fila 6: Delay Out 2 (B)
         grid.addWidget(QLabel("Delay Out 2 (B):"), 6, 0)
-        self.delay_out2_spin = QDoubleSpinBox()
-        self.delay_out2_spin.setRange(0.0, 200.0)
-        self.delay_out2_spin.setSingleStep(0.5)
-        self.delay_out2_spin.setDecimals(1)
-        self.delay_out2_spin.setSuffix(" ms")
+        self.delay_out2_spin = PrecisionDelaySpinBox()
         self.delay_out2_spin.setValue(0.0)
         self.delay_out2_spin.setFixedWidth(110)
         self.delay_out2_spin.setStyleSheet("""
@@ -2583,45 +2629,58 @@ class AudioAnalyzerApp(QMainWindow):
         self.schedule_config_save()
 
     def auto_sync_delays(self):
-        """Calcula y aplica automáticamente el retraso ideal para sincronizar Salida 1 con Salida 2."""
+        """Botón Auto Sync: fuerza el recálculo exacto y reactiva el modo automático."""
+        self._delay_manually_adjusted = False
+        self.recalculate_auto_sync_delay(force=True)
+
+    def recalculate_auto_sync_delay(self, force: bool = False):
+        """Recalcula el delay ideal (precisión 0.01 ms) para el Sample Rate y streams actuales."""
+        if not force and getattr(self, "_delay_manually_adjusted", False):
+            # Respeta el valor manual pero re-sincroniza las líneas con el nuevo SR
+            self.delay_bus_a.set_sample_rate(self.current_sr)
+            self.delay_bus_b.set_sample_rate(self.current_sr)
+            return
         has_secondary = (self.stream_out_b is not None) or (
             hasattr(self, "out_b_combo") and self.out_b_combo.currentIndex() > 0
         )
+        self.delay_bus_a.set_sample_rate(self.current_sr)
+        self.delay_bus_b.set_sample_rate(self.current_sr)
         self._is_auto_syncing = True
         try:
             if not has_secondary:
-                self._delay_manually_adjusted = False
                 self.delay_out1_spin.setValue(0.0)
                 self.delay_out2_spin.setValue(0.0)
                 self.delay_bus_a.set_delay_ms(0.0)
                 self.delay_bus_b.set_delay_ms(0.0)
                 return
 
-            buffer_delay_ms = (2.0 * self.audio_block_size / float(self.current_sr)) * 1000.0
+            ring = getattr(self, "ring_buffer_out_b", None)
+            target_fill = float(ring.target_fill) if ring is not None else 2.0 * self.audio_block_size
+            ring_delay_ms = (target_fill / float(self.current_sr)) * 1000.0
 
-            main_out_lat = 0.0
-            sec_out_lat = 0.0
-            if self.stream is not None:
+            def _out_lat(stream) -> float:
+                if stream is None:
+                    return 0.0
                 try:
-                    lat = self.stream.latency
-                    main_out_lat = float(lat[1]) if isinstance(lat, (tuple, list)) and len(lat) > 1 else float(lat)
+                    lat = stream.latency
+                    return float(lat[1]) if isinstance(lat, (tuple, list)) and len(lat) > 1 else float(lat)
                 except Exception:
-                    pass
-            if self.stream_out_b is not None:
-                try:
-                    lat = self.stream_out_b.latency
-                    sec_out_lat = float(lat[1]) if isinstance(lat, (tuple, list)) and len(lat) > 1 else float(lat)
-                except Exception:
-                    pass
+                    return 0.0
 
-            driver_diff_ms = max(-50.0, min(100.0, (sec_out_lat - main_out_lat) * 1000.0))
-            auto_delay_ms = round(max(0.0, buffer_delay_ms + driver_diff_ms), 1)
+            stream_a_out_lat = _out_lat(self.stream)
+            stream_b_out_lat = _out_lat(self.stream_out_b)
+            hw_diff_ms = max(-100.0, min(150.0, (stream_b_out_lat - stream_a_out_lat) * 1000.0))
+            total = ring_delay_ms + hw_diff_ms
 
-            self._delay_manually_adjusted = False
-            self.delay_out1_spin.setValue(auto_delay_ms)
-            self.delay_out2_spin.setValue(0.0)
-            self.delay_bus_a.set_delay_ms(auto_delay_ms)
-            self.delay_bus_b.set_delay_ms(0.0)
+            if total >= 0.0:
+                da, db = round(min(250.0, total), 2), 0.0
+            else:
+                da, db = 0.0, round(min(250.0, -total), 2)
+
+            self.delay_out1_spin.setValue(da)
+            self.delay_out2_spin.setValue(db)
+            self.delay_bus_a.set_delay_ms(da)
+            self.delay_bus_b.set_delay_ms(db)
         finally:
             self._is_auto_syncing = False
         self.schedule_config_save()
@@ -3454,9 +3513,9 @@ class AudioAnalyzerApp(QMainWindow):
 
         if hasattr(self, "delay_out1_spin"):
             if self.stream_out_b is not None:
-                # Caso B: Salida 1 y Salida 2 activas simultáneamente
+                # Caso B: Salida 1 y Salida 2 activas simultáneamente -> recálculo exacto por SR
                 if not getattr(self, "_delay_manually_adjusted", False):
-                    self.auto_sync_delays()
+                    self.recalculate_auto_sync_delay()
                 else:
                     self.delay_bus_a.set_delay_ms(self.delay_out1_spin.value())
                     self.delay_bus_b.set_delay_ms(self.delay_out2_spin.value())
