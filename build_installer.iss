@@ -4,7 +4,7 @@
 [Setup]
 AppId={{BDJ-FFT-EQ-LIMITER-BAUTISTA-OLMOS}}
 AppName=BDJ Standalone Fast Fourier Transform analyzer, equalizer and limiter
-AppVersion=1.0.0
+AppVersion=1.1.0
 AppPublisher=Bautista Eneas Olmos
 DefaultDirName={autopf}\BDJ_FFT_EQ
 DisableProgramGroupPage=yes

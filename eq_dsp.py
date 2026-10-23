@@ -1,6 +1,6 @@
 import threading
 import numpy as np
-from scipy.signal import sosfilt
+from scipy.signal import sosfilt, butter, sosfreqz, find_peaks
 
 
 FILTER_TYPES = [
@@ -433,6 +433,30 @@ class EQBand:
         return self.dyn_enabled and abs(self.dyn_range_db) >= 0.05
 
     @property
+    def gain(self) -> float:
+        return self.gain_db
+
+    @gain.setter
+    def gain(self, val: float):
+        self.gain_db = float(val)
+
+    @property
+    def output_bus(self) -> str:
+        return self.target_output
+
+    @output_bus.setter
+    def output_bus(self, val: str):
+        self.target_output = str(val)
+
+    @property
+    def dyn_threshold(self) -> float:
+        return self.threshold_db
+
+    @dyn_threshold.setter
+    def dyn_threshold(self, val: float):
+        self.threshold_db = float(val)
+
+    @property
     def supports_gain(self) -> bool:
         return self.filter_type in ("Bell", "Low Shelf", "High Shelf")
 
@@ -780,12 +804,37 @@ class ParametricEQEngine:
         self.lock = threading.RLock()
         self.static_version = 1
         self.bands: list[EQBand] = []
+        self.autogain_enabled = False
+        self.target_autogain_db = 0.0
+        self.current_autogain_db = 0.0
         self.init_default_bands()
         self.limiter_a = MasterLimiter(sr=self.sr)
         self.limiter_b = MasterLimiter(sr=self.sr)
 
     def mark_dirty(self):
         self.static_version += 1
+        if getattr(self, "autogain_enabled", False):
+            self.recalculate_autogain_target()
+
+    def compute_combined_eq_db_at_freqs(self, freqs: np.ndarray) -> np.ndarray:
+        with self.lock:
+            w = 2.0 * np.pi * freqs / self.sr
+            z1 = np.exp(-1j * w)
+            z2 = np.exp(-2j * w)
+            total_db = np.zeros(len(freqs), dtype=np.float64)
+            for b in self.bands:
+                if b.enabled:
+                    total_db += eval_sos_mag_db_fast(b.sos_static, z1, z2)
+            return total_db
+
+    def recalculate_autogain_target(self):
+        if not getattr(self, "autogain_enabled", False) or getattr(self, "bypass", False) or getattr(self, "bypass_eq", False):
+            self.target_autogain_db = 0.0
+            return
+        freqs = np.geomspace(30.0, 16000.0, 48)
+        total_db = self.compute_combined_eq_db_at_freqs(freqs)
+        mean_eq_db = float(np.mean(total_db))
+        self.target_autogain_db = float(np.clip(-mean_eq_db * 0.85, -12.0, 12.0))
 
     def set_isolated_band(self, index: int | None):
         """Activa o desactiva el modo Isolate (Solo de Frecuencia Band-Pass) sobre la banda `index`."""
@@ -867,6 +916,8 @@ class ParametricEQEngine:
                 ),
             ]
             self.static_version += 1
+            if getattr(self, "autogain_enabled", False):
+                self.recalculate_autogain_target()
 
     def set_sample_rate(self, sr: int):
         with self.lock:
@@ -877,6 +928,8 @@ class ParametricEQEngine:
             self.limiter_a.set_sample_rate(self.sr)
             self.limiter_b.set_sample_rate(self.sr)
             self.static_version += 1
+            if getattr(self, "autogain_enabled", False):
+                self.recalculate_autogain_target()
 
     def add_band(
         self,
@@ -953,7 +1006,12 @@ class ParametricEQEngine:
             return [b for b in self.bands if b.enabled and b.target_output in ("B", "A+B")]
         return [b for b in self.bands if b.enabled]
 
-    def process_dual_block(self, indata: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    def process_dual_block(
+        self,
+        indata: np.ndarray,
+        apply_limiter: bool = True,
+        apply_autogain: bool = True,
+    ) -> tuple[np.ndarray, np.ndarray]:
         """
         Procesa `indata` generando dos bloques estéreo independientes `(out_A, out_B)`:
         - `out_A`: procesado con todas las bandas activas cuyo `target_output` sea "A" o "A+B" (usando `zi_A`).
@@ -1000,8 +1058,9 @@ class ParametricEQEngine:
                 else:
                     out_B = np.zeros_like(in_f64)
 
-                out_A = self.limiter_a.process(out_A)
-                out_B = self.limiter_b.process(out_B)
+                if apply_limiter:
+                    out_A = self.limiter_a.process(out_A)
+                    out_B = self.limiter_b.process(out_B)
                 return out_A.astype(np.float32), out_B.astype(np.float32)
 
             # --- MODO NORMAL DUAL BUS (OUT A + OUT B) ---
@@ -1010,14 +1069,17 @@ class ParametricEQEngine:
                 b.is_dynamic_active or abs(b.gain_db) > 0.01 or not b.supports_gain
                 for b in enabled_bands
             )
-            if not any_filtering and abs(self.output_gain_db) < 0.01:
+            if not any_filtering and abs(self.output_gain_db) < 0.01 and not self.autogain_enabled and abs(self.current_autogain_db) < 0.01:
                 for b in self.bands:
                     if abs(b.current_dyn_offset_db) > 0.001:
                         b.current_dyn_offset_db *= 0.85
                     else:
                         b.current_dyn_offset_db = 0.0
-                out_A = self.limiter_a.process(stereo_in.astype(np.float64, copy=True))
-                out_B = self.limiter_b.process(stereo_in.astype(np.float64, copy=True))
+                out_A = stereo_in.astype(np.float64, copy=True)
+                out_B = stereo_in.astype(np.float64, copy=True)
+                if apply_limiter:
+                    out_A = self.limiter_a.process(out_A)
+                    out_B = self.limiter_b.process(out_B)
                 return out_A.astype(np.float32), out_B.astype(np.float32)
 
             out_A = stereo_in.astype(np.float64, copy=True)
@@ -1097,8 +1159,22 @@ class ParametricEQEngine:
                 out_A *= gain_lin
                 out_B *= gain_lin
 
-            out_A = self.limiter_a.process(out_A)
-            out_B = self.limiter_b.process(out_B)
+            # --- AUTO-GAIN (Compensación de Loudness Post-EQ / Pre-Limitador) ---
+            if apply_autogain:
+                peak_sig = max(float(np.max(np.abs(out_A))), float(np.max(np.abs(out_B))))
+                if self.autogain_enabled and peak_sig > 0.001:
+                    self.current_autogain_db += 0.12 * (self.target_autogain_db - self.current_autogain_db)
+                else:
+                    self.current_autogain_db += 0.12 * (0.0 - self.current_autogain_db)
+
+                if abs(self.current_autogain_db) > 0.02:
+                    ag_lin = 10.0 ** (self.current_autogain_db / 20.0)
+                    out_A *= ag_lin
+                    out_B *= ag_lin
+
+            if apply_limiter:
+                out_A = self.limiter_a.process(out_A)
+                out_B = self.limiter_b.process(out_B)
             return out_A.astype(np.float32), out_B.astype(np.float32)
 
     def process_block(self, indata: np.ndarray) -> np.ndarray:
@@ -1149,3 +1225,283 @@ class ParametricEQEngine:
                 total_dyn += self.output_gain_db
 
             return total_static, total_dyn
+
+
+class DualOutputCrossover:
+    """
+    Crossover Digital de Salidas para dividir frecuencias entre Out A y Out B
+    utilizando filtros Linkwitz-Riley o Butterworth de orden 2, 4 u 8 (12, 24, 48 dB/oct).
+    """
+
+    def __init__(self, sample_rate=48000):
+        self.sample_rate = float(sample_rate)
+        self.enabled = False
+        self.freq_hz = 80.0
+        self.filter_type = "Linkwitz-Riley"  # "Linkwitz-Riley" o "Butterworth"
+        self.slope_db = 24                   # 12, 24, 48 dB/oct
+        self.routing_mode = "A_Tops_B_Sub"   # "A_Tops_B_Sub", "A_Sub_B_Tops", "A_Full_B_Sub"
+        self._sos_lp = None
+        self._sos_hp = None
+        self._zi_a = None
+        self._zi_b = None
+        self.update_filters()
+
+    def get_state_dict(self) -> dict:
+        return {
+            "enabled": bool(self.enabled),
+            "freq_hz": float(self.freq_hz),
+            "filter_type": str(self.filter_type),
+            "slope_db": int(self.slope_db),
+            "routing_mode": str(self.routing_mode),
+        }
+
+    def set_config(self, state_dict: dict, sample_rate=None):
+        if sample_rate is not None:
+            self.sample_rate = float(sample_rate)
+        self.enabled = bool(state_dict.get("enabled", self.enabled))
+        self.freq_hz = float(np.clip(state_dict.get("freq_hz", self.freq_hz), 20.0, 20000.0))
+        self.filter_type = str(state_dict.get("filter_type", self.filter_type))
+        self.slope_db = int(state_dict.get("slope_db", self.slope_db))
+        self.routing_mode = str(state_dict.get("routing_mode", self.routing_mode))
+        self.update_filters()
+
+    def update_filters(self):
+        nyq = 0.5 * self.sample_rate
+        norm_f = float(np.clip(self.freq_hz / nyq, 0.0005, 0.98))
+        order_total = max(2, int(self.slope_db // 6))
+
+        if self.filter_type == "Linkwitz-Riley":
+            # Linkwitz-Riley (LR2, LR4, LR8) = dos Butterworth de mitad de orden en cascada
+            half_order = max(1, order_total // 2)
+            bw_lp = butter(half_order, norm_f, btype='low', output='sos')
+            bw_hp = butter(half_order, norm_f, btype='high', output='sos')
+            new_sos_lp = np.vstack([bw_lp, bw_lp])
+            new_sos_hp = np.vstack([bw_hp, bw_hp])
+        else:
+            new_sos_lp = butter(order_total, norm_f, btype='low', output='sos')
+            new_sos_hp = butter(order_total, norm_f, btype='high', output='sos')
+
+        # Si el orden de secciones no cambia, conservar el estado zi para evitar chasquidos de fase
+        new_n_sec = new_sos_lp.shape[0]
+        if self._zi_a is None or self._zi_a.shape[0] != new_n_sec:
+            self._zi_a = np.zeros((new_n_sec, 2, 2), dtype=np.float64)
+            self._zi_b = np.zeros((new_n_sec, 2, 2), dtype=np.float64)
+
+        self._sos_lp = new_sos_lp
+        self._sos_hp = new_sos_hp
+
+    def process_outputs(self, out_a: np.ndarray, out_b: np.ndarray):
+        if not self.enabled or self._sos_lp is None or self._sos_hp is None:
+            return out_a, out_b
+
+        sos_lp = self._sos_lp
+        sos_hp = self._sos_hp
+        n_sec = sos_lp.shape[0]
+        n_ch = out_a.shape[1] if out_a.ndim > 1 else 1
+
+        if (self._zi_a is None or self._zi_a.shape[0] != n_sec
+                or (n_ch > 1 and (self._zi_a.ndim != 3 or self._zi_a.shape[2] != n_ch))
+                or (n_ch == 1 and self._zi_a.ndim != 2)):
+            if n_ch > 1:
+                self._zi_a = np.zeros((n_sec, 2, n_ch), dtype=np.float64)
+                self._zi_b = np.zeros((n_sec, 2, n_ch), dtype=np.float64)
+            else:
+                self._zi_a = np.zeros((n_sec, 2), dtype=np.float64)
+                self._zi_b = np.zeros((n_sec, 2), dtype=np.float64)
+
+        # Detección de silencio total para eludir sosfilt en reposo y evitar gasto de CPU (0.001 ms)
+        is_silent_a = float(np.max(np.abs(out_a))) < 1e-7
+        is_silent_b = float(np.max(np.abs(out_b))) < 1e-7
+        zi_silent_a = float(np.max(np.abs(self._zi_a))) < 1e-14
+        zi_silent_b = float(np.max(np.abs(self._zi_b))) < 1e-14
+
+        if self.routing_mode == "A_Tops_B_Sub":
+            if is_silent_a and zi_silent_a:
+                proc_a = out_a
+                self._zi_a.fill(0.0)
+            else:
+                proc_a, self._zi_a = sosfilt(sos_hp, out_a, axis=0, zi=self._zi_a)
+                # Anti-denormal flush instantáneo para aniquilar trampas de microcódigo CPU
+                self._zi_a[np.abs(self._zi_a) < 1e-15] = 0.0
+
+            if is_silent_b and zi_silent_b:
+                proc_b = out_b
+                self._zi_b.fill(0.0)
+            else:
+                proc_b, self._zi_b = sosfilt(sos_lp, out_b, axis=0, zi=self._zi_b)
+                self._zi_b[np.abs(self._zi_b) < 1e-15] = 0.0
+
+        elif self.routing_mode == "A_Sub_B_Tops":
+            if is_silent_a and zi_silent_a:
+                proc_a = out_a
+                self._zi_a.fill(0.0)
+            else:
+                proc_a, self._zi_a = sosfilt(sos_lp, out_a, axis=0, zi=self._zi_a)
+                self._zi_a[np.abs(self._zi_a) < 1e-15] = 0.0
+
+            if is_silent_b and zi_silent_b:
+                proc_b = out_b
+                self._zi_b.fill(0.0)
+            else:
+                proc_b, self._zi_b = sosfilt(sos_hp, out_b, axis=0, zi=self._zi_b)
+                self._zi_b[np.abs(self._zi_b) < 1e-15] = 0.0
+
+        else:  # "A_Full_B_Sub"
+            proc_a = out_a
+            if is_silent_b and zi_silent_b:
+                proc_b = out_b
+                self._zi_b.fill(0.0)
+            else:
+                proc_b, self._zi_b = sosfilt(sos_lp, out_b, axis=0, zi=self._zi_b)
+                self._zi_b[np.abs(self._zi_b) < 1e-15] = 0.0
+
+        return proc_a.astype(np.float32, copy=False), proc_b.astype(np.float32, copy=False)
+
+    def get_magnitude_db(self, freqs_hz: np.ndarray):
+        if not self.enabled or self._sos_lp is None or self._sos_hp is None:
+            zeros = np.zeros_like(freqs_hz, dtype=float)
+            return zeros, zeros
+        _, h_lp = sosfreqz(self._sos_lp, worN=freqs_hz, fs=self.sample_rate)
+        _, h_hp = sosfreqz(self._sos_hp, worN=freqs_hz, fs=self.sample_rate)
+        db_lp = 20.0 * np.log10(np.maximum(np.abs(h_lp), 1e-6))
+        db_hp = 20.0 * np.log10(np.maximum(np.abs(h_hp), 1e-6))
+        if self.routing_mode == "A_Tops_B_Sub":
+            return db_hp, db_lp
+        elif self.routing_mode == "A_Sub_B_Tops":
+            return db_lp, db_hp
+        else:
+            return np.zeros_like(freqs_hz, dtype=float), db_lp
+
+
+class AsyncInputRingBuffer:
+    """
+    Ring Buffer Lock-Free SPSC para Input 2 (Aux / Mic) con corrección de clock drift
+    automática sin bloqueo del hilo de audio ni asignaciones dinámicas.
+    """
+
+    def __init__(self, capacity_frames: int = 32768, channels: int = 2):
+        self.capacity = int(capacity_frames)
+        self.channels = int(channels)
+        self.buffer = np.zeros((self.capacity, self.channels), dtype=np.float32)
+        self.write_ptr = 0
+        self.read_ptr = 0
+        self.available = 0
+        self.target_fill = 2048
+
+    def reset(self, target_fill: int = 2048):
+        self.buffer.fill(0.0)
+        self.target_fill = int(target_fill)
+        self.write_ptr = self.target_fill
+        self.read_ptr = 0
+        self.available = self.target_fill
+
+    def write(self, data: np.ndarray):
+        n = data.shape[0]
+        if n <= 0:
+            return
+        if data.ndim == 1:
+            frames = np.column_stack((data, data))
+        elif data.shape[1] == 1:
+            frames = np.repeat(data, 2, axis=1)
+        else:
+            frames = data[:, :2]
+
+        # Prevención de overflow (corrección de clock drift positivo)
+        max_allowed = self.capacity - n
+        if self.available > max_allowed:
+            drop = self.available - self.target_fill
+            self.read_ptr = (self.read_ptr + drop) % self.capacity
+            self.available = self.target_fill
+
+        idx = (self.write_ptr + np.arange(n)) % self.capacity
+        self.buffer[idx] = frames
+        self.write_ptr = (self.write_ptr + n) % self.capacity
+        self.available += n
+
+    def read_into(self, out_array: np.ndarray) -> bool:
+        n = out_array.shape[0]
+        if self.available < n:
+            # Corrección de underrun (clock drift negativo) sin bloquear el callback maestro
+            out_array.fill(0.0)
+            return False
+        idx = (self.read_ptr + np.arange(n)) % self.capacity
+        np.copyto(out_array, self.buffer[idx])
+        self.read_ptr = (self.read_ptr + n) % self.capacity
+        self.available -= n
+        return True
+
+
+def smooth_spectrum_12th_octave(freqs_hz: np.ndarray, mag_db: np.ndarray) -> np.ndarray:
+    """
+    Aplica suavizado de 1/12 de octava sobre un espectro de frecuencias en dB
+    mediante interpolación logarítmica y filtro Gaussiano sin alterar los extremos.
+    """
+    valid = (freqs_hz >= 20.0) & np.isfinite(mag_db)
+    if not np.any(valid):
+        return mag_db.copy()
+
+    f_valid = freqs_hz[valid]
+    m_valid = mag_db[valid]
+    log_f = np.log2(f_valid)
+
+    n_grid = 1000
+    log_min, log_max = log_f[0], log_f[-1]
+    if log_max <= log_min:
+        return mag_db.copy()
+
+    grid_log = np.linspace(log_min, log_max, n_grid)
+    grid_mag = np.interp(grid_log, log_f, m_valid)
+
+    octave_step = (log_max - log_min) / float(n_grid - 1)
+    pts_per_oct = 1.0 / (12.0 * octave_step)
+    sigma = max(1.0, pts_per_oct / 2.355)
+
+    try:
+        from scipy.ndimage import gaussian_filter1d
+        smoothed_grid = gaussian_filter1d(grid_mag, sigma=sigma, mode="nearest")
+    except Exception:
+        # Fallback si scipy.ndimage no estuviera disponible
+        k_w = int(max(3, round(pts_per_oct)))
+        if k_w % 2 == 0:
+            k_w += 1
+        kernel = np.hanning(k_w)
+        kernel /= np.sum(kernel)
+        smoothed_grid = np.convolve(grid_mag, kernel, mode="same")
+
+    smoothed = mag_db.copy()
+    smoothed[valid] = np.interp(log_f, grid_log, smoothed_grid)
+    return smoothed
+
+
+def detect_resonances(
+    freqs_hz: np.ndarray,
+    smoothed_mag_db: np.ndarray,
+    n_peaks: int = 3,
+    min_freq: float = 25.0,
+    max_freq: float = 16000.0,
+    prominence: float = 3.0,
+) -> list[tuple[float, float, float]]:
+    """
+    Detecta los picos de resonancia más notorios usando scipy.signal.find_peaks
+    en el rango acotado (por defecto 25 Hz - 16 kHz).
+    Retorna lista de tuplas (frecuencia_hz, ganancia_db, prominencia_db).
+    """
+    mask = (freqs_hz >= min_freq) & (freqs_hz <= max_freq) & np.isfinite(smoothed_mag_db)
+    if not np.any(mask):
+        return []
+
+    f_sub = freqs_hz[mask]
+    m_sub = smoothed_mag_db[mask]
+
+    peaks, props = find_peaks(m_sub, prominence=prominence)
+    if len(peaks) == 0:
+        return []
+
+    proms = props.get("prominences", np.ones(len(peaks)))
+    order = np.argsort(proms)[::-1][:n_peaks]
+
+    results = []
+    for p in order:
+        idx = peaks[p]
+        results.append((float(f_sub[idx]), float(m_sub[idx]), float(proms[p])))
+    return results

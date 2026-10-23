@@ -5,7 +5,7 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QComboBox, QFrame, QMenu, QColorDialog, QDialog, QToolTip,
     QGraphicsOpacityEffect, QListView, QSlider, QGraphicsPathItem, QGraphicsItem,
-    QApplication
+    QApplication, QCheckBox, QDoubleSpinBox, QGridLayout, QWidgetAction
 )
 from PyQt6.QtCore import Qt, QEvent, QPoint, QPointF, QRectF, pyqtSignal, QTimer
 from PyQt6.QtGui import (
@@ -4364,3 +4364,309 @@ class MiniOscilloscopeWidget(QWidget):
 CompactScopeGLWidget = MiniOscilloscopeWidget
 _CompactScopeCanvas = MiniOscilloscopeWidget
 OverlayMaskWidget = MiniOscilloscopeWidget
+
+
+class AutoGainMiniBar(QWidget):
+    toggled = pyqtSignal(bool)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(58, 26)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip("Auto-Gain (Compensación de Loudness)\nClic para Activar / Desactivar")
+        self._enabled = False
+        self._ag_db = 0.0
+
+    def set_state(self, enabled: bool, ag_db: float):
+        changed = (self._enabled != enabled) or (abs(self._ag_db - ag_db) > 0.05)
+        self._enabled = enabled
+        self._ag_db = float(np.clip(ag_db, -12.0, 12.0))
+        if changed:
+            self.update()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._enabled = not self._enabled
+            self.toggled.emit(self._enabled)
+            self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        w, h = self.width(), self.height()
+
+        # Fondo de cápsula oscura haciendo juego con el mini-osciloscopio
+        bg_color = QColor(20, 26, 36, 220) if self._enabled else QColor(18, 20, 26, 180)
+        border_color = QColor(0, 229, 255, 150) if self._enabled else QColor(255, 255, 255, 35)
+        p.setPen(QPen(border_color, 1.0))
+        p.setBrush(bg_color)
+        p.drawRoundedRect(QRectF(0.5, 0.5, w - 1.0, h - 1.0), 8.0, 8.0)
+
+        # Riel vertical de la barrita bipolar (tipo Threshold del Dynamic EQ)
+        bar_x, bar_y, bar_w, bar_h = 6.0, 4.0, 6.0, h - 8.0
+        mid_y = bar_y + bar_h * 0.5
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(10, 12, 16, 220))
+        p.drawRoundedRect(QRectF(bar_x, bar_y, bar_w, bar_h), 2.0, 2.0)
+
+        # Relleno desde el centro (0 dB) hacia arriba (+dB) o hacia abajo (-dB)
+        if self._enabled and abs(self._ag_db) > 0.05:
+            norm = min(1.0, abs(self._ag_db) / 12.0)
+            fill_h = max(2.0, norm * (bar_h * 0.5))
+            if self._ag_db < 0:
+                # Atenuando (Cian)
+                p.setBrush(QColor(0, 229, 255, 230))
+                p.drawRoundedRect(QRectF(bar_x, mid_y, bar_w, fill_h), 2.0, 2.0)
+            else:
+                # Compensando hacia arriba (Verde Esmeralda)
+                p.setBrush(QColor(0, 230, 118, 230))
+                p.drawRoundedRect(QRectF(bar_x, mid_y - fill_h, bar_w, fill_h), 2.0, 2.0)
+
+        # Marca blanca central de 0 dB
+        p.setPen(QPen(QColor(255, 255, 255, 130), 1.0))
+        p.drawLine(QPointF(bar_x - 1, mid_y), QPointF(bar_x + bar_w + 1, mid_y))
+
+        # Texto compacto a la derecha de la barrita
+        font = p.font()
+        font.setPixelSize(9)
+        font.setBold(True)
+        p.setFont(font)
+        if not self._enabled:
+            p.setPen(QColor(140, 150, 165))
+            p.drawText(QRectF(15, 0, w - 17, h), Qt.AlignmentFlag.AlignCenter, "AG OFF")
+        else:
+            txt_color = QColor(0, 229, 255) if self._ag_db <= 0 else QColor(0, 230, 118)
+            p.setPen(txt_color)
+            p.drawText(QRectF(14, 0, w - 16, h), Qt.AlignmentFlag.AlignCenter, f"{self._ag_db:+.1f}dB")
+
+
+class CrossoverMenuWidget(QWidget):
+    """
+    Panel de control para el Crossover Digital de Salidas (Out A / Out B)
+    para alojar dentro de un QMenu con QWidgetAction con estética oscura (#14171F).
+    """
+    configChanged = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedWidth(290)
+        self.setStyleSheet("""
+            QWidget {
+                background-color: #14171F;
+                color: #ECEFF4;
+                font-family: "Segoe UI", sans-serif;
+                font-size: 11px;
+            }
+            QCheckBox {
+                font-size: 11px;
+                font-weight: 600;
+                color: #FFB300;
+                spacing: 8px;
+            }
+            QCheckBox::indicator {
+                width: 15px;
+                height: 15px;
+                border: 1px solid #4A5263;
+                border-radius: 3px;
+                background-color: #1B1E28;
+            }
+            QCheckBox::indicator:checked {
+                background-color: #FFB300;
+                border: 1px solid #FFD54F;
+            }
+            QLabel {
+                color: #9AA2B2;
+                font-size: 10px;
+                font-weight: 600;
+            }
+            QDoubleSpinBox {
+                background-color: #1B1E28;
+                color: #ECEFF4;
+                border: 1px solid #333A4A;
+                border-radius: 4px;
+                padding: 3px 6px;
+                font-size: 11px;
+                font-weight: 600;
+            }
+            QDoubleSpinBox:focus {
+                border: 1px solid #FFB300;
+            }
+            QComboBox {
+                background-color: #1B1E28;
+                color: #ECEFF4;
+                border: 1px solid #333A4A;
+                border-radius: 4px;
+                padding: 3px 6px;
+                font-size: 10px;
+                font-weight: 500;
+            }
+            QComboBox:focus {
+                border: 1px solid #FFB300;
+            }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(10)
+
+        # 1. Header / Checkbox principal
+        self.chk_enabled = QCheckBox("Activar Crossover (Out A / Out B)", self)
+        self.chk_enabled.setCursor(Qt.CursorShape.PointingHandCursor)
+        layout.addWidget(self.chk_enabled)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet("background-color: #242936; min-height: 1px; max-height: 1px;")
+        layout.addWidget(sep)
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(8)
+
+        # 2. Frecuencia de Cruce (Hz)
+        lbl_freq = QLabel("Frecuencia de Cruce:", self)
+        self.spin_freq = QDoubleSpinBox(self)
+        self.spin_freq.setRange(20.0, 20000.0)
+        self.spin_freq.setDecimals(1)
+        self.spin_freq.setSuffix(" Hz")
+        self.spin_freq.setKeyboardTracking(False)
+        self.spin_freq.setValue(80.0)
+        grid.addWidget(lbl_freq, 0, 0)
+        grid.addWidget(self.spin_freq, 0, 1)
+
+        # 3. Tipo de Filtro
+        lbl_type = QLabel("Tipo de Filtro:", self)
+        self.combo_type = QComboBox(self)
+        self.combo_type.addItems(["Linkwitz-Riley", "Butterworth"])
+        style_dark_combobox(self.combo_type)
+        grid.addWidget(lbl_type, 1, 0)
+        grid.addWidget(self.combo_type, 1, 1)
+
+        # 4. Pendiente (Slope)
+        lbl_slope = QLabel("Pendiente (Slope):", self)
+        self.combo_slope = QComboBox(self)
+        self.combo_slope.addItem("12 dB/oct", 12)
+        self.combo_slope.addItem("24 dB/oct", 24)
+        self.combo_slope.addItem("48 dB/oct", 48)
+        style_dark_combobox(self.combo_slope)
+        grid.addWidget(lbl_slope, 2, 0)
+        grid.addWidget(self.combo_slope, 2, 1)
+
+        # 5. Asignación de Vías
+        lbl_routing = QLabel("Asignación de Vías:", self)
+        self.combo_routing = QComboBox(self)
+        self.combo_routing.addItem("Out A: Tops (HP)  |  Out B: Sub (LP)", "A_Tops_B_Sub")
+        self.combo_routing.addItem("Out A: Sub (LP)   |  Out B: Tops (HP)", "A_Sub_B_Tops")
+        self.combo_routing.addItem("Out A: Full Range |  Out B: Sub (LP)", "A_Full_B_Sub")
+        style_dark_combobox(self.combo_routing)
+        grid.addWidget(lbl_routing, 3, 0)
+        grid.addWidget(self.combo_routing, 3, 1)
+
+        layout.addLayout(grid)
+
+        # Connect internal signals
+        self.chk_enabled.toggled.connect(self._on_control_changed)
+        self.spin_freq.valueChanged.connect(self._on_control_changed)
+        self.combo_type.currentIndexChanged.connect(self._on_control_changed)
+        self.combo_slope.currentIndexChanged.connect(self._on_control_changed)
+        self.combo_routing.currentIndexChanged.connect(self._on_control_changed)
+
+    def _on_control_changed(self):
+        self.configChanged.emit()
+
+    def get_state(self) -> dict:
+        return {
+            "enabled": bool(self.chk_enabled.isChecked()),
+            "freq_hz": float(self.spin_freq.value()),
+            "filter_type": str(self.combo_type.currentText()),
+            "slope_db": int(self.combo_slope.currentData() if self.combo_slope.currentData() is not None else 24),
+            "routing_mode": str(self.combo_routing.currentData() if self.combo_routing.currentData() is not None else "A_Tops_B_Sub"),
+        }
+
+    def set_state(self, state: dict):
+        self.chk_enabled.blockSignals(True)
+        self.spin_freq.blockSignals(True)
+        self.combo_type.blockSignals(True)
+        self.combo_slope.blockSignals(True)
+        self.combo_routing.blockSignals(True)
+
+        self.chk_enabled.setChecked(bool(state.get("enabled", False)))
+        self.spin_freq.setValue(float(state.get("freq_hz", 80.0)))
+        
+        ft = str(state.get("filter_type", "Linkwitz-Riley"))
+        idx_t = self.combo_type.findText(ft)
+        if idx_t >= 0:
+            self.combo_type.setCurrentIndex(idx_t)
+
+        sl = int(state.get("slope_db", 24))
+        idx_s = self.combo_slope.findData(sl)
+        if idx_s >= 0:
+            self.combo_slope.setCurrentIndex(idx_s)
+
+        rm = str(state.get("routing_mode", "A_Tops_B_Sub"))
+        idx_r = self.combo_routing.findData(rm)
+        if idx_r >= 0:
+            self.combo_routing.setCurrentIndex(idx_r)
+
+        self.chk_enabled.blockSignals(False)
+        self.spin_freq.blockSignals(False)
+        self.combo_type.blockSignals(False)
+        self.combo_slope.blockSignals(False)
+        self.combo_routing.blockSignals(False)
+
+
+class EditInputSelector(QWidget):
+    """
+    Selector segmentado en cápsula Liquid Glass para alternar el banco de EQ activo:
+    🎛️ Edit EQ: [ In 1 | In 2 ]
+    """
+    inputChanged = pyqtSignal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setFixedHeight(28)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(2, 0, 2, 0)
+        layout.setSpacing(4)
+
+        lbl = QLabel("🎛️ Edit EQ:", self)
+        lbl.setStyleSheet("color: #C5CDD9; font-size: 11px; font-weight: bold; background: transparent;")
+        layout.addWidget(lbl)
+
+        self.btn_in1 = LiquidGlassButton("In 1", self, active_tint_color="#00E5FF", pill_radius=11.0)
+        self.btn_in1.setCheckable(True)
+        self.btn_in1.setChecked(True)
+        self.btn_in1.setFixedWidth(44)
+        self.btn_in1.setFixedHeight(24)
+        self.btn_in1.setToolTip("Editar banco de EQ para Entrada 1 (Principal)")
+        self.btn_in1.clicked.connect(lambda: self._select_input(1))
+        layout.addWidget(self.btn_in1)
+
+        self.btn_in2 = LiquidGlassButton("In 2", self, active_tint_color="#BA68C8", pill_radius=11.0)
+        self.btn_in2.setCheckable(True)
+        self.btn_in2.setChecked(False)
+        self.btn_in2.setFixedWidth(44)
+        self.btn_in2.setFixedHeight(24)
+        self.btn_in2.setToolTip("Editar banco de EQ para Entrada 2 (Aux / Mic)")
+        self.btn_in2.clicked.connect(lambda: self._select_input(2))
+        layout.addWidget(self.btn_in2)
+
+        self._active_input = 1
+
+    def _select_input(self, inp: int):
+        self._active_input = inp
+        self.btn_in1.blockSignals(True)
+        self.btn_in2.blockSignals(True)
+        self.btn_in1.setChecked(inp == 1)
+        self.btn_in2.setChecked(inp == 2)
+        self.btn_in1.blockSignals(False)
+        self.btn_in2.blockSignals(False)
+        self.btn_in1.update()
+        self.btn_in2.update()
+        self.inputChanged.emit(inp)
+
+    def set_active_input(self, inp: int):
+        if inp in (1, 2) and inp != self._active_input:
+            self._select_input(inp)
