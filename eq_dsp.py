@@ -1415,13 +1415,80 @@ class DualOutputCrossover:
             return np.zeros_like(freqs_hz, dtype=float), db_lp
 
 
-class AsyncInputRingBuffer:
+class RealtimeStreamResampler:
     """
-    Ring Buffer Lock-Free SPSC para Input 2 (Aux / Mic) con corrección de clock drift
-    automática sin bloqueo del hilo de audio ni asignaciones dinámicas.
+    Remuestreador streaming continuo de alta fidelidad para flujos de audio en tiempo real.
+    Aplica interpolación cúbica de Hermite (Catmull-Rom) con acumulador de fase continuo
+    entre bloques contiguos, garantizando continuidad C1 sin saltos de fase, clics ni
+    desfase de tono ante cualquier combinación de frecuencias de muestreo (ej. 44.1k <-> 48k <-> 192k).
     """
 
-    def __init__(self, capacity_frames: int = 32768, channels: int = 2):
+    def __init__(self, in_sr: int = 48000, out_sr: int = 48000, channels: int = 2):
+        self.in_sr = float(max(1000.0, float(in_sr)))
+        self.out_sr = float(max(1000.0, float(out_sr)))
+        self.channels = int(channels)
+        self.ratio = self.in_sr / self.out_sr
+        self.time_pos = 1.0
+        self.history = np.zeros((3, self.channels), dtype=np.float32)
+
+    def set_rates(self, in_sr: int, out_sr: int):
+        self.in_sr = float(max(1000.0, float(in_sr)))
+        self.out_sr = float(max(1000.0, float(out_sr)))
+        self.ratio = self.in_sr / self.out_sr
+        self.time_pos = 1.0
+        self.history.fill(0.0)
+
+    def process(self, indata: np.ndarray) -> np.ndarray:
+        if abs(self.in_sr - self.out_sr) < 1.0 or self.ratio <= 0.0:
+            return indata
+
+        n_in = indata.shape[0]
+        if n_in == 0:
+            return np.zeros((0, self.channels), dtype=np.float32)
+
+        full = np.vstack((self.history, indata))
+        t_limit = float(n_in + 1.0)
+
+        t_list = []
+        t = self.time_pos
+        while t < t_limit:
+            t_list.append(t)
+            t += self.ratio
+
+        self.time_pos = t - float(n_in)
+        self.history = full[-3:].copy()
+
+        if not t_list:
+            return np.zeros((0, self.channels), dtype=np.float32)
+
+        t_arr = np.array(t_list, dtype=np.float64)
+        idx_floor = np.floor(t_arr).astype(int)
+        mu = (t_arr - idx_floor)[:, np.newaxis].astype(np.float32)
+
+        p0 = full[idx_floor - 1]
+        p1 = full[idx_floor]
+        p2 = full[idx_floor + 1]
+        p3 = full[idx_floor + 2]
+
+        a = -0.5 * p0 + 1.5 * p1 - 1.5 * p2 + 0.5 * p3
+        b = p0 - 2.5 * p1 + 2.0 * p2 - 0.5 * p3
+        c = -0.5 * p0 + 0.5 * p2
+        d = p1
+
+        out = ((a * mu + b) * mu + c) * mu + d
+        return out.astype(np.float32)
+
+
+class AsyncInputRingBuffer:
+    """
+    Ring Buffer Lock-Free SPSC para entradas de audio (Input 1 / Input 2) con:
+    - Remuestreo streaming en tiempo real (RealtimeStreamResampler) para sincronizar cualquier
+      sample rate de entrada con el sample rate del motor maestro sin alteración de tono ni velocidad.
+    - Pre-buffering automático para evitar clicks/underruns al arrancar los streams.
+    - Colchón anti-jitter dinámico y corrección suave de clock drift.
+    """
+
+    def __init__(self, capacity_frames: int = 65536, channels: int = 2):
         self.capacity = int(capacity_frames)
         self.channels = int(channels)
         self.buffer = np.zeros((self.capacity, self.channels), dtype=np.float32)
@@ -1429,17 +1496,26 @@ class AsyncInputRingBuffer:
         self.read_ptr = 0
         self.available = 0
         self.target_fill = 2048
+        self.is_prebuffering = True
+        self.last_frame = np.zeros((1, self.channels), dtype=np.float32)
+        self.resampler = RealtimeStreamResampler(48000, 48000, channels=self.channels)
+
+    def set_rates(self, in_sr: int, out_sr: int):
+        self.resampler.set_rates(in_sr, out_sr)
 
     def reset(self, target_fill: int = 2048):
         self.buffer.fill(0.0)
-        self.target_fill = int(target_fill)
-        self.write_ptr = self.target_fill
+        self.target_fill = max(256, int(target_fill))
+        self.write_ptr = 0
         self.read_ptr = 0
-        self.available = self.target_fill
+        self.available = 0
+        self.is_prebuffering = True
+        self.last_frame.fill(0.0)
+        self.resampler.set_rates(self.resampler.in_sr, self.resampler.out_sr)
 
     def write(self, data: np.ndarray):
-        n = data.shape[0]
-        if n <= 0:
+        n_raw = data.shape[0]
+        if n_raw <= 0:
             return
         if data.ndim == 1:
             frames = np.column_stack((data, data))
@@ -1448,9 +1524,17 @@ class AsyncInputRingBuffer:
         else:
             frames = data[:, :2]
 
-        # Prevención de overflow (corrección de clock drift positivo)
+        # Remuestreo en tiempo real si el sample rate de la entrada difiere del sample rate maestro
+        if abs(self.resampler.in_sr - self.resampler.out_sr) >= 1.0:
+            frames = self.resampler.process(frames)
+            if frames.shape[0] <= 0:
+                return
+
+        n = frames.shape[0]
+
+        # Prevención de overflow (corrección suave de clock drift positivo)
         max_allowed = self.capacity - n
-        if self.available > max_allowed:
+        if self.available > max_allowed or self.available > (self.target_fill * 4):
             drop = self.available - self.target_fill
             self.read_ptr = (self.read_ptr + drop) % self.capacity
             self.available = self.target_fill
@@ -1460,16 +1544,35 @@ class AsyncInputRingBuffer:
         self.write_ptr = (self.write_ptr + n) % self.capacity
         self.available += n
 
+        # Al alcanzar el colchón inicial target_fill, desactivar pre-buffering
+        if self.is_prebuffering and self.available >= self.target_fill:
+            self.is_prebuffering = False
+
     def read_into(self, out_array: np.ndarray) -> bool:
         n = out_array.shape[0]
-        if self.available < n:
-            # Corrección de underrun (clock drift negativo) sin bloquear el callback maestro
+        if self.is_prebuffering:
             out_array.fill(0.0)
             return False
+
+        if self.available < n:
+            # Corrección de underrun transitorio: entrega lo disponible y desvanece suavemente
+            if self.available > 0:
+                avail = self.available
+                idx = (self.read_ptr + np.arange(avail)) % self.capacity
+                out_array[:avail] = self.buffer[idx]
+                fade = np.linspace(1.0, 0.0, n - avail)[:, np.newaxis]
+                out_array[avail:] = out_array[avail - 1 : avail] * fade
+                self.read_ptr = (self.read_ptr + avail) % self.capacity
+                self.available = 0
+            else:
+                out_array.fill(0.0)
+            return False
+
         idx = (self.read_ptr + np.arange(n)) % self.capacity
         np.copyto(out_array, self.buffer[idx])
         self.read_ptr = (self.read_ptr + n) % self.capacity
         self.available -= n
+        self.last_frame[:] = out_array[-1:, :self.channels]
         return True
 
 

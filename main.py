@@ -45,7 +45,7 @@ from eq_ui import (
 )
 from fft_analyzer import FFTSpectrumAnalyzer
 from eq_dsp import (
-    ParametricEQEngine, DualOutputCrossover, AsyncInputRingBuffer,
+    ParametricEQEngine, DualOutputCrossover, AsyncInputRingBuffer, RealtimeStreamResampler,
     smooth_spectrum_12th_octave, detect_resonances
 )
 
@@ -531,8 +531,9 @@ class StereoDelayLine:
 
 class SecondaryOutputRingBuffer:
     """
-    Ring buffer continuo thread-safe con colchón anti-jitter y compensación suave de reloj
-    (drift correction) para sincronizar un segundo dispositivo de salida de audio en Windows.
+    Ring buffer continuo thread-safe con colchón anti-jitter, remuestreo en tiempo real
+    y compensación suave de reloj (drift correction) para sincronizar un segundo dispositivo
+    de salida de audio en Windows.
     """
 
     def __init__(self, block_size: int = 512, channels: int = 2):
@@ -546,7 +547,12 @@ class SecondaryOutputRingBuffer:
         self.available_frames = 0
         self.is_prebuffering = True
         self.last_frame = np.zeros((1, self.channels), dtype=np.float32)
+        self.resampler = RealtimeStreamResampler(48000, 48000, channels=self.channels)
         self.lock = threading.Lock()
+
+    def set_rates(self, in_sr: int, out_sr: int):
+        with self.lock:
+            self.resampler.set_rates(in_sr, out_sr)
 
     def reset(self, block_size: int | None = None):
         with self.lock:
@@ -562,12 +568,19 @@ class SecondaryOutputRingBuffer:
             self.available_frames = 0
             self.is_prebuffering = True
             self.last_frame.fill(0.0)
+            self.resampler.set_rates(self.resampler.in_sr, self.resampler.out_sr)
 
     def write(self, data: np.ndarray) -> None:
         """Escribe un bloque de audio estéreo (N, channels) en el ring buffer."""
         n_frames = data.shape[0]
         if n_frames == 0:
             return
+
+        if abs(self.resampler.in_sr - self.resampler.out_sr) >= 1.0:
+            data = self.resampler.process(data)
+            n_frames = data.shape[0]
+            if n_frames == 0:
+                return
 
         with self.lock:
             # Si el búfer está lleno (overrun severo), descartar las muestras más viejas
@@ -2272,9 +2285,9 @@ class AudioAnalyzerApp(QMainWindow):
         self._get_presets_dir()
 
         # Motor Dual-Input asíncrono y dos bancos independientes de filtros Biquad
-        self.in1_ring_buffer = AsyncInputRingBuffer(capacity_frames=32768, channels=2)
+        self.in1_ring_buffer = AsyncInputRingBuffer(capacity_frames=65536, channels=2)
         self.in1_block = np.zeros((self.audio_block_size, 2), dtype=np.float32)
-        self.in2_ring_buffer = AsyncInputRingBuffer(capacity_frames=32768, channels=2)
+        self.in2_ring_buffer = AsyncInputRingBuffer(capacity_frames=65536, channels=2)
         self.in2_block = np.zeros((self.audio_block_size, 2), dtype=np.float32)
         self.stream_in2 = None
 
@@ -4465,7 +4478,8 @@ class AudioAnalyzerApp(QMainWindow):
             return
 
         try:
-            self.in2_ring_buffer.reset(target_fill=self.audio_block_size * 2)
+            jitter_cushion = max(self.audio_block_size * 2, int(self.current_sr * 0.03))
+            self.in2_ring_buffer.reset(target_fill=jitter_cushion)
             stream, used_sr, ch = self._open_stream_safe(
                 sd.InputStream,
                 dev_idx,
@@ -4474,6 +4488,7 @@ class AudioAnalyzerApp(QMainWindow):
                 callback=self.audio_callback_in2,
                 max_ch=2,
             )
+            self.in2_ring_buffer.set_rates(in_sr=used_sr, out_sr=self.current_sr)
             self.stream_in2 = stream
             self.stream_in2.start()
         except Exception as e:
@@ -4598,47 +4613,86 @@ class AudioAnalyzerApp(QMainWindow):
     def _open_stream_safe(self, stream_cls, device_idx, preferred_sr, blocksize, callback, max_ch: int = 2):
         """
         Abre de forma segura un InputStream u OutputStream unilateral en Windows (WASAPI / ASIO / WDM-KS / MME).
-        Si el dispositivo WASAPI Shared Mode rechaza preferred_sr o la cantidad de canales,
-        negocia automáticamente con el default_samplerate / canales nativos de Windows sin lanzar excepciones no controladas.
+        Si el dispositivo es WASAPI, activa automáticamente sd.WasapiSettings(auto_convert=True) para que
+        el motor de Windows Audio Engine habilite la conversión de formato/sample rate sin distorsión ni errores.
+        Si el dispositivo rechaza preferred_sr o la cantidad de canales, negocia con default_samplerate / canales nativos.
         """
         dev_info = sd.query_devices(device_idx)
+        hostapis = sd.query_hostapis()
+        api_name = hostapis[dev_info["hostapi"]]["name"]
+        is_wasapi = "WASAPI" in api_name
+
         if stream_cls == sd.InputStream:
             avail_ch = int(dev_info.get("max_input_channels", 2))
         else:
             avail_ch = int(dev_info.get("max_output_channels", 2))
         channels = min(max_ch, max(1, avail_ch))
 
+        wasapi_extra = None
+        if is_wasapi:
+            try:
+                wasapi_extra = sd.WasapiSettings(auto_convert=True)
+            except Exception:
+                wasapi_extra = None
+
         # 1. Intento primario con preferred_sr y latency='low'
         try:
+            kwargs = {"latency": "low"}
+            if wasapi_extra is not None:
+                kwargs["extra_settings"] = wasapi_extra
             stream = stream_cls(
                 device=device_idx,
                 channels=channels,
                 samplerate=preferred_sr,
                 blocksize=blocksize,
                 dtype="float32",
-                latency="low",
                 callback=callback,
+                **kwargs,
             )
-            return stream, preferred_sr, channels
+            actual_sr = int(round(stream.samplerate))
+            return stream, actual_sr, channels
         except Exception as e_pref:
-            # 2. Fallback al sample rate nativo del dispositivo en Windows (default_samplerate)
+            # 2. Intento con preferred_sr sin latency='low'
+            try:
+                kwargs = {}
+                if wasapi_extra is not None:
+                    kwargs["extra_settings"] = wasapi_extra
+                stream = stream_cls(
+                    device=device_idx,
+                    channels=channels,
+                    samplerate=preferred_sr,
+                    blocksize=blocksize,
+                    dtype="float32",
+                    callback=callback,
+                    **kwargs,
+                )
+                actual_sr = int(round(stream.samplerate))
+                return stream, actual_sr, channels
+            except Exception:
+                pass
+
+            # 3. Fallback al sample rate nativo del dispositivo en Windows (default_samplerate)
             native_sr = int(dev_info.get("default_samplerate", preferred_sr))
             if native_sr > 0 and native_sr != preferred_sr:
                 try:
+                    kwargs = {"latency": "low"}
+                    if wasapi_extra is not None:
+                        kwargs["extra_settings"] = wasapi_extra
                     stream = stream_cls(
                         device=device_idx,
                         channels=channels,
                         samplerate=native_sr,
                         blocksize=blocksize,
                         dtype="float32",
-                        latency="low",
                         callback=callback,
+                        **kwargs,
                     )
+                    actual_sr = int(round(stream.samplerate))
                     return stream, native_sr, channels
                 except Exception:
                     pass
 
-            # 3. Fallback adicional sin latency='low'
+            # 4. Fallback final sin extra_settings ni latency='low'
             for sr_try in (preferred_sr, native_sr):
                 if sr_try <= 0:
                     continue
@@ -4651,7 +4705,8 @@ class AudioAnalyzerApp(QMainWindow):
                         dtype="float32",
                         callback=callback,
                     )
-                    return stream, sr_try, channels
+                    actual_sr = int(round(stream.samplerate))
+                    return stream, actual_sr, channels
                 except Exception:
                     pass
 
@@ -4882,9 +4937,11 @@ class AudioAnalyzerApp(QMainWindow):
         else:
             self.audio_block_size = 128
 
-        self.in1_ring_buffer.reset(target_fill=self.audio_block_size * 2)
+        # Target fill de ~30 ms para absorción de jitter entre hilos/relojes asíncronos sin cortes ni clicks
+        jitter_cushion = max(self.audio_block_size * 2, int(self.current_sr * 0.03))
+        self.in1_ring_buffer.reset(target_fill=jitter_cushion)
         if hasattr(self, "in2_ring_buffer"):
-            self.in2_ring_buffer.reset(target_fill=self.audio_block_size * 2)
+            self.in2_ring_buffer.reset(target_fill=jitter_cushion)
         self.ring_buffer_out_b.reset(block_size=self.audio_block_size)
 
         self.in1_block = np.zeros((self.audio_block_size, 2), dtype=np.float32)
@@ -4947,7 +5004,7 @@ class AudioAnalyzerApp(QMainWindow):
         if negotiated_sr != self.current_sr:
             self.update_sample_rate(negotiated_sr)
 
-        # 2. Apertura segura de Entrada 1
+        # 2. Apertura segura de Entrada 1 y sincronización de sample rates
         try:
             self.stream_in1, sr_in1, ch_in1 = self._open_stream_safe(
                 sd.InputStream,
@@ -4957,6 +5014,7 @@ class AudioAnalyzerApp(QMainWindow):
                 callback=self.audio_callback_in1,
                 max_ch=2,
             )
+            self.in1_ring_buffer.set_rates(in_sr=sr_in1, out_sr=self.current_sr)
         except Exception as e_in:
             print(f"[WARN] No se pudo iniciar Entrada 1 con dispositivo {in_dev}: {e_in}. Intentando dispositivo por defecto...")
             default_in = sd.default.device[0]
@@ -4970,6 +5028,7 @@ class AudioAnalyzerApp(QMainWindow):
                         callback=self.audio_callback_in1,
                         max_ch=2,
                     )
+                    self.in1_ring_buffer.set_rates(in_sr=sr_in1, out_sr=self.current_sr)
                     if hasattr(self, "in_combo"):
                         idx_def_in = self.in_combo.findData(default_in)
                         if idx_def_in >= 0:
@@ -4998,17 +5057,17 @@ class AudioAnalyzerApp(QMainWindow):
                     self.stream = None
                 return
 
-        # Iniciar streams principales
+        # Iniciar streams principales (entrada primero para cebar el buffer antes de la salida)
         try:
-            self.stream_out_a.start()
             self.stream_in1.start()
+            self.stream_out_a.start()
         except Exception as e_start:
             print(f"[WARN] Error al iniciar streams principales: {e_start}")
 
         # 3. Apertura de Salida Secundaria (Bus B - 3,4) si está seleccionada
         if out_b_dev is not None and out_b_dev != out_dev:
             try:
-                self.stream_out_b, _, _ = self._open_stream_safe(
+                self.stream_out_b, sr_b, _ = self._open_stream_safe(
                     sd.OutputStream,
                     out_b_dev,
                     preferred_sr=self.current_sr,
@@ -5016,6 +5075,7 @@ class AudioAnalyzerApp(QMainWindow):
                     callback=self.audio_callback_out_b,
                     max_ch=2,
                 )
+                self.ring_buffer_out_b.set_rates(in_sr=self.current_sr, out_sr=sr_b)
                 self.stream_out_b.start()
             except Exception as e_b:
                 self.stream_out_b = None
