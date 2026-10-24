@@ -2220,7 +2220,7 @@ class AudioAnalyzerApp(QMainWindow):
 
         self.sample_rates = [44100, 48000, 88200, 96000, 176400, 192000]
         self.current_sr = 48000
-        self.audio_block_size = 512
+        self.audio_block_size = 128
         self.fft_sizes = [512, 1024, 2048, 4096, 8192, 16384]
         self.fft_size = 4096
         self.channels = 2
@@ -2228,6 +2228,8 @@ class AudioAnalyzerApp(QMainWindow):
         self.audio_queue = queue.Queue(maxsize=10)
         self.ring_buffer_out_b = SecondaryOutputRingBuffer(block_size=self.audio_block_size, channels=2)
         self.stream = None
+        self.stream_in1 = None
+        self.stream_out_a = None
         self.stream_out_b = None
         self.delay_bus_a = StereoDelayLine(sample_rate=self.current_sr)
         self.delay_bus_b = StereoDelayLine(sample_rate=self.current_sr)
@@ -2270,6 +2272,8 @@ class AudioAnalyzerApp(QMainWindow):
         self._get_presets_dir()
 
         # Motor Dual-Input asíncrono y dos bancos independientes de filtros Biquad
+        self.in1_ring_buffer = AsyncInputRingBuffer(capacity_frames=32768, channels=2)
+        self.in1_block = np.zeros((self.audio_block_size, 2), dtype=np.float32)
         self.in2_ring_buffer = AsyncInputRingBuffer(capacity_frames=32768, channels=2)
         self.in2_block = np.zeros((self.audio_block_size, 2), dtype=np.float32)
         self.stream_in2 = None
@@ -4122,26 +4126,35 @@ class AudioAnalyzerApp(QMainWindow):
         saved_version = int(self.saved_config.get("version", 1))
         audio_cfg = self.saved_config.get("audio", {})
         if isinstance(audio_cfg, dict):
+            def _find_combo_item(combo, name, idx_saved):
+                if isinstance(name, str) and combo.findText(name) >= 0:
+                    return combo.findText(name)
+                if isinstance(idx_saved, int) and combo.findData(idx_saved) >= 0:
+                    return combo.findData(idx_saved)
+                if isinstance(name, str) and name:
+                    clean = name.split("]", 1)[-1].strip() if "]" in name else name
+                    for i in range(combo.count()):
+                        if clean and clean in combo.itemText(i):
+                            return i
+                return -1
+
             in_name = audio_cfg.get("input_device_name")
             in_idx_saved = audio_cfg.get("input_device_index")
-            if isinstance(in_name, str) and self.in_combo.findText(in_name) >= 0:
-                self.in_combo.setCurrentIndex(self.in_combo.findText(in_name))
-            elif isinstance(in_idx_saved, int) and self.in_combo.findData(in_idx_saved) >= 0:
-                self.in_combo.setCurrentIndex(self.in_combo.findData(in_idx_saved))
+            idx_in = _find_combo_item(self.in_combo, in_name, in_idx_saved)
+            if idx_in >= 0:
+                self.in_combo.setCurrentIndex(idx_in)
 
             out_name = audio_cfg.get("output_device_name")
             out_idx_saved = audio_cfg.get("output_device_index")
-            if isinstance(out_name, str) and self.out_combo.findText(out_name) >= 0:
-                self.out_combo.setCurrentIndex(self.out_combo.findText(out_name))
-            elif isinstance(out_idx_saved, int) and self.out_combo.findData(out_idx_saved) >= 0:
-                self.out_combo.setCurrentIndex(self.out_combo.findData(out_idx_saved))
+            idx_out = _find_combo_item(self.out_combo, out_name, out_idx_saved)
+            if idx_out >= 0:
+                self.out_combo.setCurrentIndex(idx_out)
 
             out_b_name = audio_cfg.get("output_b_device_name")
             out_b_idx_saved = audio_cfg.get("output_b_device_index")
-            if isinstance(out_b_name, str) and self.out_b_combo.findText(out_b_name) >= 0:
-                self.out_b_combo.setCurrentIndex(self.out_b_combo.findText(out_b_name))
-            elif isinstance(out_b_idx_saved, int) and self.out_b_combo.findData(out_b_idx_saved) >= 0:
-                self.out_b_combo.setCurrentIndex(self.out_b_combo.findData(out_b_idx_saved))
+            idx_out_b = _find_combo_item(self.out_b_combo, out_b_name, out_b_idx_saved)
+            if idx_out_b >= 0:
+                self.out_b_combo.setCurrentIndex(idx_out_b)
 
             sr_saved = audio_cfg.get("sample_rate")
             if sr_saved in self.sample_rates:
@@ -4376,16 +4389,44 @@ class AudioAnalyzerApp(QMainWindow):
         devices = sd.query_devices()
         hostapis = sd.query_hostapis()
 
-        for idx, dev in enumerate(devices):
+        def _format_device_item(dev, idx):
             api_name = hostapis[dev["hostapi"]]["name"]
-            dev_label = f"[{api_name}] {dev['name']}"
-            if dev["max_input_channels"] > 0:
-                self.in_combo.addItem(dev_label, idx)
-                if hasattr(self, "in2_combo"):
-                    self.in2_combo.addItem(dev_label, idx)
-            if dev["max_output_channels"] > 0:
-                self.out_combo.addItem(dev_label, idx)
-                self.out_b_combo.addItem(dev_label, idx)
+            u = api_name.upper()
+            if "WASAPI" in u:
+                prefix = "⚡ [WASAPI]"
+                priority = 0
+            elif "ASIO" in u:
+                prefix = "🚀 [ASIO]"
+                priority = 1
+            elif "WDM-KS" in u or "WDMKS" in u:
+                prefix = "⚡ [WDM-KS]"
+                priority = 2
+            elif "DIRECTSOUND" in u:
+                prefix = "[DirectSound]"
+                priority = 3
+            elif "MME" in u:
+                prefix = "[MME]"
+                priority = 4
+            else:
+                prefix = f"[{api_name}]"
+                priority = 5
+            label = f"{prefix} {dev['name']}"
+            return (priority, label, idx)
+
+        in_devices = [_format_device_item(d, i) for i, d in enumerate(devices) if d["max_input_channels"] > 0]
+        out_devices = [_format_device_item(d, i) for i, d in enumerate(devices) if d["max_output_channels"] > 0]
+
+        in_devices.sort(key=lambda x: (x[0], x[1]))
+        out_devices.sort(key=lambda x: (x[0], x[1]))
+
+        for _, label, idx in in_devices:
+            self.in_combo.addItem(label, idx)
+            if hasattr(self, "in2_combo"):
+                self.in2_combo.addItem(label, idx)
+
+        for _, label, idx in out_devices:
+            self.out_combo.addItem(label, idx)
+            self.out_b_combo.addItem(label, idx)
 
         default_in, default_out = sd.default.device
         in_idx = self.in_combo.findData(default_in)
@@ -4409,7 +4450,7 @@ class AudioAnalyzerApp(QMainWindow):
             self.schedule_config_save()
 
     def _restart_in2_stream(self):
-        if self.stream_in2 is not None:
+        if hasattr(self, "stream_in2") and self.stream_in2 is not None:
             try:
                 self.stream_in2.stop()
                 self.stream_in2.close()
@@ -4424,16 +4465,16 @@ class AudioAnalyzerApp(QMainWindow):
             return
 
         try:
-            dev_info = sd.query_devices(dev_idx)
-            ch = min(2, int(dev_info["max_input_channels"]))
             self.in2_ring_buffer.reset(target_fill=self.audio_block_size * 2)
-            self.stream_in2 = sd.InputStream(
-                device=dev_idx,
-                channels=ch,
-                samplerate=self.current_sr,
+            stream, used_sr, ch = self._open_stream_safe(
+                sd.InputStream,
+                dev_idx,
+                preferred_sr=self.current_sr,
                 blocksize=self.audio_block_size,
-                callback=self.audio_callback_in2
+                callback=self.audio_callback_in2,
+                max_ch=2,
             )
+            self.stream_in2 = stream
             self.stream_in2.start()
         except Exception as e:
             self.stream_in2 = None
@@ -4515,8 +4556,22 @@ class AudioAnalyzerApp(QMainWindow):
         for lbl in self.rta_peak_labels:
             lbl.setVisible(False)
 
-    def on_sr_changed(self):
-        self.current_sr = self.sr_combo.currentData()
+    def update_sample_rate(self, new_sr: int):
+        new_sr = int(new_sr)
+        self.current_sr = new_sr
+        if hasattr(self, "sr_combo"):
+            idx = self.sr_combo.findData(self.current_sr)
+            if idx >= 0:
+                if self.sr_combo.currentIndex() != idx:
+                    self.sr_combo.blockSignals(True)
+                    self.sr_combo.setCurrentIndex(idx)
+                    self.sr_combo.blockSignals(False)
+            else:
+                self.sr_combo.blockSignals(True)
+                self.sr_combo.addItem(f"{self.current_sr} Hz", self.current_sr)
+                self.sr_combo.setCurrentIndex(self.sr_combo.count() - 1)
+                self.sr_combo.blockSignals(False)
+
         self.fft_analyzer.set_sample_rate(self.current_sr)
         if hasattr(self, "fft_analyzer_in2"):
             self.fft_analyzer_in2.set_sample_rate(self.current_sr)
@@ -4532,9 +4587,75 @@ class AudioAnalyzerApp(QMainWindow):
         self.eq_panel.refresh_from_engine()
         self.update_axes_config()
         self.update_crossover_visuals()
+
+    def on_sr_changed(self):
+        new_sr = self.sr_combo.currentData()
+        self.update_sample_rate(new_sr)
         if not self._loading_config:
             self.restart_audio_stream()
             self.schedule_config_save()
+
+    def _open_stream_safe(self, stream_cls, device_idx, preferred_sr, blocksize, callback, max_ch: int = 2):
+        """
+        Abre de forma segura un InputStream u OutputStream unilateral en Windows (WASAPI / ASIO / WDM-KS / MME).
+        Si el dispositivo WASAPI Shared Mode rechaza preferred_sr o la cantidad de canales,
+        negocia automáticamente con el default_samplerate / canales nativos de Windows sin lanzar excepciones no controladas.
+        """
+        dev_info = sd.query_devices(device_idx)
+        if stream_cls == sd.InputStream:
+            avail_ch = int(dev_info.get("max_input_channels", 2))
+        else:
+            avail_ch = int(dev_info.get("max_output_channels", 2))
+        channels = min(max_ch, max(1, avail_ch))
+
+        # 1. Intento primario con preferred_sr y latency='low'
+        try:
+            stream = stream_cls(
+                device=device_idx,
+                channels=channels,
+                samplerate=preferred_sr,
+                blocksize=blocksize,
+                dtype="float32",
+                latency="low",
+                callback=callback,
+            )
+            return stream, preferred_sr, channels
+        except Exception as e_pref:
+            # 2. Fallback al sample rate nativo del dispositivo en Windows (default_samplerate)
+            native_sr = int(dev_info.get("default_samplerate", preferred_sr))
+            if native_sr > 0 and native_sr != preferred_sr:
+                try:
+                    stream = stream_cls(
+                        device=device_idx,
+                        channels=channels,
+                        samplerate=native_sr,
+                        blocksize=blocksize,
+                        dtype="float32",
+                        latency="low",
+                        callback=callback,
+                    )
+                    return stream, native_sr, channels
+                except Exception:
+                    pass
+
+            # 3. Fallback adicional sin latency='low'
+            for sr_try in (preferred_sr, native_sr):
+                if sr_try <= 0:
+                    continue
+                try:
+                    stream = stream_cls(
+                        device=device_idx,
+                        channels=channels,
+                        samplerate=sr_try,
+                        blocksize=blocksize,
+                        dtype="float32",
+                        callback=callback,
+                    )
+                    return stream, sr_try, channels
+                except Exception:
+                    pass
+
+            raise e_pref
 
     def update_axes_config(self):
         is_x_log = (self.x_scale_combo.currentText() == "Logarítmica")
@@ -4583,14 +4704,26 @@ class AudioAnalyzerApp(QMainWindow):
         self.edge_masks_and_scales.update()
         self.schedule_config_save()
 
-    def audio_callback(self, indata, outdata, frames, time_info, status):
+    def audio_callback_in1(self, indata, frames, time_info, status):
+        if hasattr(self, "in1_ring_buffer"):
+            self.in1_ring_buffer.write(indata)
+
+    def master_output_callback(self, outdata, frames, time_info, status):
+        # 0. Lectura del bloque actual de Input 1 desde el ring buffer
+        if not hasattr(self, "in1_block") or self.in1_block.shape[0] != frames:
+            self.in1_block = np.zeros((frames, 2), dtype=np.float32)
+        if hasattr(self, "in1_ring_buffer"):
+            self.in1_ring_buffer.read_into(self.in1_block)
+        indata = self.in1_block
+
         # 1. Procesamiento independiente de Input 1
         in1_a, in1_b = self.eq_proc_in1.process_dual_block(indata, apply_limiter=False, apply_autogain=False)
 
         # 2. Lectura y procesamiento independiente de Input 2 (Aux / Mic) desde el ring buffer lock-free
         if not hasattr(self, "in2_block") or self.in2_block.shape[0] != frames:
             self.in2_block = np.zeros((frames, 2), dtype=np.float32)
-        self.in2_ring_buffer.read_into(self.in2_block)
+        if hasattr(self, "in2_ring_buffer"):
+            self.in2_ring_buffer.read_into(self.in2_block)
         in2_a, in2_b = self.eq_proc_in2.process_dual_block(self.in2_block, apply_limiter=False, apply_autogain=False)
 
         # 3. Matriz de ruteo libre de acoples hacia Out A y Out B
@@ -4703,6 +4836,12 @@ class AudioAnalyzerApp(QMainWindow):
         except queue.Full:
             pass
 
+    def audio_callback(self, indata, outdata, frames, time_info, status):
+        """Método de compatibilidad con llamadas de prueba o llamadas directas."""
+        if indata is not None and hasattr(self, "in1_ring_buffer"):
+            self.in1_ring_buffer.write(indata)
+        self.master_output_callback(outdata, frames, time_info, status)
+
     def audio_callback_out_b(self, outdata, frames, time_info, status):
         if self.is_muted:
             outdata.fill(0.0)
@@ -4710,13 +4849,22 @@ class AudioAnalyzerApp(QMainWindow):
         self.ring_buffer_out_b.read(outdata, frames)
 
     def restart_audio_stream(self):
-        if self.stream is not None:
+        if hasattr(self, "stream_in1") and self.stream_in1 is not None:
             try:
-                self.stream.stop()
-                self.stream.close()
+                self.stream_in1.stop()
+                self.stream_in1.close()
             except Exception:
                 pass
-            self.stream = None
+            self.stream_in1 = None
+
+        if hasattr(self, "stream_out_a") and self.stream_out_a is not None:
+            try:
+                self.stream_out_a.stop()
+                self.stream_out_a.close()
+            except Exception:
+                pass
+            self.stream_out_a = None
+        self.stream = None
 
         if self.stream_out_b is not None:
             try:
@@ -4726,17 +4874,20 @@ class AudioAnalyzerApp(QMainWindow):
                 pass
             self.stream_out_b = None
 
-        # Ajuste dinámico de blocksize según el sample rate para mantener latencia estable de ~10.6 ms
+        # Bloque de audio para latencia ultra-baja (128 samples a 48 kHz = 2.6 ms)
         if self.current_sr >= 176400:
-            self.audio_block_size = 2048
-        elif self.current_sr >= 88200:
-            self.audio_block_size = 1024
-        else:
             self.audio_block_size = 512
+        elif self.current_sr >= 88200:
+            self.audio_block_size = 256
+        else:
+            self.audio_block_size = 128
 
-        self.ring_buffer_out_b.reset(block_size=self.audio_block_size)
+        self.in1_ring_buffer.reset(target_fill=self.audio_block_size * 2)
         if hasattr(self, "in2_ring_buffer"):
             self.in2_ring_buffer.reset(target_fill=self.audio_block_size * 2)
+        self.ring_buffer_out_b.reset(block_size=self.audio_block_size)
+
+        self.in1_block = np.zeros((self.audio_block_size, 2), dtype=np.float32)
         self.in2_block = np.zeros((self.audio_block_size, 2), dtype=np.float32)
         self.scope_buffer.sample_rate = self.current_sr
         self.scope_buffer.block_size = self.audio_block_size
@@ -4748,69 +4899,147 @@ class AudioAnalyzerApp(QMainWindow):
         if in_dev is None or out_dev is None:
             return
 
-        # Detectar si el dispositivo de salida principal soporta 4 o más canales (Out A [1-2] + Out B [3-4])
+        # 1. Apertura segura de Salida Master (Out A)
         out_max_ch = 2
         try:
             dev_info = sd.query_devices(out_dev)
             out_max_ch = int(dev_info.get("max_output_channels", 2))
         except Exception:
             out_max_ch = 2
+        wanted_out_ch = 4 if out_max_ch >= 4 else 2
 
-        primary_opened = False
-        if out_max_ch >= 4:
-            try:
-                self.stream = sd.Stream(
-                    samplerate=self.current_sr,
-                    blocksize=self.audio_block_size,
-                    device=(in_dev, out_dev),
-                    channels=(self.channels, 4),
-                    dtype="float32",
-                    callback=self.audio_callback,
-                )
-                self.stream.start()
-                primary_opened = True
-            except Exception:
-                self.stream = None
-                primary_opened = False
-
-        if not primary_opened:
-            try:
-                self.stream = sd.Stream(
-                    samplerate=self.current_sr,
-                    blocksize=self.audio_block_size,
-                    device=(in_dev, out_dev),
-                    channels=self.channels,
-                    dtype="float32",
-                    callback=self.audio_callback,
-                )
-                self.stream.start()
-            except Exception as e:
-                QMessageBox.warning(
-                    self,
-                    "Error de Audio",
-                    f"No se pudo iniciar el stream con los dispositivos/Sample Rate elegidos:\n{e}",
-                )
+        try:
+            self.stream_out_a, negotiated_sr, ch_a = self._open_stream_safe(
+                sd.OutputStream,
+                out_dev,
+                preferred_sr=self.current_sr,
+                blocksize=self.audio_block_size,
+                callback=self.master_output_callback,
+                max_ch=wanted_out_ch,
+            )
+            self.stream = self.stream_out_a
+        except Exception as e_out:
+            print(f"[WARN] No se pudo iniciar Salida Master con dispositivo {out_dev}: {e_out}. Intentando dispositivo por defecto...")
+            default_out = sd.default.device[1]
+            if default_out is not None and default_out != out_dev:
+                try:
+                    self.stream_out_a, negotiated_sr, ch_a = self._open_stream_safe(
+                        sd.OutputStream,
+                        default_out,
+                        preferred_sr=self.current_sr,
+                        blocksize=self.audio_block_size,
+                        callback=self.master_output_callback,
+                        max_ch=2,
+                    )
+                    self.stream = self.stream_out_a
+                    if hasattr(self, "out_combo"):
+                        idx_def = self.out_combo.findData(default_out)
+                        if idx_def >= 0:
+                            self.out_combo.blockSignals(True)
+                            self.out_combo.setCurrentIndex(idx_def)
+                            self.out_combo.blockSignals(False)
+                except Exception as e_def:
+                    print(f"[ERROR] No se pudo abrir Salida Master ni por defecto: {e_def}")
+                    return
+            else:
                 return
 
-        # Si el usuario seleccionó una Salida Secundaria (Bus B - 3,4), abrir OutputStream secundario no bloqueante
+        if negotiated_sr != self.current_sr:
+            self.update_sample_rate(negotiated_sr)
+
+        # 2. Apertura segura de Entrada 1
+        try:
+            self.stream_in1, sr_in1, ch_in1 = self._open_stream_safe(
+                sd.InputStream,
+                in_dev,
+                preferred_sr=self.current_sr,
+                blocksize=self.audio_block_size,
+                callback=self.audio_callback_in1,
+                max_ch=2,
+            )
+        except Exception as e_in:
+            print(f"[WARN] No se pudo iniciar Entrada 1 con dispositivo {in_dev}: {e_in}. Intentando dispositivo por defecto...")
+            default_in = sd.default.device[0]
+            if default_in is not None and default_in != in_dev:
+                try:
+                    self.stream_in1, sr_in1, ch_in1 = self._open_stream_safe(
+                        sd.InputStream,
+                        default_in,
+                        preferred_sr=self.current_sr,
+                        blocksize=self.audio_block_size,
+                        callback=self.audio_callback_in1,
+                        max_ch=2,
+                    )
+                    if hasattr(self, "in_combo"):
+                        idx_def_in = self.in_combo.findData(default_in)
+                        if idx_def_in >= 0:
+                            self.in_combo.blockSignals(True)
+                            self.in_combo.setCurrentIndex(idx_def_in)
+                            self.in_combo.blockSignals(False)
+                except Exception as e_def_in:
+                    if self.stream_out_a is not None:
+                        try:
+                            self.stream_out_a.stop()
+                            self.stream_out_a.close()
+                        except Exception:
+                            pass
+                        self.stream_out_a = None
+                        self.stream = None
+                    print(f"[ERROR] No se pudo abrir Entrada 1 ni por defecto: {e_def_in}")
+                    return
+            else:
+                if self.stream_out_a is not None:
+                    try:
+                        self.stream_out_a.stop()
+                        self.stream_out_a.close()
+                    except Exception:
+                        pass
+                    self.stream_out_a = None
+                    self.stream = None
+                return
+
+        # Iniciar streams principales
+        try:
+            self.stream_out_a.start()
+            self.stream_in1.start()
+        except Exception as e_start:
+            print(f"[WARN] Error al iniciar streams principales: {e_start}")
+
+        # 3. Apertura de Salida Secundaria (Bus B - 3,4) si está seleccionada
         if out_b_dev is not None and out_b_dev != out_dev:
             try:
-                self.stream_out_b = sd.OutputStream(
-                    samplerate=self.current_sr,
+                self.stream_out_b, _, _ = self._open_stream_safe(
+                    sd.OutputStream,
+                    out_b_dev,
+                    preferred_sr=self.current_sr,
                     blocksize=self.audio_block_size,
-                    device=out_b_dev,
-                    channels=2,
-                    dtype="float32",
                     callback=self.audio_callback_out_b,
+                    max_ch=2,
                 )
                 self.stream_out_b.start()
-            except Exception as e:
+            except Exception as e_b:
                 self.stream_out_b = None
-                QMessageBox.warning(
-                    self,
-                    "Aviso de Salida Secundaria (Bus B)",
-                    f"No se pudo iniciar la Salida Secundaria (Bus B) en el dispositivo seleccionado:\n{e}",
-                )
+                print(f"[WARN] No se pudo iniciar Salida Secundaria (Bus B): {e_b}")
+
+        # 4. Input 2 (Aux / Mic)
+        self._restart_in2_stream()
+
+        # 5. Sincronizar retardo y Auto-Sync
+        self.delay_bus_a.set_sample_rate(self.current_sr)
+        self.delay_bus_b.set_sample_rate(self.current_sr)
+
+        if hasattr(self, "delay_out1_spin"):
+            if self.stream_out_b is not None:
+                self.delay_out1_spin.setEnabled(True)
+                self.delay_out2_spin.setEnabled(True)
+                if hasattr(self, "auto_sync_btn"):
+                    self.auto_sync_btn.setEnabled(True)
+                self.recalculate_auto_sync_delay(force=False)
+            else:
+                self.delay_out1_spin.setEnabled(False)
+                self.delay_out2_spin.setEnabled(False)
+                if hasattr(self, "auto_sync_btn"):
+                    self.auto_sync_btn.setEnabled(False)
 
         # Actualizar frecuencia de muestreo de las líneas de retardo estéreo
         self.delay_bus_a.set_sample_rate(self.current_sr)
@@ -5116,25 +5345,22 @@ class AudioAnalyzerApp(QMainWindow):
             self._out2_drawn_at_rest = False
 
     def closeEvent(self, event):
-        if self.stream is not None:
-            try:
-                self.stream.stop()
-                self.stream.close()
-            except Exception:
-                pass
-        if self.stream_out_b is not None:
-            try:
-                self.stream_out_b.stop()
-                self.stream_out_b.close()
-            except Exception:
-                pass
-        if hasattr(self, "stream_in2") and self.stream_in2 is not None:
-            try:
-                self.stream_in2.stop()
-                self.stream_in2.close()
-            except Exception:
-                pass
-        if self.config_save_timer.isActive():
+        for s in (
+            getattr(self, "stream_in1", None),
+            getattr(self, "stream_out_a", None),
+            getattr(self, "stream", None),
+            getattr(self, "stream_out_b", None),
+            getattr(self, "stream_in2", None),
+        ):
+            if s is not None:
+                try:
+                    s.stop()
+                    s.close()
+                except Exception:
+                    pass
+        if hasattr(self, "timer") and self.timer.isActive():
+            self.timer.stop()
+        if hasattr(self, "config_save_timer") and self.config_save_timer.isActive():
             self.config_save_timer.stop()
         self.save_app_config()
         event.accept()
