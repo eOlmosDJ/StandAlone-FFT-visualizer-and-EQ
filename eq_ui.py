@@ -4489,16 +4489,22 @@ class AutoGainMiniBar(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedSize(58, 26)
+        self.setFixedSize(78, 26)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setToolTip("Auto-Gain (Compensación de Loudness)\nClic para Activar / Desactivar")
+        self.setToolTip("Auto-Gain Independiente (Out A | Out B)\nClic para Activar / Desactivar")
         self._enabled = False
-        self._ag_db = 0.0
+        self._ag_a_db = 0.0
+        self._ag_b_db = 0.0
 
-    def set_state(self, enabled: bool, ag_db: float):
-        changed = (self._enabled != enabled) or (abs(self._ag_db - ag_db) > 0.05)
+    def set_state(self, enabled: bool, ag_a_db: float, ag_b_db: float = 0.0):
+        changed = (
+            (self._enabled != enabled)
+            or (abs(self._ag_a_db - ag_a_db) > 0.05)
+            or (abs(self._ag_b_db - ag_b_db) > 0.05)
+        )
         self._enabled = enabled
-        self._ag_db = float(np.clip(ag_db, -12.0, 12.0))
+        self._ag_a_db = float(np.clip(ag_a_db, -12.0, 12.0))
+        self._ag_b_db = float(np.clip(ag_b_db, -12.0, 12.0))
         if changed:
             self.update()
 
@@ -4508,54 +4514,53 @@ class AutoGainMiniBar(QWidget):
             self.toggled.emit(self._enabled)
             self.update()
 
+    def _draw_bipolar_rail(self, p: QPainter, x: float, y: float, w: float, h: float, val_db: float):
+        mid_y = y + h * 0.5
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(10, 12, 16, 220))
+        p.drawRoundedRect(QRectF(x, y, w, h), 1.5, 1.5)
+
+        if self._enabled and abs(val_db) > 0.05:
+            norm = min(1.0, abs(val_db) / 12.0)
+            fill_h = max(2.0, norm * (h * 0.5))
+            if val_db < 0:
+                p.setBrush(QColor(0, 229, 255, 230))
+                p.drawRoundedRect(QRectF(x, mid_y, w, fill_h), 1.5, 1.5)
+            else:
+                p.setBrush(QColor(0, 230, 118, 230))
+                p.drawRoundedRect(QRectF(x, mid_y - fill_h, w, fill_h), 1.5, 1.5)
+
+        p.setPen(QPen(QColor(255, 255, 255, 130), 1.0))
+        p.drawLine(QPointF(x - 0.5, mid_y), QPointF(x + w + 0.5, mid_y))
+
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         w, h = self.width(), self.height()
 
-        # Fondo de cápsula oscura haciendo juego con el mini-osciloscopio
         bg_color = QColor(20, 26, 36, 220) if self._enabled else QColor(18, 20, 26, 180)
         border_color = QColor(0, 229, 255, 150) if self._enabled else QColor(255, 255, 255, 35)
         p.setPen(QPen(border_color, 1.0))
         p.setBrush(bg_color)
         p.drawRoundedRect(QRectF(0.5, 0.5, w - 1.0, h - 1.0), 8.0, 8.0)
 
-        # Riel vertical de la barrita bipolar (tipo Threshold del Dynamic EQ)
-        bar_x, bar_y, bar_w, bar_h = 6.0, 4.0, 6.0, h - 8.0
-        mid_y = bar_y + bar_h * 0.5
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor(10, 12, 16, 220))
-        p.drawRoundedRect(QRectF(bar_x, bar_y, bar_w, bar_h), 2.0, 2.0)
+        # Dos rieles paralelos: Izquierdo (Out A) y Derecho (Out B)
+        self._draw_bipolar_rail(p, 5.0, 4.0, 4.5, h - 8.0, self._ag_a_db)
+        self._draw_bipolar_rail(p, 11.5, 4.0, 4.5, h - 8.0, self._ag_b_db)
 
-        # Relleno desde el centro (0 dB) hacia arriba (+dB) o hacia abajo (-dB)
-        if self._enabled and abs(self._ag_db) > 0.05:
-            norm = min(1.0, abs(self._ag_db) / 12.0)
-            fill_h = max(2.0, norm * (bar_h * 0.5))
-            if self._ag_db < 0:
-                # Atenuando (Cian)
-                p.setBrush(QColor(0, 229, 255, 230))
-                p.drawRoundedRect(QRectF(bar_x, mid_y, bar_w, fill_h), 2.0, 2.0)
-            else:
-                # Compensando hacia arriba (Verde Esmeralda)
-                p.setBrush(QColor(0, 230, 118, 230))
-                p.drawRoundedRect(QRectF(bar_x, mid_y - fill_h, bar_w, fill_h), 2.0, 2.0)
-
-        # Marca blanca central de 0 dB
-        p.setPen(QPen(QColor(255, 255, 255, 130), 1.0))
-        p.drawLine(QPointF(bar_x - 1, mid_y), QPointF(bar_x + bar_w + 1, mid_y))
-
-        # Texto compacto a la derecha de la barrita
         font = p.font()
-        font.setPixelSize(9)
+        font.setPixelSize(8)
         font.setBold(True)
         p.setFont(font)
+
         if not self._enabled:
             p.setPen(QColor(140, 150, 165))
-            p.drawText(QRectF(15, 0, w - 17, h), Qt.AlignmentFlag.AlignCenter, "AG OFF")
+            p.drawText(QRectF(18, 0, w - 20, h), Qt.AlignmentFlag.AlignCenter, "AG OFF")
         else:
-            txt_color = QColor(0, 229, 255) if self._ag_db <= 0 else QColor(0, 230, 118)
-            p.setPen(txt_color)
-            p.drawText(QRectF(14, 0, w - 16, h), Qt.AlignmentFlag.AlignCenter, f"{self._ag_db:+.1f}dB")
+            p.setPen(QColor(0, 229, 255) if self._ag_a_db <= 0 else QColor(0, 230, 118))
+            p.drawText(QRectF(18, 2, w - 20, 11), Qt.AlignmentFlag.AlignCenter, f"A:{self._ag_a_db:+.1f}")
+            p.setPen(QColor(0, 229, 255) if self._ag_b_db <= 0 else QColor(0, 230, 118))
+            p.drawText(QRectF(18, 13, w - 20, 11), Qt.AlignmentFlag.AlignCenter, f"B:{self._ag_b_db:+.1f}")
 
 
 class CrossoverMenuWidget(QWidget):

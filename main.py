@@ -1123,13 +1123,13 @@ class WaveformOverlayWidget(QWidget):
         """)
         self.btn_scope_autogain.toggled.connect(self._on_autogain_toggled)
 
-        self.lbl_scope_ag = QLabel("AG: 0.0 dB", self)
-        self.lbl_scope_ag.setFixedSize(72, 20)
+        self.lbl_scope_ag = QLabel("AG: OFF", self)
+        self.lbl_scope_ag.setFixedSize(130, 20)
         self.lbl_scope_ag.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
         self.lbl_scope_ag.setStyleSheet("""
             QLabel {
                 color: #8C96A5;
-                font-size: 10px;
+                font-size: 9px;
                 font-weight: 600;
                 background: transparent;
             }
@@ -1245,7 +1245,7 @@ class WaveformOverlayWidget(QWidget):
             self.lbl_scope_ag.move(484, 2)
             self.lbl_scope_ag.raise_()
         if hasattr(self, "dur_btn"):
-            self.dur_btn.move(560, 2)
+            self.dur_btn.move(620, 2)
             self.dur_btn.raise_()
 
     def showEvent(self, event):
@@ -1267,7 +1267,7 @@ class WaveformOverlayWidget(QWidget):
             self.lbl_scope_ag.move(484, 2)
             self.lbl_scope_ag.raise_()
         if hasattr(self, "dur_btn"):
-            self.dur_btn.move(560, 2)
+            self.dur_btn.move(620, 2)
             self.dur_btn.raise_()
 
     def mousePressEvent(self, event):
@@ -2312,6 +2312,10 @@ class AudioAnalyzerApp(QMainWindow):
         )
         self.rta_ring_buffer = np.zeros(self.fft_size, dtype=np.float32)
         self.autogain_enabled = False
+        self.target_autogain_a_db = 0.0
+        self.target_autogain_b_db = 0.0
+        self.current_autogain_a_db = 0.0
+        self.current_autogain_b_db = 0.0
         self.target_autogain_db = 0.0
         self.current_autogain_db = 0.0
         self.scope_buffer = WaveformEnvelopeBuffer(sample_rate=self.current_sr, block_size=self.audio_block_size)
@@ -3364,14 +3368,26 @@ class AudioAnalyzerApp(QMainWindow):
         self.eq_overlay.update_eq_curves(force=True)
         self.schedule_config_save()
 
+    def compute_single_band_db_at_freqs(self, band, freqs: np.ndarray) -> np.ndarray:
+        if hasattr(self, "eq_engine") and hasattr(self.eq_engine, "compute_single_band_db_at_freqs"):
+            return self.eq_engine.compute_single_band_db_at_freqs(band, freqs)
+        sr = getattr(self, "current_sr", 48000.0)
+        w = 2.0 * np.pi * freqs / sr
+        z1 = np.exp(-1j * w)
+        z2 = np.exp(-2j * w)
+        return eval_sos_mag_db_fast(band.sos_static, z1, z2)
+
     def _on_autogain_toggled(self, enabled: bool):
         self.autogain_enabled = bool(enabled)
-        if hasattr(self, "eq_engine"):
+        if hasattr(self, "eq_engine") and self.eq_engine is not None:
             self.eq_engine.autogain_enabled = bool(enabled)
-            self.eq_engine.recalculate_autogain_target()
-            self.target_autogain_db = self.eq_engine.target_autogain_db
+        if hasattr(self, "eq_proc_in1") and self.eq_proc_in1 is not None:
+            self.eq_proc_in1.autogain_enabled = bool(enabled)
+        if hasattr(self, "eq_proc_in2") and self.eq_proc_in2 is not None:
+            self.eq_proc_in2.autogain_enabled = bool(enabled)
+        self.recalculate_autogain_target()
         if hasattr(self, "autogain_mini_bar") and self.autogain_mini_bar._enabled != enabled:
-            self.autogain_mini_bar.set_state(bool(enabled), getattr(self.eq_engine, "current_autogain_db", 0.0))
+            self.autogain_mini_bar.set_state(bool(enabled), getattr(self, "current_autogain_a_db", 0.0), getattr(self, "current_autogain_b_db", 0.0))
         if hasattr(self, "scope_overlay") and hasattr(self.scope_overlay, "btn_scope_autogain"):
             self.scope_overlay.btn_scope_autogain.blockSignals(True)
             self.scope_overlay.btn_scope_autogain.setChecked(bool(enabled))
@@ -3380,14 +3396,63 @@ class AudioAnalyzerApp(QMainWindow):
 
     def recalculate_autogain_target(self):
         ag_en = getattr(self, "autogain_enabled", False)
+        if not ag_en or getattr(self, "bypass_eq", False):
+            self.target_autogain_a_db = 0.0
+            self.target_autogain_b_db = 0.0
+            self.target_autogain_db = 0.0
+            if hasattr(self, "eq_engine") and self.eq_engine is not None:
+                self.eq_engine.autogain_enabled = ag_en
+                self.eq_engine.target_autogain_a_db = 0.0
+                self.eq_engine.target_autogain_b_db = 0.0
+                self.eq_engine.target_autogain_db = 0.0
+            if hasattr(self, "eq_proc_in1") and self.eq_proc_in1 is not None:
+                self.eq_proc_in1.autogain_enabled = ag_en
+                self.eq_proc_in1.target_autogain_a_db = 0.0
+                self.eq_proc_in1.target_autogain_b_db = 0.0
+                self.eq_proc_in1.target_autogain_db = 0.0
+            if hasattr(self, "eq_proc_in2") and self.eq_proc_in2 is not None:
+                self.eq_proc_in2.autogain_enabled = ag_en
+                self.eq_proc_in2.target_autogain_a_db = 0.0
+                self.eq_proc_in2.target_autogain_b_db = 0.0
+                self.eq_proc_in2.target_autogain_db = 0.0
+            return
+
+        freqs = np.geomspace(60.0, 12000.0, 32)
+        db_curve_a = np.zeros_like(freqs, dtype=float)
+        db_curve_b = np.zeros_like(freqs, dtype=float)
+
+        # Recorre las bandas activas de las entradas que van a cada bus
+        for b in getattr(self, "bands", []):
+            if not getattr(b, "enabled", True):
+                continue
+            bus = str(getattr(b, "output_bus", getattr(b, "target_output", "A+B"))).upper()
+            band_resp_db = self.compute_single_band_db_at_freqs(b, freqs)
+            if "A" in bus:
+                db_curve_a += band_resp_db
+            if "B" in bus:
+                db_curve_b += band_resp_db
+
+        mean_a = float(np.mean(db_curve_a))
+        mean_b = float(np.mean(db_curve_b))
+        self.target_autogain_a_db = float(np.clip(-mean_a * 0.85, -12.0, 12.0))
+        self.target_autogain_b_db = float(np.clip(-mean_b * 0.85, -12.0, 12.0))
+        self.target_autogain_db = self.target_autogain_a_db
+
         if hasattr(self, "eq_engine") and self.eq_engine is not None:
             self.eq_engine.autogain_enabled = ag_en
-            self.eq_engine.recalculate_autogain_target()
-            self.target_autogain_db = float(self.eq_engine.target_autogain_db)
+            self.eq_engine.target_autogain_a_db = self.target_autogain_a_db
+            self.eq_engine.target_autogain_b_db = self.target_autogain_b_db
+            self.eq_engine.target_autogain_db = self.target_autogain_a_db
         if hasattr(self, "eq_proc_in1") and self.eq_proc_in1 is not None:
             self.eq_proc_in1.autogain_enabled = ag_en
+            self.eq_proc_in1.target_autogain_a_db = self.target_autogain_a_db
+            self.eq_proc_in1.target_autogain_b_db = self.target_autogain_b_db
+            self.eq_proc_in1.target_autogain_db = self.target_autogain_a_db
         if hasattr(self, "eq_proc_in2") and self.eq_proc_in2 is not None:
             self.eq_proc_in2.autogain_enabled = ag_en
+            self.eq_proc_in2.target_autogain_a_db = self.target_autogain_a_db
+            self.eq_proc_in2.target_autogain_b_db = self.target_autogain_b_db
+            self.eq_proc_in2.target_autogain_db = self.target_autogain_a_db
 
     def _show_crossover_menu(self):
         if self._crossover_menu is None:
@@ -4576,17 +4641,25 @@ class AudioAnalyzerApp(QMainWindow):
                 self.rta_measuring = False
                 self.rta_measurement_done = True
 
-        # 5. Compensador de Loudness (Auto-Gain)
-        peak_sig = max(float(np.max(np.abs(out_A))), float(np.max(np.abs(out_B))))
-        if getattr(self, "autogain_enabled", False) and peak_sig > 0.001:
-            self.current_autogain_db += 0.12 * (self.target_autogain_db - self.current_autogain_db)
-        else:
-            self.current_autogain_db += 0.12 * (0.0 - self.current_autogain_db)
+        # 5. Compensador de Loudness (Auto-Gain Independiente por Bus A y B)
+        if getattr(self, "autogain_enabled", False) and not getattr(self, "bypass_eq", False):
+            peak_a = float(np.max(np.abs(out_A))) if out_A.size else 0.0
+            peak_b = float(np.max(np.abs(out_B))) if out_B.size else 0.0
 
-        if abs(self.current_autogain_db) > 0.02:
-            ag_lin = 10.0 ** (self.current_autogain_db / 20.0)
-            out_A *= ag_lin
-            out_B *= ag_lin
+            target_a = self.target_autogain_a_db if peak_a > 0.001 else 0.0
+            target_b = self.target_autogain_b_db if peak_b > 0.001 else 0.0
+        else:
+            target_a = 0.0
+            target_b = 0.0
+
+        self.current_autogain_a_db += 0.12 * (target_a - self.current_autogain_a_db)
+        self.current_autogain_b_db += 0.12 * (target_b - self.current_autogain_b_db)
+        self.current_autogain_db = self.current_autogain_a_db
+
+        if abs(self.current_autogain_a_db) > 0.02:
+            out_A = out_A * (10.0 ** (self.current_autogain_a_db / 20.0))
+        if abs(self.current_autogain_b_db) > 0.02:
+            out_B = out_B * (10.0 ** (self.current_autogain_b_db / 20.0))
 
         # 6. Crossover Digital de Salidas (Out A / Out B)
         if hasattr(self, "crossover") and self.crossover.enabled:
@@ -4794,18 +4867,19 @@ class AudioAnalyzerApp(QMainWindow):
 
         # Actualiza estado y medición de Auto-Gain
         ag_en = getattr(self, "autogain_enabled", False)
-        ag_val = getattr(self, "current_autogain_db", 0.0)
+        ag_a = getattr(self, "current_autogain_a_db", 0.0)
+        ag_b = getattr(self, "current_autogain_b_db", 0.0)
         if hasattr(self, "autogain_mini_bar"):
-            self.autogain_mini_bar.set_state(ag_en, ag_val)
+            self.autogain_mini_bar.set_state(ag_en, ag_a, ag_b)
         if hasattr(self, "scope_overlay") and hasattr(self.scope_overlay, "lbl_scope_ag"):
-            txt = f"AG: {ag_val:+.1f} dB" if ag_en else "AG: OFF"
+            txt = f"AG A:{ag_a:+.1f} | B:{ag_b:+.1f} dB" if ag_en else "AG: OFF"
             if self.scope_overlay.lbl_scope_ag.text() != txt:
                 self.scope_overlay.lbl_scope_ag.setText(txt)
                 if ag_en:
-                    c = "#00E5FF" if ag_val <= 0 else "#00E676"
-                    self.scope_overlay.lbl_scope_ag.setStyleSheet(f"color: {c}; font-size: 10px; font-weight: 600; background: transparent;")
+                    c = "#00E676" if (ag_a > 0 or ag_b > 0) else "#00E5FF"
+                    self.scope_overlay.lbl_scope_ag.setStyleSheet(f"color: {c}; font-size: 9px; font-weight: 600; background: transparent;")
                 else:
-                    self.scope_overlay.lbl_scope_ag.setStyleSheet("color: #8C96A5; font-size: 10px; font-weight: 600; background: transparent;")
+                    self.scope_overlay.lbl_scope_ag.setStyleSheet("color: #8C96A5; font-size: 9px; font-weight: 600; background: transparent;")
 
         gr_db = float(min(self.eq_proc_in1.limiter_a.last_gr_db, self.eq_proc_in1.limiter_b.last_gr_db))
 

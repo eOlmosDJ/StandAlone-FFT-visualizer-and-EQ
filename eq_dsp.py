@@ -805,6 +805,10 @@ class ParametricEQEngine:
         self.static_version = 1
         self.bands: list[EQBand] = []
         self.autogain_enabled = False
+        self.target_autogain_a_db = 0.0
+        self.target_autogain_b_db = 0.0
+        self.current_autogain_a_db = 0.0
+        self.current_autogain_b_db = 0.0
         self.target_autogain_db = 0.0
         self.current_autogain_db = 0.0
         self.init_default_bands()
@@ -827,14 +831,42 @@ class ParametricEQEngine:
                     total_db += eval_sos_mag_db_fast(b.sos_static, z1, z2)
             return total_db
 
+    def compute_single_band_db_at_freqs(self, band: EQBand, freqs: np.ndarray) -> np.ndarray:
+        w = 2.0 * np.pi * freqs / self.sr
+        z1 = np.exp(-1j * w)
+        z2 = np.exp(-2j * w)
+        return eval_sos_mag_db_fast(band.sos_static, z1, z2)
+
     def recalculate_autogain_target(self):
         if not getattr(self, "autogain_enabled", False) or getattr(self, "bypass", False) or getattr(self, "bypass_eq", False):
+            self.target_autogain_a_db = 0.0
+            self.target_autogain_b_db = 0.0
             self.target_autogain_db = 0.0
             return
-        freqs = np.geomspace(30.0, 16000.0, 48)
-        total_db = self.compute_combined_eq_db_at_freqs(freqs)
-        mean_eq_db = float(np.mean(total_db))
-        self.target_autogain_db = float(np.clip(-mean_eq_db * 0.85, -12.0, 12.0))
+
+        freqs = np.geomspace(60.0, 12000.0, 32)
+        db_curve_a = np.zeros_like(freqs, dtype=float)
+        db_curve_b = np.zeros_like(freqs, dtype=float)
+
+        with self.lock:
+            w = 2.0 * np.pi * freqs / self.sr
+            z1 = np.exp(-1j * w)
+            z2 = np.exp(-2j * w)
+            for b in self.bands:
+                if not getattr(b, "enabled", True):
+                    continue
+                bus = str(getattr(b, "output_bus", getattr(b, "target_output", "A+B"))).upper()
+                band_resp_db = eval_sos_mag_db_fast(b.sos_static, z1, z2)
+                if "A" in bus:
+                    db_curve_a += band_resp_db
+                if "B" in bus:
+                    db_curve_b += band_resp_db
+
+        mean_a = float(np.mean(db_curve_a))
+        mean_b = float(np.mean(db_curve_b))
+        self.target_autogain_a_db = float(np.clip(-mean_a * 0.85, -12.0, 12.0))
+        self.target_autogain_b_db = float(np.clip(-mean_b * 0.85, -12.0, 12.0))
+        self.target_autogain_db = self.target_autogain_a_db
 
     def set_isolated_band(self, index: int | None):
         """Activa o desactiva el modo Isolate (Solo de Frecuencia Band-Pass) sobre la banda `index`."""
@@ -1161,16 +1193,23 @@ class ParametricEQEngine:
 
             # --- AUTO-GAIN (Compensación de Loudness Post-EQ / Pre-Limitador) ---
             if apply_autogain:
-                peak_sig = max(float(np.max(np.abs(out_A))), float(np.max(np.abs(out_B))))
-                if self.autogain_enabled and peak_sig > 0.001:
-                    self.current_autogain_db += 0.12 * (self.target_autogain_db - self.current_autogain_db)
+                if getattr(self, "autogain_enabled", False) and not getattr(self, "bypass_eq", False):
+                    peak_a = float(np.max(np.abs(out_A))) if out_A.size else 0.0
+                    peak_b = float(np.max(np.abs(out_B))) if out_B.size else 0.0
+                    target_a = self.target_autogain_a_db if peak_a > 0.001 else 0.0
+                    target_b = self.target_autogain_b_db if peak_b > 0.001 else 0.0
                 else:
-                    self.current_autogain_db += 0.12 * (0.0 - self.current_autogain_db)
+                    target_a = 0.0
+                    target_b = 0.0
 
-                if abs(self.current_autogain_db) > 0.02:
-                    ag_lin = 10.0 ** (self.current_autogain_db / 20.0)
-                    out_A *= ag_lin
-                    out_B *= ag_lin
+                self.current_autogain_a_db += 0.12 * (target_a - self.current_autogain_a_db)
+                self.current_autogain_b_db += 0.12 * (target_b - self.current_autogain_b_db)
+                self.current_autogain_db = self.current_autogain_a_db
+
+                if abs(self.current_autogain_a_db) > 0.02:
+                    out_A *= (10.0 ** (self.current_autogain_a_db / 20.0))
+                if abs(self.current_autogain_b_db) > 0.02:
+                    out_B *= (10.0 ** (self.current_autogain_b_db / 20.0))
 
             if apply_limiter:
                 out_A = self.limiter_a.process(out_A)
