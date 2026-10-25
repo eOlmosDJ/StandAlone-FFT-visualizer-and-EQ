@@ -1446,6 +1446,9 @@ class DualOutputCrossover:
         self._sos_hp = new_sos_hp
 
     def _fast_filter_block(self, sos: np.ndarray, blk: np.ndarray, zi: np.ndarray) -> np.ndarray:
+        frames = blk.shape[0] if blk.ndim > 0 else 0
+        if frames == 0:
+            return blk
         if _c_sosfilt is not None:
             n_ch = blk.shape[1] if blk.ndim > 1 else 1
             if blk.ndim == 1 or n_ch == 1:
@@ -1453,9 +1456,16 @@ class DualOutputCrossover:
                 _c_sosfilt(sos, col, zi[0:1])
                 return col[0].astype(np.float32, copy=False)
             else:
-                x_c = np.ascontiguousarray(blk[:, 0:2].T, dtype=np.float64)
-                _c_sosfilt(sos, x_c, zi)
-                return x_c.T.astype(np.float32, copy=False)
+                if not hasattr(self, "_buf_f64") or self._buf_f64.shape != (2, frames):
+                    self._buf_f64 = np.zeros((2, frames), dtype=np.float64)
+                    self._buf_f32 = np.zeros((frames, 2), dtype=np.float32)
+
+                self._buf_f64[0, :] = blk[:, 0]
+                self._buf_f64[1, :] = blk[:, 1]
+                _c_sosfilt(sos, self._buf_f64, zi)
+                self._buf_f32[:, 0] = self._buf_f64[0]
+                self._buf_f32[:, 1] = self._buf_f64[1]
+                return self._buf_f32.copy()
         else:
             zi_sc = np.moveaxis(zi, 0, -1)
             proc, zi_out = sosfilt(sos, blk, axis=0, zi=zi_sc)

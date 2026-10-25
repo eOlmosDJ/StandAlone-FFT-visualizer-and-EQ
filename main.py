@@ -333,6 +333,9 @@ class WaveformEnvelopeBuffer:
             return False
 
         any_active = False
+        mins_list = []
+        maxs_list = []
+
         for i in range(n_blocks):
             # 1. Pre-EQ (Input)
             if pre_blocks and i < len(pre_blocks) and pre_blocks[i] is not None:
@@ -392,15 +395,26 @@ class WaveformEnvelopeBuffer:
                     return True
                 continue
 
-            self.is_at_rest = False
-            self.min_data[:, :-1] = self.min_data[:, 1:]
-            self.max_data[:, :-1] = self.max_data[:, 1:]
-            self.gr_data[:-1] = self.gr_data[1:]
+            mins_list.append(mins)
+            maxs_list.append(maxs)
 
-            self.min_data[:, -1] = np.clip(mins, -1.0, 1.0)
-            self.max_data[:, -1] = np.clip(maxs, -1.0, 1.0)
-            self.gr_data[-1] = float(np.clip(gr_db, -60.0, 0.0))
-            self.total_pushed += 1
+        k = len(mins_list)
+        if k > 0:
+            self.is_at_rest = False
+            mins_arr = np.column_stack(mins_list)
+            maxs_arr = np.column_stack(maxs_list)
+            if k >= self.capacity_10s:
+                self.min_data[:, :] = np.clip(mins_arr[:, -self.capacity_10s:], -1.0, 1.0)
+                self.max_data[:, :] = np.clip(maxs_arr[:, -self.capacity_10s:], -1.0, 1.0)
+                self.gr_data[:] = float(np.clip(gr_db, -60.0, 0.0))
+            else:
+                self.min_data[:, :-k] = self.min_data[:, k:]
+                self.max_data[:, :-k] = self.max_data[:, k:]
+                self.gr_data[:-k] = self.gr_data[k:]
+                self.min_data[:, -k:] = np.clip(mins_arr, -1.0, 1.0)
+                self.max_data[:, -k:] = np.clip(maxs_arr, -1.0, 1.0)
+                self.gr_data[-k:] = float(np.clip(gr_db, -60.0, 0.0))
+            self.total_pushed += k
 
         return not self.is_at_rest
 
@@ -4827,7 +4841,7 @@ class AudioAnalyzerApp(QMainWindow):
         if hasattr(self, "crossover") and self.crossover.enabled:
             # Si Out B no tiene ruteo independiente configurado pero el Crossover está activo,
             # alimenta Out B con el master de Out A para que el Sub reciba la señal de bajas frecuencias
-            if not self.route_in1_to_b and not self.route_in2_to_b and (float(np.max(np.abs(out_B))) < 1e-6):
+            if not self.route_in1_to_b and not self.route_in2_to_b:
                 out_B = out_A.copy()
             out_A, out_B = self.crossover.process_outputs(out_A, out_B)
 
@@ -4860,10 +4874,40 @@ class AudioAnalyzerApp(QMainWindow):
             self.ring_buffer_out_b.write(blk_b)
 
         # 9. Cola de renderizado visual a la UI (In 1, In 2, Out A, Out B)
-        try:
-            self.audio_queue.put_nowait((indata.copy(), self.in2_block.copy(), out_A.copy(), out_B.copy()))
-        except queue.Full:
-            pass
+        # Para tamaños de bloque micro (64 o 128 muestras), acumulamos hasta >=256 muestras (~180 Hz)
+        # para eliminar el 80% de contención de cola y carga de recolección de basura
+        if not hasattr(self, "_vis_accum_count"):
+            self._vis_accum_count = 0
+            self._vis_in1_buf = []
+            self._vis_in2_buf = []
+            self._vis_outA_buf = []
+            self._vis_outB_buf = []
+
+        if frames < 256:
+            self._vis_accum_count += frames
+            self._vis_in1_buf.append(indata.copy())
+            self._vis_in2_buf.append(self.in2_block.copy())
+            self._vis_outA_buf.append(out_A.copy())
+            self._vis_outB_buf.append(out_B.copy())
+            if self._vis_accum_count >= 256:
+                try:
+                    c_in1 = np.concatenate(self._vis_in1_buf) if len(self._vis_in1_buf) > 1 else self._vis_in1_buf[0]
+                    c_in2 = np.concatenate(self._vis_in2_buf) if len(self._vis_in2_buf) > 1 else self._vis_in2_buf[0]
+                    c_outA = np.concatenate(self._vis_outA_buf) if len(self._vis_outA_buf) > 1 else self._vis_outA_buf[0]
+                    c_outB = np.concatenate(self._vis_outB_buf) if len(self._vis_outB_buf) > 1 else self._vis_outB_buf[0]
+                    self.audio_queue.put_nowait((c_in1, c_in2, c_outA, c_outB))
+                except (queue.Full, Exception):
+                    pass
+                self._vis_accum_count = 0
+                self._vis_in1_buf.clear()
+                self._vis_in2_buf.clear()
+                self._vis_outA_buf.clear()
+                self._vis_outB_buf.clear()
+        else:
+            try:
+                self.audio_queue.put_nowait((indata.copy(), self.in2_block.copy(), out_A.copy(), out_B.copy()))
+            except queue.Full:
+                pass
 
     def audio_callback_out_b(self, outdata, frames, time_info, status):
         if self.is_muted:
@@ -5076,11 +5120,10 @@ class AudioAnalyzerApp(QMainWindow):
             txt = f"AG A:{ag_a:+.1f} | B:{ag_b:+.1f} dB" if ag_en else "AG: OFF"
             if self.scope_overlay.lbl_scope_ag.text() != txt:
                 self.scope_overlay.lbl_scope_ag.setText(txt)
-                if ag_en:
-                    c = "#00E676" if (ag_a > 0 or ag_b > 0) else "#00E5FF"
-                    self.scope_overlay.lbl_scope_ag.setStyleSheet(f"color: {c}; font-size: 9px; font-weight: 600; background: transparent;")
-                else:
-                    self.scope_overlay.lbl_scope_ag.setStyleSheet("color: #8C96A5; font-size: 9px; font-weight: 600; background: transparent;")
+            target_c = ("#00E676" if (ag_a > 0 or ag_b > 0) else "#00E5FF") if ag_en else "#8C96A5"
+            if getattr(self, "_last_scope_ag_c", None) != target_c:
+                self._last_scope_ag_c = target_c
+                self.scope_overlay.lbl_scope_ag.setStyleSheet(f"color: {target_c}; font-size: 9px; font-weight: 600; background: transparent;")
 
         gr_db = float(min(self.eq_proc_in1.limiter_a.last_gr_db, self.eq_proc_in1.limiter_b.last_gr_db))
 

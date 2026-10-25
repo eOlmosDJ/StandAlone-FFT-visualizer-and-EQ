@@ -170,19 +170,33 @@ class FFTSpectrumAnalyzer:
 
     @staticmethod
     def _push_to_ring(ring: np.ndarray, blocks: list) -> tuple[np.ndarray, bool]:
+        if not blocks:
+            return ring, True
         fft_size = len(ring)
-        all_silent = True
-        for blk in blocks:
-            mono_blk = (blk[:, 0] + blk[:, 1]) * 0.5 if (blk.ndim > 1 and blk.shape[1] > 1) else (blk[:, 0] if blk.ndim > 1 else blk)
-            if all_silent and np.max(np.abs(mono_blk)) > 1e-5:
-                all_silent = False
-            n = len(mono_blk)
-            if n >= fft_size:
-                ring[:] = mono_blk[-fft_size:]
-            else:
-                ring[:-n] = ring[n:]
-                ring[-n:] = mono_blk
-        return ring, all_silent
+        if len(blocks) == 1:
+            blk = blocks[0]
+            if blk is None or len(blk) == 0:
+                return ring, True
+            mono = (blk[:, 0] + blk[:, 1]) * 0.5 if (blk.ndim > 1 and blk.shape[1] > 1) else (blk[:, 0] if blk.ndim > 1 else blk)
+        else:
+            mono_list = [
+                (blk[:, 0] + blk[:, 1]) * 0.5 if (blk.ndim > 1 and blk.shape[1] > 1) else (blk[:, 0] if blk.ndim > 1 else blk)
+                for blk in blocks if blk is not None and len(blk) > 0
+            ]
+            if not mono_list:
+                return ring, True
+            mono = np.concatenate(mono_list)
+
+        n = len(mono)
+        if n == 0:
+            return ring, True
+        is_silent = float(np.max(np.abs(mono))) <= 1e-5
+        if n >= fft_size:
+            ring[:] = mono[-fft_size:]
+        else:
+            ring[:-n] = ring[n:]
+            ring[-n:] = mono
+        return ring, is_silent
 
     def push_blocks(self, pre_blocks: list, post_blocks: list, post2_blocks: list = None):
         """Acumula bloques de audio en los 3 Ring Buffers (Input, Output 1, Output 2)."""
