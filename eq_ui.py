@@ -1539,12 +1539,26 @@ class CrossoverLineItem(pg.GraphicsObject):
         self._pen_hover.setCosmetic(True)
         self._font = QFont("Segoe UI", 9)
         self._font.setBold(True)
+        from PyQt6.QtGui import QFontMetricsF
+        self._fm = QFontMetricsF(self._font)
+        self._cached_txt = ""
+        self._cached_badge_w = 40.0
+        self._cached_badge_h = 20.0
+        self._update_label_cache()
         self._update_pos()
+
+    def _update_label_cache(self):
+        self._cached_txt = f"XOVER: {int(round(self.freq_hz))} Hz" if self.freq_hz < 1000.0 else f"XOVER: {self.freq_hz/1000.0:.1f} kHz"
+        tw = self._fm.horizontalAdvance(self._cached_txt)
+        th = self._fm.height()
+        self._cached_badge_w = tw + 14.0
+        self._cached_badge_h = th + 6.0
 
     def set_config(self, freq_hz: float, is_x_log: bool = True, clip_lim: float = 36.0):
         self.freq_hz = float(np.clip(freq_hz, 20.0, 20000.0))
         self.is_x_log = bool(is_x_log)
         self._clip_lim = float(clip_lim)
+        self._update_label_cache()
         self.prepareGeometryChange()
         self._update_pos()
         self.update()
@@ -1564,7 +1578,7 @@ class CrossoverLineItem(pg.GraphicsObject):
         painter.setPen(pen)
         painter.drawLine(QPointF(0.0, -self._clip_lim), QPointF(0.0, self._clip_lim))
 
-        # Badge de texto en coordenadas de pantalla para nitidez total
+        # Badge de texto en coordenadas de pantalla para nitidez total con métricas cacheadas
         painter.save()
         tr = painter.transform()
         painter.resetTransform()
@@ -1573,15 +1587,9 @@ class CrossoverLineItem(pg.GraphicsObject):
         px = center_scene_pt.x()
         py = 52.0  # Posición vertical elegante y siempre visible justo debajo de la barra superior
 
-        lbl_txt = f"XOVER: {int(round(self.freq_hz))} Hz" if self.freq_hz < 1000.0 else f"XOVER: {self.freq_hz/1000.0:.1f} kHz"
         painter.setFont(self._font)
-        from PyQt6.QtGui import QFontMetricsF
-        fm = QFontMetricsF(self._font)
-        tw = fm.horizontalAdvance(lbl_txt)
-        th = fm.height()
-
-        badge_w = tw + 14.0
-        badge_h = th + 6.0
+        badge_w = self._cached_badge_w
+        badge_h = self._cached_badge_h
         badge_rect = QRectF(px - badge_w * 0.5, py - badge_h * 0.5, badge_w, badge_h)
 
         border_color = QColor(255, 213, 79, 230) if (self.is_hovered or self.is_dragging) else QColor(255, 171, 64, 180)
@@ -1590,7 +1598,7 @@ class CrossoverLineItem(pg.GraphicsObject):
         painter.drawRoundedRect(badge_rect, 5.0, 5.0)
 
         painter.setPen(border_color)
-        painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, lbl_txt)
+        painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, self._cached_txt)
         painter.restore()
 
     def hoverEnterEvent(self, ev):
@@ -1620,6 +1628,7 @@ class CrossoverLineItem(pg.GraphicsObject):
             new_f = float(10.0 ** view_x if self.is_x_log else view_x)
             new_f = float(np.clip(new_f, 20.0, 20000.0))
             self.freq_hz = new_f
+            self._update_label_cache()
             self._update_pos()
             self.sigPositionChanged.emit(new_f)
             self.update()

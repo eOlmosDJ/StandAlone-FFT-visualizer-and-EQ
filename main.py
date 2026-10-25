@@ -2473,8 +2473,8 @@ class AudioAnalyzerApp(QMainWindow):
         # Curvas y línea interactiva del Crossover Digital de Salidas alojadas en el ViewBox de EQ
         # para alineación matemática exacta centrada en +-0 dB y 60 FPS estables sin sobrecosto de CPU
         self.fft_plot = self.plot_widget
-        pen_xover_a = pg.mkPen(color=QColor(0, 229, 255, 190), width=1.8, style=Qt.PenStyle.DashLine)
-        pen_xover_b = pg.mkPen(color=QColor(255, 171, 64, 190), width=1.8, style=Qt.PenStyle.DashLine)
+        pen_xover_a = pg.mkPen(color=QColor(0, 229, 255, 175), width=1.6, style=Qt.PenStyle.SolidLine)
+        pen_xover_b = pg.mkPen(color=QColor(255, 171, 64, 175), width=1.6, style=Qt.PenStyle.SolidLine)
         self.xover_curve_a = pg.PlotDataItem(pen=pen_xover_a, connect='finite')
         self.xover_curve_b = pg.PlotDataItem(pen=pen_xover_b, connect='finite')
         self.xover_curve_a.setZValue(15)
