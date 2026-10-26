@@ -40,6 +40,7 @@ except Exception:
 
 from eq_ui import (
     ProQ4Overlay, FloatingBandHUD, LiquidGlassButton, style_dark_combobox,
+    style_hud_spinbox, HUDPopupDialog, HUDPopupMenu,
     LimiterControlPopup, LimiterGRMiniWidget, MiniOscilloscopeWidget, CompactScopeGLWidget,
     AutoGainMiniBar, CrossoverMenuWidget, EditInputSelector, CrossoverLineItem
 )
@@ -838,20 +839,20 @@ class WaveformScopeWidget(QWidget):
             painter.drawRoundedRect(rect, r, r)
 
 
-class ScopeSignalSettingsPopup(QWidget):
+class ScopeSignalSettingsPopup(HUDPopupDialog):
     """
     Popup flotante no-modal para seleccionar qué señales se visualizan en el osciloscopio desplegado,
-    personalizar sus colores (vía QColorDialog) y ajustar la opacidad global de las curvas.
+    personalizar sus colores (vía QColorDialog) y ajustar la opacidad global de las curvas,
+    siguiendo el diseño translúcido del HUD y renderizado por GPU con OpenGL.
     """
 
     def __init__(self, overlay_widget: "WaveformOverlayWidget", parent=None):
-        super().__init__(parent, Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
+        super().__init__(parent=parent, accent_color="#00E5FF", corner_radius=10.0)
         self.overlay = overlay_widget
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
         self.setFixedWidth(460)
         self.setStyleSheet("""
             QWidget {
-                background-color: #181A20;
+                background: transparent;
                 color: #ECEFF4;
                 font-family: "Segoe UI", sans-serif;
                 font-size: 11px;
@@ -859,13 +860,14 @@ class ScopeSignalSettingsPopup(QWidget):
             QCheckBox {
                 color: #D8DEE9;
                 spacing: 6px;
+                font-weight: 600;
             }
             QCheckBox::indicator {
                 width: 13px;
                 height: 13px;
-                border: 1px solid #3E4452;
+                border: 1px solid rgba(62, 68, 82, 180);
                 border-radius: 3px;
-                background-color: #21252B;
+                background-color: rgba(16, 18, 24, 150);
             }
             QCheckBox::indicator:checked {
                 background-color: #00E5FF;
@@ -873,7 +875,7 @@ class ScopeSignalSettingsPopup(QWidget):
             }
             QSlider::groove:horizontal {
                 height: 4px;
-                background: #2B303C;
+                background: rgba(43, 48, 60, 200);
                 border-radius: 2px;
             }
             QSlider::sub-page:horizontal {
@@ -889,16 +891,18 @@ class ScopeSignalSettingsPopup(QWidget):
                 border-radius: 6px;
             }
             QPushButton#actionBtn {
-                background-color: #262B34;
-                color: #C0C5D0;
-                border: 1px solid #363C48;
-                border-radius: 4px;
+                background-color: rgba(16, 18, 24, 145);
+                color: #C5CDD9;
+                border: 1px solid rgba(62, 68, 82, 165);
+                border-radius: 5px;
                 padding: 3px 10px;
                 font-size: 10px;
+                font-weight: bold;
             }
             QPushButton#actionBtn:hover {
-                background-color: #323846;
+                background-color: rgba(0, 229, 255, 36);
                 color: #FFFFFF;
+                border-color: #00E5FF;
             }
         """)
 
@@ -1269,20 +1273,27 @@ class WaveformOverlayWidget(QWidget):
     def wheelEvent(self, event):
         event.accept()
 
+    def _get_interface_bg_color(self) -> QColor:
+        if self.app_ref and hasattr(self.app_ref, "theme") and isinstance(self.app_ref.theme, dict):
+            c = QColor(self.app_ref.theme.get("background", "#141414"))
+            if c.isValid():
+                return c
+        return QColor("#141414")
+
     def _draw_strip_bg(self, p: QPainter, x0: int, strip_w: int, h: int):
-        p.fillRect(x0, 0, strip_w, h, QColor("#101216"))
+        p.fillRect(x0, 0, strip_w, h, self._get_interface_bg_color())
         pad_t = 24
         pad_b = 20
         plot_h = max(10, h - pad_t - pad_b)
         mid_y = pad_t + plot_h // 2
         half_h = plot_h * 0.5
 
-        p.setPen(QPen(QColor("#1F232B"), 1))
+        p.setPen(QPen(QColor(255, 255, 255, 16), 1))
         for level in (-0.5, 0.5):
             y_g = int(round(mid_y - level * half_h))
             p.drawLine(x0, y_g, x0 + strip_w, y_g)
 
-        p.setPen(QPen(QColor("#3A404D"), 1))
+        p.setPen(QPen(QColor(255, 255, 255, 34), 1))
         p.drawLine(x0, mid_y, x0 + strip_w, mid_y)
 
     def _rebuild_hud_overlay_cache(self):
@@ -1304,8 +1315,8 @@ class WaveformOverlayWidget(QWidget):
         mid_y = pad_t + plot_h * 0.5
         half_h = plot_h * 0.5
 
-        # Máscaras laterales 100% opacas (#101216) y barras de leyenda
-        bg_col = QColor("#101216")
+        # Máscaras laterales sincronizadas con el color de fondo exacto del resto de la interfaz
+        bg_col = self._get_interface_bg_color()
         p.fillRect(0, 0, pad_l, h, bg_col)
         p.fillRect(w - pad_r, 0, pad_r, h, bg_col)
         p.fillRect(0, 0, w, pad_t, bg_col)
@@ -1619,6 +1630,14 @@ class SlimStereoMeter(QWidget):
 
         w = self.width()
         h = self.height()
+
+        # Fondo plano idéntico al del resto de la interfaz (sin bisel)
+        win = self.window()
+        bg_hex = "#141414"
+        if win is not None and hasattr(win, "theme") and isinstance(win.theme, dict):
+            bg_hex = win.theme.get("background", "#141414")
+        painter.fillRect(0, 0, w, h, QColor(bg_hex))
+
         top_pad = 6
         bot_pad = 6
         bar_h = max(10, h - top_pad - bot_pad)
@@ -1628,10 +1647,9 @@ class SlimStereoMeter(QWidget):
         x_l = (w - (2 * bar_w + gap)) // 2
         x_r = x_l + bar_w + gap
 
-        bg_color = QColor("#101010")
-        border_color = QColor("#2A2A2A")
-        painter.fillRect(x_l, top_pad, bar_w, bar_h, bg_color)
-        painter.fillRect(x_r, top_pad, bar_w, bar_h, bg_color)
+        track_color = QColor(255, 255, 255, 16)
+        painter.fillRect(x_l, top_pad, bar_w, bar_h, track_color)
+        painter.fillRect(x_r, top_pad, bar_w, bar_h, track_color)
 
         grad = QLinearGradient(0, top_pad + bar_h, 0, top_pad)
         grad.setColorAt(0.00, QColor("#12A84B"))
@@ -1653,9 +1671,6 @@ class SlimStereoMeter(QWidget):
                 pk_y = top_pad + int(round((1.0 - pk_ratio) * bar_h))
                 pk_color = QColor("#FF3B30") if pk > -1.0 else QColor("#FFE047")
                 painter.fillRect(x_pos, pk_y, bar_w, 2, pk_color)
-
-            painter.setPen(border_color)
-            painter.drawRect(x_pos, top_pad, bar_w - 1, bar_h - 1)
 
 
 class ColorSettingsDialog(QDialog):
@@ -2545,15 +2560,7 @@ class AudioAnalyzerApp(QMainWindow):
         self.crossover_btn.clicked.connect(self._show_crossover_menu)
         top_layout.addWidget(self.crossover_btn)
 
-        self._crossover_menu = QMenu(self)
-        self._crossover_menu.setStyleSheet("""
-            QMenu {
-                background-color: #14171F;
-                border: 1px solid #2A303C;
-                border-radius: 8px;
-                padding: 4px;
-            }
-        """)
+        self._crossover_menu = HUDPopupMenu(self, accent_color="#FFB300", corner_radius=10.0)
         action_xover = QWidgetAction(self._crossover_menu)
         self.crossover_widget = CrossoverMenuWidget(self._crossover_menu)
         self.crossover_widget.set_state(self.crossover_state)
@@ -2671,18 +2678,7 @@ class AudioAnalyzerApp(QMainWindow):
         self.schedule_config_save()
 
     def _show_background_color_menu(self):
-        menu = QMenu(self)
-        menu.setStyleSheet("""
-            QMenu {
-                background-color: #1C1C1C;
-                color: #ECEFF4;
-                border: 1px solid #363636;
-                padding: 4px;
-                font-size: 11px;
-            }
-            QMenu::item { padding: 5px 16px; border-radius: 3px; }
-            QMenu::item:selected { background-color: #2E3440; color: #FFFFFF; }
-        """)
+        menu = HUDPopupMenu(self, accent_color=self.theme.get("curve_out1", "#00E5FF"), corner_radius=9.0)
         hdr = menu.addAction("Color de Fondo")
         hdr.setEnabled(False)
         menu.addSeparator()
@@ -2722,12 +2718,11 @@ class AudioAnalyzerApp(QMainWindow):
             self._set_background_color(orig)
 
     def _build_audio_io_popup(self):
-        self.audio_popup = QDialog(self, Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
+        self.audio_popup = HUDPopupDialog(self, accent_color="#00E5FF", corner_radius=10.0)
         self.audio_popup.setStyleSheet("""
             QDialog {
-                background-color: #1C1C1C;
-                border: 1px solid #363636;
-                border-radius: 6px;
+                background: transparent;
+                border: none;
             }
             QLabel {
                 background: transparent;
@@ -2745,25 +2740,37 @@ class AudioAnalyzerApp(QMainWindow):
             QCheckBox::indicator {
                 width: 14px;
                 height: 14px;
-                border: 1px solid #4A5263;
+                border: 1px solid rgba(74, 82, 99, 185);
                 border-radius: 3px;
-                background-color: #1B1E28;
+                background-color: rgba(16, 18, 24, 150);
             }
             QCheckBox::indicator:checked {
                 background-color: #00E5FF;
                 border: 1px solid #33EBFF;
             }
-            QPushButton {
-                background-color: #262930;
+            QComboBox {
+                background-color: rgba(16, 18, 24, 155);
                 color: #ECEFF4;
-                border: 1px solid #3E4350;
-                border-radius: 4px;
+                border: 1px solid rgba(62, 68, 82, 175);
+                border-radius: 5px;
+                padding: 3px 8px;
+                font-size: 11px;
+                font-weight: 600;
+            }
+            QComboBox:hover {
+                border-color: #00E5FF;
+            }
+            QPushButton {
+                background-color: rgba(16, 18, 24, 145);
+                color: #ECEFF4;
+                border: 1px solid rgba(62, 68, 82, 165);
+                border-radius: 5px;
                 padding: 4px 10px;
                 font-size: 11px;
                 font-weight: bold;
             }
             QPushButton:hover {
-                background-color: #323742;
+                background-color: rgba(0, 229, 255, 36);
                 border-color: #00E5FF;
                 color: #FFFFFF;
             }
@@ -2882,22 +2889,8 @@ class AudioAnalyzerApp(QMainWindow):
 
         self.delay_out1_spin = PrecisionDelaySpinBox()
         self.delay_out1_spin.setValue(0.0)
-        self.delay_out1_spin.setFixedWidth(110)
-        self.delay_out1_spin.setStyleSheet("""
-            QDoubleSpinBox {
-                background-color: #181A20;
-                color: #00E5FF;
-                border: 1px solid #3A3F4B;
-                border-radius: 5px;
-                padding: 3px 6px;
-                font-size: 11px;
-                font-weight: bold;
-            }
-            QDoubleSpinBox:hover {
-                border-color: #00E5FF;
-                background-color: #20242D;
-            }
-        """)
+        self.delay_out1_spin.setFixedWidth(115)
+        style_hud_spinbox(self.delay_out1_spin, accent_color="#00E5FF")
         self.delay_out1_spin.valueChanged.connect(self._on_user_delay_a_changed)
         delay_a_layout.addWidget(self.delay_out1_spin)
 
@@ -2934,22 +2927,8 @@ class AudioAnalyzerApp(QMainWindow):
         grid.addWidget(QLabel("Delay Out 2 (B):"), 12, 0)
         self.delay_out2_spin = PrecisionDelaySpinBox()
         self.delay_out2_spin.setValue(0.0)
-        self.delay_out2_spin.setFixedWidth(110)
-        self.delay_out2_spin.setStyleSheet("""
-            QDoubleSpinBox {
-                background-color: #181A20;
-                color: #00E676;
-                border: 1px solid #3A3F4B;
-                border-radius: 5px;
-                padding: 3px 6px;
-                font-size: 11px;
-                font-weight: bold;
-            }
-            QDoubleSpinBox:hover {
-                border-color: #00E676;
-                background-color: #20242D;
-            }
-        """)
+        self.delay_out2_spin.setFixedWidth(115)
+        style_hud_spinbox(self.delay_out2_spin, accent_color="#00E676")
         self.delay_out2_spin.valueChanged.connect(self._on_user_delay_b_changed)
         grid.addWidget(self.delay_out2_spin, 12, 1, alignment=Qt.AlignmentFlag.AlignLeft)
 
@@ -2984,18 +2963,8 @@ class AudioAnalyzerApp(QMainWindow):
         self.rta_level_spin.setSuffix(" dB")
         self.rta_level_spin.setDecimals(1)
         self.rta_level_spin.setKeyboardTracking(False)
-        self.rta_level_spin.setFixedWidth(110)
-        self.rta_level_spin.setStyleSheet("""
-            QDoubleSpinBox {
-                background-color: #181A20;
-                color: #FFD740;
-                border: 1px solid #3A3F4B;
-                border-radius: 5px;
-                padding: 3px 6px;
-                font-size: 11px;
-                font-weight: bold;
-            }
-        """)
+        self.rta_level_spin.setFixedWidth(115)
+        style_hud_spinbox(self.rta_level_spin, accent_color="#FFD740")
         grid.addWidget(self.rta_level_spin, 17, 1, alignment=Qt.AlignmentFlag.AlignLeft)
 
         rta_btn_row = QHBoxLayout()
@@ -3130,13 +3099,12 @@ class AudioAnalyzerApp(QMainWindow):
         self.audio_popup.show()
 
     def _build_analyzer_popup(self):
-        """Panel del Analizador con FFT Samples, Curvas FFT (In, Out 1, Out 2) y Colores."""
-        self.analyzer_popup = QDialog(self, Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
+        """Panel del Analizador con FFT Samples, Curvas FFT (In, Out 1, Out 2) y Colores con diseño HUD + OpenGL."""
+        self.analyzer_popup = HUDPopupDialog(self, accent_color="#00E5FF", corner_radius=10.0)
         self.analyzer_popup.setStyleSheet("""
             QDialog {
-                background-color: #1C1C1C;
-                border: 1px solid #363636;
-                border-radius: 6px;
+                background: transparent;
+                border: none;
             }
             QLabel {
                 background: transparent;
@@ -3145,17 +3113,47 @@ class AudioAnalyzerApp(QMainWindow):
                 font-size: 11px;
                 font-weight: bold;
             }
-            QPushButton {
-                background-color: #262930;
+            QCheckBox {
                 color: #ECEFF4;
-                border: 1px solid #3E4350;
-                border-radius: 4px;
+                font-size: 11px;
+                font-weight: 600;
+                spacing: 6px;
+            }
+            QCheckBox::indicator {
+                width: 14px;
+                height: 14px;
+                border: 1px solid rgba(74, 82, 99, 185);
+                border-radius: 3px;
+                background-color: rgba(16, 18, 24, 150);
+            }
+            QCheckBox::indicator:checked {
+                background-color: #00E5FF;
+                border: 1px solid #33EBFF;
+            }
+            QComboBox {
+                background-color: rgba(16, 18, 24, 155);
+                color: #ECEFF4;
+                border: 1px solid rgba(62, 68, 82, 175);
+                border-radius: 5px;
+                padding: 3px 8px;
+                font-size: 11px;
+                font-weight: 600;
+            }
+            QComboBox:hover {
+                border-color: #00E5FF;
+            }
+            QPushButton {
+                background-color: rgba(16, 18, 24, 145);
+                color: #ECEFF4;
+                border: 1px solid rgba(62, 68, 82, 165);
+                border-radius: 5px;
                 padding: 5px 8px;
                 font-size: 11px;
+                font-weight: 600;
                 text-align: left;
             }
             QPushButton:hover {
-                background-color: #323742;
+                background-color: rgba(0, 229, 255, 36);
                 border-color: #00E5FF;
                 color: #FFFFFF;
             }
@@ -3228,6 +3226,7 @@ class AudioAnalyzerApp(QMainWindow):
         self.db_min_spin.setSingleStep(5)
         self.db_min_spin.setValue(self.db_min)
         self.db_min_spin.setSuffix(" dB")
+        style_hud_spinbox(self.db_min_spin, accent_color="#00E5FF")
         self.db_min_spin.valueChanged.connect(self.on_db_range_changed)
         grid.addWidget(self.db_min_spin, 4, 1)
 
@@ -3237,6 +3236,7 @@ class AudioAnalyzerApp(QMainWindow):
         self.db_max_spin.setSingleStep(5)
         self.db_max_spin.setValue(self.db_max)
         self.db_max_spin.setSuffix(" dB")
+        style_hud_spinbox(self.db_max_spin, accent_color="#00E5FF")
         self.db_max_spin.valueChanged.connect(self.on_db_range_changed)
         grid.addWidget(self.db_max_spin, 5, 1)
 
@@ -3496,12 +3496,11 @@ class AudioAnalyzerApp(QMainWindow):
 
     def _show_crossover_menu(self):
         if self._crossover_menu is None:
-            self._crossover_menu = QMenu(self)
+            self._crossover_menu = HUDPopupMenu(self, accent_color="#FFB300", corner_radius=10.0)
             self._crossover_menu.setStyleSheet("""
                 QMenu {
-                    background-color: #14171F;
-                    border: 1px solid #2A303C;
-                    border-radius: 8px;
+                    background-color: transparent;
+                    border: none;
                     padding: 4px;
                 }
             """)
@@ -3936,38 +3935,9 @@ class AudioAnalyzerApp(QMainWindow):
         self.schedule_config_save()
 
     def _show_presets_menu(self):
-        """Despliega el menú oscuro estilizado de Presets bajo el botón de la barra superior."""
-        menu = QMenu(self)
-        menu.setStyle(QStyleFactory.create("Fusion"))
-        menu.setStyleSheet("""
-            QMenu {
-                background-color: #14171F;
-                color: #ECEFF4;
-                border: 1px solid #2A303C;
-                border-radius: 6px;
-                padding: 4px 0px;
-                font-family: "Segoe UI", sans-serif;
-                font-size: 11px;
-            }
-            QMenu::item {
-                background-color: transparent;
-                padding: 5px 22px 5px 12px;
-                margin: 1px 4px;
-                border-radius: 4px;
-            }
-            QMenu::item:selected {
-                background-color: rgba(0, 229, 255, 0.22);
-                color: #FFFFFF;
-            }
-            QMenu::item:disabled {
-                color: #555D6E;
-            }
-            QMenu::separator {
-                height: 1px;
-                background-color: #2A303C;
-                margin: 4px 8px;
-            }
-        """)
+        """Despliega el menú HUD estilizado de Presets bajo el botón de la barra superior."""
+        c_eq_a = str(self.theme.get("curve_eq_a", "#FFD54F")) if hasattr(self, "theme") else "#FFD54F"
+        menu = HUDPopupMenu(self, accent_color=c_eq_a, corner_radius=8.0)
 
         # 1. Resetear EQ
         act_reset = menu.addAction("Resetear EQ Actual (Plano)")
@@ -3992,16 +3962,9 @@ class AudioAnalyzerApp(QMainWindow):
             return lambda: self._delete_preset_file(p)
 
         sub_load_all = menu.addMenu("Cargar Completo (EQ + Crossover)")
-        sub_load_all.setStyle(QStyleFactory.create("Fusion"))
-
         sub_load_eq = menu.addMenu("Cargar Solo EQ")
-        sub_load_eq.setStyle(QStyleFactory.create("Fusion"))
-
         sub_load_xover = menu.addMenu("Cargar Solo Crossover")
-        sub_load_xover.setStyle(QStyleFactory.create("Fusion"))
-
         sub_del = menu.addMenu("Eliminar Preset")
-        sub_del.setStyle(QStyleFactory.create("Fusion"))
 
         if not preset_files:
             for sm in (sub_load_all, sub_load_eq, sub_load_xover, sub_del):
@@ -4041,17 +4004,8 @@ class AudioAnalyzerApp(QMainWindow):
             self.showFullScreen()
 
     def show_context_menu(self, pos):
-        menu = QMenu(self)
-        menu.setStyleSheet("""
-            QMenu {
-                background-color: #1C1C1C;
-                color: #EEE;
-                border: 1px solid #363636;
-                padding: 4px;
-            }
-            QMenu::item { padding: 5px 18px; border-radius: 3px; }
-            QMenu::item:selected { background-color: #2E3440; color: #FFF; }
-        """)
+        c_out1 = str(self.theme.get("curve_out1", self.theme.get("curve", "#00E5FF"))) if hasattr(self, "theme") else "#00E5FF"
+        menu = HUDPopupMenu(self, accent_color=c_out1, corner_radius=8.0)
 
         act_add = menu.addAction("+ Añadir Banda EQ (Doble clic en gráfico)")
         act_add.triggered.connect(self.eq_panel._on_add_band)
@@ -4404,6 +4358,13 @@ class AudioAnalyzerApp(QMainWindow):
                 sw = getattr(self.scope_overlay, s_attr, None)
                 if sw is not None and hasattr(sw, "setActiveTintColor"):
                     sw.setActiveTintColor(c_out1_hex)
+            self.scope_overlay.invalidate_cache()
+        if hasattr(self, "stereo_meter"):
+            self.stereo_meter.update()
+        for pop_attr in ("audio_popup", "analyzer_popup"):
+            pop_w = getattr(self, pop_attr, None)
+            if pop_w is not None and hasattr(pop_w, "set_accent_color"):
+                pop_w.set_accent_color(c_out1_hex)
 
         self._update_curve_brush()
         self.plot_widget.showGrid(x=False, y=False)
@@ -5380,6 +5341,28 @@ class AudioAnalyzerApp(QMainWindow):
                 self._out1_was_shown = True
             if show_out2:
                 self._out2_was_shown = True
+
+        # Refrescar elementos HUD translúcidos visibles para que las curvas dinámicas FFT/EQ se vean en vivo a través del cristal
+        if hasattr(self, "eq_panel") and self.eq_panel.isVisible() and self.eq_panel._bg_gl_item is not None:
+            self.eq_panel._bg_gl_item.update()
+            self.eq_panel.update()
+        if hasattr(self, "eq_overlay") and hasattr(self.eq_overlay, "node_callout") and self.eq_overlay.node_callout.isVisible():
+            if self.eq_overlay.node_callout._bg_gl_item is not None:
+                self.eq_overlay.node_callout._bg_gl_item.update()
+            self.eq_overlay.node_callout.update()
+        if hasattr(self, "eq_overlay") and hasattr(self.eq_overlay, "fft_inspector") and self.eq_overlay.fft_inspector.isVisible():
+            self.eq_overlay.fft_inspector.update()
+        for pop_w in (
+            getattr(self, "audio_popup", None),
+            getattr(self, "analyzer_popup", None),
+            getattr(self, "_crossover_menu", None),
+            getattr(getattr(self, "scope_overlay", None), "settings_popup", None),
+            getattr(getattr(self, "scope_overlay", None), "limiter_popup", None),
+        ):
+            if pop_w is not None and pop_w.isVisible() and hasattr(pop_w, "_hud_gl"):
+                if pop_w._hud_gl._bg_gl_item is not None:
+                    pop_w._hud_gl._bg_gl_item.update()
+                pop_w.update()
 
 
     def closeEvent(self, event):

@@ -5,9 +5,9 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QComboBox, QFrame, QMenu, QColorDialog, QDialog, QToolTip,
     QGraphicsOpacityEffect, QListView, QSlider, QGraphicsPathItem, QGraphicsItem,
-    QApplication, QCheckBox, QDoubleSpinBox, QGridLayout, QWidgetAction
+    QApplication, QCheckBox, QDoubleSpinBox, QSpinBox, QGridLayout, QWidgetAction
 )
-from PyQt6.QtCore import Qt, QEvent, QPoint, QPointF, QRectF, pyqtSignal, QTimer
+from PyQt6.QtCore import Qt, QEvent, QObject, QPoint, QPointF, QRectF, pyqtSignal, QTimer
 from PyQt6.QtGui import (
     QColor, QFont, QPainter, QPainterPath, QPen, QBrush,
     QLinearGradient, QPolygonF, QPixmap, QImage, QIcon, QCursor
@@ -24,45 +24,495 @@ from eq_dsp import (
 )
 
 
-def style_dark_combobox(combo: QComboBox):
-    """Fuerza a PyQt6 a renderizar la lista desplegable internamente con estética oscura de alto contraste."""
+def _resolve_app_and_plot(widget: QWidget | None):
+    """Localiza el AudioAnalyzerApp principal, su plot_widget OpenGL y el eq_overlay desde cualquier widget."""
+    cur = widget
+    visited = set()
+    while cur is not None and id(cur) not in visited:
+        visited.add(id(cur))
+        if hasattr(cur, "plot_widget") and hasattr(cur, "eq_overlay") and getattr(cur, "plot_widget", None) is not None:
+            return cur, cur.plot_widget, cur.eq_overlay
+        if hasattr(cur, "overlay") and getattr(cur, "overlay", None) is not None:
+            ov = cur.overlay
+            if hasattr(ov, "plot_widget") and hasattr(ov, "eq_engine"):
+                return getattr(ov.plot_widget, "window", lambda: None)(), ov.plot_widget, ov
+            if hasattr(ov, "app_ref") and getattr(ov, "app_ref", None) is not None:
+                app_r = ov.app_ref
+                return app_r, getattr(app_r, "plot_widget", None), getattr(app_r, "eq_overlay", None)
+        if hasattr(cur, "app_ref") and getattr(cur, "app_ref", None) is not None:
+            app_r = cur.app_ref
+            return app_r, getattr(app_r, "plot_widget", None), getattr(app_r, "eq_overlay", None)
+        try:
+            win = cur.window()
+            if win is not None and win is not cur and hasattr(win, "plot_widget") and hasattr(win, "eq_overlay"):
+                return win, win.plot_widget, win.eq_overlay
+        except Exception:
+            pass
+        cur = cur.parentWidget() if hasattr(cur, "parentWidget") else None
+
+    for top_w in QApplication.topLevelWidgets():
+        if hasattr(top_w, "plot_widget") and hasattr(top_w, "eq_overlay"):
+            return top_w, top_w.plot_widget, top_w.eq_overlay
+    return None, None, None
+
+
+class _HUDPopupGLHelper:
+    """
+    Sincroniza un HUDOpenGLBackgroundItem dentro de la escena OpenGL de la FFT bajo cualquier
+    menú o popup desplegable y provee pintado HUD con Gaussian Blur para el widget.
+    """
+
+    def __init__(self, widget: QWidget, accent_color: str = "#00E5FF", corner_radius: float = 10.0):
+        self.widget = widget
+        self.accent_color = QColor(accent_color) if accent_color else QColor("#00E5FF")
+        self.corner_radius = float(corner_radius)
+        self._bg_gl_item = None
+        self._blur_pixmap = None
+        self._last_blur_time = 0.0
+
+    def set_accent_color(self, hex_or_color):
+        c = QColor(hex_or_color)
+        if c.isValid() and c != self.accent_color:
+            self.accent_color = c
+            self.sync_gl_item()
+            self.widget.update()
+
+    def build_rounded_path(self, w: float, h: float) -> QPainterPath:
+        pad = 1.5
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(pad, pad, max(2.0, w - 2.0 * pad), max(2.0, h - 2.0 * pad)), self.corner_radius, self.corner_radius)
+        return path
+
+    def sync_gl_item(self):
+        _, pw, ov = _resolve_app_and_plot(self.widget)
+        if pw is None or ov is None:
+            return
+        if self._bg_gl_item is None:
+            self._bg_gl_item = HUDOpenGLBackgroundItem(overlay=ov, plot_widget=pw)
+            self._bg_gl_item.setZValue(28)
+            pw.plotItem.vb.scene().addItem(self._bg_gl_item)
+        if not self.widget.isVisible():
+            self._bg_gl_item.hide()
+            return
+        global_tl = self.widget.mapToGlobal(QPoint(0, 0))
+        local_in_pw = pw.mapFromGlobal(global_tl)
+        scene_pt = pw.mapToScene(local_in_pw)
+        w = float(self.widget.width())
+        h = float(self.widget.height())
+        self._bg_gl_item.set_custom_shape(scene_pt, w, h, self.build_rounded_path(w, h), self.accent_color)
+        if not self._bg_gl_item.isVisible():
+            self._bg_gl_item.show()
+
+    def hide_gl_item(self):
+        if self._bg_gl_item is not None:
+            self._bg_gl_item.hide()
+
+    def paint_hud_background(self, painter: QPainter):
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        w = float(self.widget.width())
+        h = float(self.widget.height())
+        path = self.build_rounded_path(w, h)
+
+        now = time.perf_counter()
+        _, pw, ov = _resolve_app_and_plot(self.widget)
+        if (self._blur_pixmap is None or (now - self._last_blur_time) >= 0.030) and pw is not None and ov is not None:
+            self._last_blur_time = now
+            global_tl = self.widget.mapToGlobal(QPoint(0, 0))
+            local_in_pw = pw.mapFromGlobal(global_tl)
+            scene_pt = pw.mapToScene(local_in_pw)
+            self._blur_pixmap = HUDOpenGLBackgroundItem.render_scene_blur_pixmap(
+                ov, pw, float(scene_pt.x()), float(scene_pt.y()), w, h, self.accent_color
+            )
+
+        if self._blur_pixmap is not None and not self._blur_pixmap.isNull():
+            painter.save()
+            painter.setClipPath(path)
+            painter.drawPixmap(self.widget.rect(), self._blur_pixmap)
+            painter.fillRect(self.widget.rect(), QColor(14, 16, 22, 138))
+            tint = QColor(self.accent_color)
+            tint.setAlpha(16)
+            painter.fillRect(self.widget.rect(), tint)
+            painter.restore()
+        else:
+            painter.fillPath(path, QBrush(QColor(14, 16, 22, 145)))
+            tint = QColor(self.accent_color)
+            tint.setAlpha(18)
+            painter.fillPath(path, QBrush(tint))
+
+        glow = QColor(self.accent_color)
+        glow.setAlpha(40)
+        painter.setPen(QPen(glow, 2.8))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawPath(path)
+
+        border = _brighten_color(self.accent_color, 0.12)
+        border.setAlpha(195)
+        painter.setPen(QPen(border, 1.25))
+        painter.drawPath(path)
+
+
+class HUDPopupDialog(QDialog):
+    """
+    Diálogo desplegable sin bordes con el diseño del HUD (fondo translúcido de baja opacidad +
+    Gaussian Blur en tiempo real + borde coloreado y sincronización OpenGL en GPU).
+    """
+
+    def __init__(self, parent=None, accent_color: str = "#00E5FF", corner_radius: float = 10.0):
+        super().__init__(
+            parent,
+            Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint | Qt.WindowType.NoDropShadowWindowHint,
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self._hud_gl = _HUDPopupGLHelper(self, accent_color=accent_color, corner_radius=corner_radius)
+
+    def setAccentColor(self, hex_color: str):
+        self._hud_gl.set_accent_color(hex_color)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._hud_gl._last_blur_time = 0.0
+        self._hud_gl.sync_gl_item()
+
+    def moveEvent(self, event):
+        super().moveEvent(event)
+        self._hud_gl.sync_gl_item()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._hud_gl._last_blur_time = 0.0
+        self._hud_gl.sync_gl_item()
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self._hud_gl.hide_gl_item()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        self._hud_gl.paint_hud_background(painter)
+
+
+class HUDPopupMenu(QMenu):
+    """
+    Menú desplegable QMenu con el diseño del HUD (fondo translúcido de baja opacidad +
+    Gaussian Blur en tiempo real + borde coloreado y sincronización OpenGL en GPU).
+    """
+
+    def __init__(self, title_or_parent=None, parent=None, accent_color: str = "#00E5FF", corner_radius: float = 9.0):
+        if isinstance(title_or_parent, str):
+            super().__init__(title_or_parent, parent)
+        else:
+            super().__init__(title_or_parent)
+        self.setWindowFlags(
+            Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint | Qt.WindowType.NoDropShadowWindowHint
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self._hud_gl = _HUDPopupGLHelper(self, accent_color=accent_color, corner_radius=corner_radius)
+        self._apply_menu_qss(accent_color)
+
+    def _apply_menu_qss(self, accent_hex: str):
+        c = QColor(accent_hex) if accent_hex else QColor("#00E5FF")
+        r, g, b = c.red(), c.green(), c.blue()
+        bright_hex = _brighten_color(c, 0.35).name()
+        self.setStyleSheet(f"""
+            QMenu {{
+                background-color: transparent;
+                color: #ECEFF4;
+                border: none;
+                padding: 6px 5px;
+                font-family: "Segoe UI", sans-serif;
+                font-size: 11px;
+                font-weight: 600;
+            }}
+            QMenu::item {{
+                background-color: transparent;
+                padding: 5px 22px 5px 12px;
+                margin: 1px 4px;
+                border-radius: 5px;
+                color: #D8DEE9;
+            }}
+            QMenu::item:selected {{
+                background-color: rgba({r}, {g}, {b}, 52);
+                color: {bright_hex};
+                border: 1px solid rgba({r}, {g}, {b}, 185);
+            }}
+            QMenu::item:disabled {{
+                color: #6C7486;
+            }}
+            QMenu::separator {{
+                height: 1px;
+                background-color: rgba(255, 255, 255, 28);
+                margin: 4px 8px;
+            }}
+        """)
+
+    def setAccentColor(self, hex_color: str):
+        self._hud_gl.set_accent_color(hex_color)
+        self._apply_menu_qss(hex_color)
+
+    def addMenu(self, title: str) -> "HUDPopupMenu":
+        sub = HUDPopupMenu(title, self, accent_color=self._hud_gl.accent_color.name(), corner_radius=self._hud_gl.corner_radius)
+        super().addMenu(sub)
+        return sub
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._hud_gl._last_blur_time = 0.0
+        self._hud_gl.sync_gl_item()
+
+    def moveEvent(self, event):
+        super().moveEvent(event)
+        self._hud_gl.sync_gl_item()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._hud_gl._last_blur_time = 0.0
+        self._hud_gl.sync_gl_item()
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self._hud_gl.hide_gl_item()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        self._hud_gl.paint_hud_background(painter)
+        painter.end()
+        super().paintEvent(event)
+
+
+class _ComboPopupFilter(QObject):
+    """Sincroniza y pinta el contenedor desplegable de cualquier QComboBox con diseño HUD + OpenGL."""
+
+    def __init__(self, combo: QComboBox, accent_color: str = "#00E5FF"):
+        super().__init__(combo)
+        self.combo = combo
+        self.accent_color = accent_color
+        self._helper = None
+
+    def eventFilter(self, obj, event):
+        etype = event.type()
+        if etype in (QEvent.Type.Show, QEvent.Type.Move, QEvent.Type.Resize):
+            if self._helper is None:
+                self._helper = _HUDPopupGLHelper(obj, accent_color=self.accent_color, corner_radius=7.0)
+            if etype in (QEvent.Type.Show, QEvent.Type.Resize):
+                self._helper._last_blur_time = 0.0
+            self._helper.sync_gl_item()
+        elif etype == QEvent.Type.Hide:
+            if self._helper is not None:
+                self._helper.hide_gl_item()
+        elif etype == QEvent.Type.Paint:
+            if self._helper is None:
+                self._helper = _HUDPopupGLHelper(obj, accent_color=self.accent_color, corner_radius=7.0)
+            p = QPainter(obj)
+            self._helper.paint_hud_background(p)
+            p.end()
+            return True
+        return False
+
+
+def style_dark_combobox(combo: QComboBox, accent_color: str = "#00E5FF"):
+    """Estiliza la lista desplegable de un QComboBox con el diseño del HUD y renderizado OpenGL."""
+    c = QColor(accent_color) if accent_color else QColor("#00E5FF")
+    r, g, b = c.red(), c.green(), c.blue()
+    bright_hex = _brighten_color(c, 0.35).name()
     list_view = QListView(combo)
     list_view.setUniformItemSizes(True)
     list_view.setSpacing(2)
-    list_view.setStyleSheet("""
-        QListView {
-            background-color: #181A20;
+    list_view.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+    list_view.viewport().setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+    list_view.setStyleSheet(f"""
+        QListView {{
+            background-color: rgba(14, 16, 22, 138);
             color: #F0F2F5;
-            border: 1px solid #3A3F4B;
-            border-radius: 6px;
+            border: 1.25px solid rgba({r}, {g}, {b}, 190);
+            border-radius: 7px;
             padding: 4px;
             outline: none;
-        }
-        QListView::item {
-            min-height: 24px;
-            padding: 4px 10px;
+        }}
+        QListView::item {{
+            min-height: 22px;
+            padding: 3px 10px;
             border-radius: 4px;
-            color: #F0F2F5;
+            color: #D8DEE9;
             background-color: transparent;
-        }
-        QListView::item:hover {
-            background-color: #2B303C;
+        }}
+        QListView::item:hover {{
+            background-color: rgba({r}, {g}, {b}, 36);
             color: #FFFFFF;
-        }
-        QListView::item:selected {
-            background-color: #00E5FF;
-            color: #0D0F14;
+        }}
+        QListView::item:selected {{
+            background-color: rgba({r}, {g}, {b}, 62);
+            color: {bright_hex};
+            border: 1px solid rgba({r}, {g}, {b}, 185);
             font-weight: bold;
-        }
+        }}
     """)
     combo.setView(list_view)
     try:
-        combo.view().window().setWindowFlags(
+        popup_win = combo.view().window()
+        popup_win.setWindowFlags(
             Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint | Qt.WindowType.NoDropShadowWindowHint
         )
-        combo.view().window().setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        popup_win.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        flt = _ComboPopupFilter(combo, accent_color=accent_color)
+        combo._hud_popup_filter = flt
+        popup_win.installEventFilter(flt)
     except Exception:
         pass
+
+
+class _SpinBoxArrowOverlay(QWidget):
+    """
+     Superposición ligera a la derecha del QSpinBox / QDoubleSpinBox que dibuja
+    flechas vectoriales nítidas ▴ (subir) y ▾ (bajar) con estética HUD.
+    """
+
+    def __init__(self, spinbox, accent_color: str = "#00E5FF"):
+        super().__init__(spinbox)
+        self.spinbox = spinbox
+        self.accent_color = QColor(accent_color) if accent_color else QColor("#00E5FF")
+        self._hover_part = None  # "up", "down", or None
+        self._pressed_part = None
+        self.setMouseTracking(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._sync_geometry()
+
+    def _sync_geometry(self):
+        btn_w = 20
+        self.setGeometry(max(0, self.spinbox.width() - btn_w), 0, btn_w, self.spinbox.height())
+        self.raise_()
+
+    def mouseMoveEvent(self, event):
+        part = "up" if event.position().y() < self.height() * 0.5 else "down"
+        if part != self._hover_part:
+            self._hover_part = part
+            self.update()
+        event.accept()
+
+    def leaveEvent(self, event):
+        self._hover_part = None
+        self._pressed_part = None
+        self.update()
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self.spinbox.isEnabled():
+            part = "up" if event.position().y() < self.height() * 0.5 else "down"
+            self._pressed_part = part
+            if part == "up":
+                self.spinbox.stepUp()
+            else:
+                self.spinbox.stepDown()
+            self.update()
+        event.accept()
+
+    def mouseReleaseEvent(self, event):
+        self._pressed_part = None
+        self.update()
+        event.accept()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        w = float(self.width())
+        h = float(self.height())
+        mid_y = h * 0.5
+
+        # Línea divisoria vertical e intermedia sutil
+        p.setPen(QPen(QColor(255, 255, 255, 28), 1.0))
+        p.drawLine(QPointF(0.5, 3.0), QPointF(0.5, h - 3.0))
+        p.drawLine(QPointF(2.0, mid_y), QPointF(w - 2.0, mid_y))
+
+        for part, cy, is_up in (("up", mid_y * 0.5 + 0.5, True), ("down", mid_y * 1.5 - 0.5, False)):
+            hovered = (self._hover_part == part) and self.spinbox.isEnabled()
+            pressed = (self._pressed_part == part) and self.spinbox.isEnabled()
+            if pressed or hovered:
+                sub_rect = QRectF(1.5, 1.5 if is_up else mid_y + 0.5, w - 3.0, mid_y - 2.0)
+                bg = QColor(self.accent_color)
+                bg.setAlpha(68 if pressed else 35)
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(bg)
+                p.drawRoundedRect(sub_rect, 3.0, 3.0)
+
+            cx = w * 0.5
+            aw = 3.6
+            ah = 2.4
+            tri = QPolygonF()
+            if is_up:
+                tri.append(QPointF(cx, cy - ah))
+                tri.append(QPointF(cx - aw, cy + ah))
+                tri.append(QPointF(cx + aw, cy + ah))
+            else:
+                tri.append(QPointF(cx, cy + ah))
+                tri.append(QPointF(cx - aw, cy - ah))
+                tri.append(QPointF(cx + aw, cy - ah))
+
+            if not self.spinbox.isEnabled():
+                col = QColor(110, 116, 128, 110)
+            elif pressed:
+                col = _brighten_color(self.accent_color, 0.45)
+            elif hovered:
+                col = _brighten_color(self.accent_color, 0.25)
+            else:
+                col = QColor("#D8DEE9")
+
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(col))
+            p.drawPolygon(tri)
+
+
+class _SpinBoxResizeFilter(QObject):
+    def __init__(self, spinbox, overlay: _SpinBoxArrowOverlay):
+        super().__init__(spinbox)
+        self.overlay = overlay
+
+    def eventFilter(self, obj, event):
+        if event.type() in (QEvent.Type.Resize, QEvent.Type.Show):
+            self.overlay._sync_geometry()
+        return False
+
+
+def style_hud_spinbox(spinbox, accent_color: str = "#00E5FF"):
+    """
+    Aplica la estética del HUD a un QSpinBox / QDoubleSpinBox y añade flechas
+    vectoriales explícitas ▴ (subir) y ▾ (bajar) en los botones laterales.
+    """
+    c = QColor(accent_color) if accent_color else QColor("#00E5FF")
+    r, g, b = c.red(), c.green(), c.blue()
+    hex_c = c.name()
+    spinbox.setStyleSheet(f"""
+        QSpinBox, QDoubleSpinBox {{
+            background-color: rgba(16, 18, 24, 145);
+            color: {hex_c};
+            border: 1px solid rgba(62, 68, 82, 170);
+            border-radius: 5px;
+            padding: 3px 22px 3px 6px;
+            font-size: 11px;
+            font-weight: bold;
+        }}
+        QSpinBox:hover, QDoubleSpinBox:hover, QSpinBox:focus, QDoubleSpinBox:focus {{
+            border: 1px solid {hex_c};
+            background-color: rgba({r}, {g}, {b}, 26);
+        }}
+        QSpinBox::up-button, QDoubleSpinBox::up-button,
+        QSpinBox::down-button, QDoubleSpinBox::down-button {{
+            width: 0px;
+            border: none;
+            background: transparent;
+        }}
+    """)
+    if not hasattr(spinbox, "_hud_arrow_overlay"):
+        ov = _SpinBoxArrowOverlay(spinbox, accent_color=hex_c)
+        flt = _SpinBoxResizeFilter(spinbox, ov)
+        spinbox._hud_arrow_overlay = ov
+        spinbox._hud_resize_filter = flt
+        spinbox.installEventFilter(flt)
+        ov._sync_geometry()
+        ov.show()
+    else:
+        spinbox._hud_arrow_overlay.accent_color = c
+        spinbox._hud_arrow_overlay._sync_geometry()
+        spinbox._hud_arrow_overlay.update()
 
 
 STUDIO_BAND_COLORS = [
@@ -344,19 +794,7 @@ class ColorSwatchButton(QPushButton):
             self.update()
 
     def _open_palette_menu(self):
-        menu = QMenu(self)
-        menu.setStyleSheet("""
-            QMenu {
-                background-color: #1A1C22;
-                color: #ECEFF4;
-                border: 1px solid #383C47;
-                border-radius: 6px;
-                padding: 4px;
-                font-size: 11px;
-            }
-            QMenu::item { padding: 5px 14px; border-radius: 4px; }
-            QMenu::item:selected { background-color: #2E3440; color: #FFFFFF; }
-        """)
+        menu = HUDPopupMenu(self, accent_color=self._color.name(), corner_radius=8.0)
         for label, hex_val in STUDIO_BAND_COLORS:
             act = menu.addAction(_make_color_icon(hex_val, 12), label)
             act.triggered.connect(lambda _=False, hv=hex_val: self._emit_color(hv))
@@ -1347,14 +1785,59 @@ class BandNodeCallout(QWidget):
         self.overlay._show_node_context_menu(idx, pos)
 
     def paintEvent(self, event):
+        # Si el fondo OpenGL está activo, el 100% de la transparencia y Gaussian Blur se mezcla en la GPU
+        if getattr(self, "_bg_gl_item", None) is not None and self._bg_gl_item.isVisible():
+            return
+
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
 
         w = float(self.width())
+        h = float(self.height())
+        full_path = self._build_callout_path(w)
+
+        pw = getattr(self.overlay, "plot_widget", None)
+        blur_pix = None
+        if pw is not None:
+            scene_pt = pw.mapToScene(self.pos())
+            blur_pix = HUDOpenGLBackgroundItem.render_scene_blur_pixmap(
+                self.overlay, pw, float(scene_pt.x()), float(scene_pt.y()), w, h, QColor(self._band_color)
+            )
+
+        if blur_pix is not None and not blur_pix.isNull():
+            painter.save()
+            painter.setClipPath(full_path)
+            painter.drawPixmap(self.rect(), blur_pix)
+            painter.fillRect(self.rect(), QColor(14, 16, 22, 136))
+            tint = QColor(self._band_color)
+            tint.setAlpha(14)
+            painter.fillRect(self.rect(), tint)
+            painter.restore()
+        else:
+            painter.fillPath(full_path, QBrush(QColor(14, 16, 22, 138)))
+            tint = QColor(self._band_color)
+            tint.setAlpha(16)
+            painter.fillPath(full_path, QBrush(tint))
+
+        # Resplandor exterior sutil del color de la banda estilo HUD
+        glow_c = QColor(self._band_color)
+        glow_c.setAlpha(38)
+        painter.setPen(QPen(glow_c, 2.8))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawPath(full_path)
+
+        # Borde redondeado coloreado nítido estilo HUD
+        border_c = QColor(self._band_color)
+        border_c.setAlpha(190)
+        painter.setPen(QPen(border_c, 1.25))
+        painter.drawPath(full_path)
+
+    @staticmethod
+    def _build_callout_path(w: float) -> QPainterPath:
         body_h = 75.0
         caret_h = 6.0
         cx = w * 0.5
-
         body_rect = QRectF(1.0, 1.0, w - 2.0, body_h)
         path = QPainterPath()
         path.addRoundedRect(body_rect, 8.0, 8.0)
@@ -1364,23 +1847,32 @@ class BandNodeCallout(QWidget):
         caret_path.lineTo(cx, body_h + caret_h)
         caret_path.lineTo(cx + 7.0, body_h)
         caret_path.closeSubpath()
+        return path.united(caret_path)
 
-        full_path = path.united(caret_path)
+    def _sync_gl_bg(self):
+        pw = getattr(self.overlay, "plot_widget", None)
+        if pw is None:
+            return
+        if getattr(self, "_bg_gl_item", None) is None:
+            self._bg_gl_item = HUDOpenGLBackgroundItem(overlay=self.overlay, plot_widget=pw)
+            self._bg_gl_item.setZValue(26)
+            pw.plotItem.vb.scene().addItem(self._bg_gl_item)
+        if not self.isVisible() or self._current_opacity <= 0.02:
+            self._bg_gl_item.hide()
+            return
+        scene_pt = pw.mapToScene(self.pos())
+        w = float(self.width())
+        h = float(self.height())
+        c = QColor(self._band_color)
+        self._bg_gl_item.setOpacity(self._current_opacity)
+        self._bg_gl_item.set_custom_shape(scene_pt, w, h, self._build_callout_path(w), c)
+        if not self._bg_gl_item.isVisible():
+            self._bg_gl_item.show()
 
-        # Fondo oscuro #1A1D24 con alpha=235
-        painter.fillPath(full_path, QBrush(QColor(26, 29, 36, 235)))
-
-        # Resplandor exterior sutil del color de la banda
-        glow_c = QColor(self._band_color)
-        glow_c.setAlpha(45)
-        painter.setPen(QPen(glow_c, 3.0))
-        painter.drawPath(full_path)
-
-        # Borde redondeado nítido
-        border_c = QColor(self._band_color)
-        border_c.setAlpha(180)
-        painter.setPen(QPen(border_c, 1.2))
-        painter.drawPath(full_path)
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        if getattr(self, "_bg_gl_item", None) is not None:
+            self._bg_gl_item.hide()
 
     def update_callout(self):
         if self._building:
@@ -1440,18 +1932,21 @@ class BandNodeCallout(QWidget):
         self.reposition()
         self.show()
         self.raise_()
+        self._sync_gl_bg()
         self.update()
 
     def set_callout_opacity(self, op: float):
         self._current_opacity = float(np.clip(op, 0.0, 1.0))
         if hasattr(self, "_opacity_effect"):
             self._opacity_effect.setOpacity(self._current_opacity)
+        self._sync_gl_bg()
 
     def show_callout(self):
         self.set_callout_opacity(1.0)
         self.update_callout()
         self.show()
         self.raise_()
+        self._sync_gl_bg()
 
     def reposition(self):
         idx = self.overlay.selected_band_idx
@@ -1475,10 +1970,16 @@ class BandNodeCallout(QWidget):
 
         pw = self.overlay.plot_widget
         clamped_x = max(10, min(pw.width() - w - 10, target_x))
-        if target_y < 46:
+        min_y = 46
+        hud_c = getattr(self.overlay, "hud_container", None)
+        scope_ov = getattr(hud_c, "scope_overlay", None) if hud_c is not None else None
+        if scope_ov is not None and scope_ov.isVisible():
+            min_y = max(min_y, scope_ov.y() + scope_ov.height() + 6)
+        if target_y < min_y:
             target_y = int(view_pt.y() + 18)
 
         self.move(clamped_x, target_y)
+        self._sync_gl_bg()
 
 
 class GhostCurveItem(pg.GraphicsObject):
@@ -1678,14 +2179,17 @@ class CrossoverLineItem(pg.GraphicsObject):
 
 class FFTInspectorItem(QGraphicsItem):
     """
-    Mini-inspector flotante dibujado DENTRO de la escena OpenGL de la FFT (zValue alto):
+    Mini-inspector flotante dibujado DENTRO de la escena OpenGL de la FFT (zValue alto)
+    siguiendo el diseño del HUD (fondo translúcido de baja opacidad + Gaussian Blur + borde coloreado):
     línea 1 = Hz + dBFS instantáneo de la FFT; línea 2 opcional = ±dB del filtro propuesto.
     """
 
-    def __init__(self):
+    def __init__(self, overlay=None, plot_widget=None):
         super().__init__()
         self.setZValue(1000)
         self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self.overlay = overlay
+        self.plot_widget = plot_widget
         self._line1 = ""
         self._line2 = ""
         self._line2_color = QColor("#00E5FF")
@@ -1693,6 +2197,8 @@ class FFTInspectorItem(QGraphicsItem):
         self._font.setBold(True)
         self._w = 120.0
         self._h = 22.0
+        self._blur_pixmap = None
+        self._last_blur_time = 0.0
 
     def set_content(self, line1: str, line2: str = "", line2_color: QColor | None = None):
         if line1 == self._line1 and line2 == self._line2 and (line2_color is None or line2_color == self._line2_color):
@@ -1715,21 +2221,58 @@ class FFTInspectorItem(QGraphicsItem):
         return self._w, self._h
 
     def boundingRect(self):
-        return QRectF(0.0, 0.0, self._w, self._h)
+        return QRectF(-3.0, -3.0, self._w + 6.0, self._h + 6.0)
 
     def paint(self, painter, option, widget=None):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        r = QRectF(0.5, 0.5, self._w - 1.0, self._h - 1.0)
-        painter.setPen(QPen(QColor(255, 255, 255, 46), 1.0))
-        painter.setBrush(QBrush(QColor(14, 16, 22, 185)))
-        painter.drawRoundedRect(r, 6.0, 6.0)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        r = QRectF(1.0, 1.0, self._w - 2.0, self._h - 2.0)
+        clip = QPainterPath()
+        clip.addRoundedRect(r, 7.0, 7.0)
+
+        accent = QColor(self._line2_color) if (self._line2_color and self._line2_color.isValid()) else QColor("#00E5FF")
+
+        now = time.perf_counter()
+        if (self._blur_pixmap is None or (now - self._last_blur_time) >= 0.032) and self.overlay is not None and self.plot_widget is not None:
+            self._last_blur_time = now
+            pos = self.pos()
+            self._blur_pixmap = HUDOpenGLBackgroundItem.render_scene_blur_pixmap(
+                self.overlay, self.plot_widget, float(pos.x()), float(pos.y()), float(self._w), float(self._h), accent
+            )
+
+        if self._blur_pixmap is not None and not self._blur_pixmap.isNull():
+            painter.save()
+            painter.setClipPath(clip)
+            painter.drawPixmap(QRectF(0.0, 0.0, self._w, self._h).toRect(), self._blur_pixmap)
+            painter.fillRect(r, QColor(14, 16, 22, 134))
+            tint = QColor(accent)
+            tint.setAlpha(18 if self._line2 else 14)
+            painter.fillRect(r, tint)
+            painter.restore()
+        else:
+            painter.fillPath(clip, QBrush(QColor(14, 16, 22, 138)))
+            tint = QColor(accent)
+            tint.setAlpha(18 if self._line2 else 14)
+            painter.fillPath(clip, QBrush(tint))
+
+        glow = QColor(accent)
+        glow.setAlpha(38)
+        painter.setPen(QPen(glow, 2.4))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawPath(clip)
+
+        border = _brighten_color(accent, 0.12)
+        border.setAlpha(195)
+        painter.setPen(QPen(border, 1.25))
+        painter.drawPath(clip)
+
         painter.setFont(self._font)
         from PyQt6.QtGui import QFontMetricsF
         lh = QFontMetricsF(self._font).height()
-        painter.setPen(QColor("#E8ECF2"))
+        painter.setPen(QColor("#F0F4F8"))
         painter.drawText(QRectF(9.0, 5.0, self._w - 18.0, lh), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, self._line1)
         if self._line2:
-            painter.setPen(self._line2_color)
+            painter.setPen(_brighten_color(accent, 0.25))
             painter.drawText(QRectF(9.0, 5.0 + lh, self._w - 18.0, lh), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, self._line2)
 
 
@@ -1792,7 +2335,7 @@ class ProQ4Overlay(QWidget):
 
         # Mini-inspector FFT (Hz + dBFS + ±dB filtro propuesto) renderizado en la escena OpenGL
         self.fft_curves = []
-        self.fft_inspector = FFTInspectorItem()
+        self.fft_inspector = FFTInspectorItem(overlay=self, plot_widget=self.plot_widget)
         self.plot_item.scene().addItem(self.fft_inspector)
         self.fft_inspector.hide()
 
@@ -2038,6 +2581,7 @@ class ProQ4Overlay(QWidget):
         f_txt = f"{freq_hz / 1000.0:.2f} kHz" if freq_hz >= 1000.0 else f"{freq_hz:.1f} Hz"
 
         fft_txt = "-- dBFS"
+        active_fft_col = QColor("#00E5FF")
         for curve in self.fft_curves:
             try:
                 if not curve.isVisible():
@@ -2047,13 +2591,19 @@ class ProQ4Overlay(QWidget):
                     continue
                 val = float(np.interp(main_pt.x(), xd, yd))
                 fft_txt = f"{val:.1f} dBFS"
+                try:
+                    pen_obj = curve.opts.get("pen")
+                    if pen_obj is not None:
+                        active_fft_col = QColor(pg.mkPen(pen_obj).color())
+                except Exception:
+                    pass
                 break
             except Exception:
                 continue
         line1 = f"{f_txt}  |  {fft_txt}"
 
         line2 = ""
-        col = None
+        col = active_fft_col
         if self._ghost_unlocked and self._ghost_fade > 0.05:
             g_db = float(np.clip(self._ghost_db, -24.0, 24.0))
             g_f = float(10.0 ** self._ghost_log_f) if self.is_x_log else float(self._ghost_log_f)
@@ -2564,18 +3114,7 @@ class ProQ4Overlay(QWidget):
                 return
             band = self.eq_engine.bands[band_idx]
 
-        menu = QMenu(self.plot_widget)
-        menu.setStyleSheet("""
-            QMenu {
-                background-color: #1C1C1C;
-                color: #ECEFF4;
-                border: 1px solid #383838;
-                padding: 4px;
-                font-size: 11px;
-            }
-            QMenu::item { padding: 5px 16px; border-radius: 3px; }
-            QMenu::item:selected { background-color: #2E3440; color: #FFFFFF; }
-        """)
+        menu = HUDPopupMenu(self.plot_widget, accent_color=band.color, corner_radius=9.0)
 
         header = menu.addAction(f"Band {band_idx + 1} ({band.filter_type} @ {band.freq:.0f} Hz)")
         header.setEnabled(False)
@@ -2983,6 +3522,7 @@ class HUDOpenGLBackgroundItem(QGraphicsItem):
         self._is_minimized = False
         self._active_color = QColor("#00E5FF")
         self._gain_center_x = 276.0
+        self._custom_path = None
         self._cached_path = QPainterPath()
         self._blur_pixmap = None
         self._last_blur_time = 0.0
@@ -2990,6 +3530,29 @@ class HUDOpenGLBackgroundItem(QGraphicsItem):
 
     def boundingRect(self) -> QRectF:
         return self._rect.adjusted(-6.0, -6.0, 6.0, 6.0)
+
+    def set_custom_shape(self, scene_pos: QPointF, width: float, height: float, custom_path: QPainterPath, active_color: QColor):
+        pos_changed = (self.pos() - scene_pos).manhattanLength() > 0.5
+        self.setPos(scene_pos)
+        c = QColor(active_color) if active_color else QColor("#00E5FF")
+        geom_changed = (
+            abs(self._rect.width() - width) > 0.5
+            or abs(self._rect.height() - height) > 0.5
+            or self._custom_path != custom_path
+        )
+        if geom_changed:
+            self.prepareGeometryChange()
+            self._rect = QRectF(0.0, 0.0, width, height)
+            self._custom_path = custom_path
+            self._cached_path = QPainterPath(custom_path)
+            self._active_color = c
+            self._last_blur_time = 0.0
+            self.update()
+        elif self._active_color != c or pos_changed:
+            self._active_color = c
+            if pos_changed:
+                self._last_blur_time = 0.0
+            self.update()
 
     def set_state(self, scene_pos: QPointF, width: float, height: float, is_minimized: bool, active_color: QColor, gain_cx: float):
         pos_changed = (self.pos() - scene_pos).manhattanLength() > 0.5
@@ -3000,12 +3563,14 @@ class HUDOpenGLBackgroundItem(QGraphicsItem):
             or abs(self._rect.height() - height) > 0.5
             or self._is_minimized != is_minimized
             or abs(self._gain_center_x - gain_cx) > 0.5
+            or self._custom_path is not None
         )
         if geom_changed:
             self.prepareGeometryChange()
             self._rect = QRectF(0.0, 0.0, width, height)
             self._is_minimized = is_minimized
             self._gain_center_x = gain_cx
+            self._custom_path = None
             self._active_color = c
             self._rebuild_path()
             self._last_blur_time = 0.0
@@ -3017,6 +3582,9 @@ class HUDOpenGLBackgroundItem(QGraphicsItem):
             self.update()
 
     def _rebuild_path(self):
+        if self._custom_path is not None:
+            self._cached_path = QPainterPath(self._custom_path)
+            return
         self._cached_path = QPainterPath()
         w = float(self._rect.width())
         h = float(self._rect.height())
@@ -3082,34 +3650,34 @@ class HUDOpenGLBackgroundItem(QGraphicsItem):
             )
         return arr
 
-    def _update_gaussian_blur_texture(self):
-        now = time.perf_counter()
-        if self._blur_pixmap is not None and (now - self._last_blur_time) < 0.032:
-            return
-        self._last_blur_time = now
-
-        w = float(self._rect.width())
-        h = float(self._rect.height())
-        if w <= 4.0 or h <= 4.0 or self.overlay is None or self.plot_widget is None:
-            return
+    @classmethod
+    def render_scene_blur_pixmap(cls, overlay, plot_widget, hx: float, hy: float, w: float, h: float, fallback_color: QColor | None = None) -> QPixmap | None:
+        if w <= 4.0 or h <= 4.0 or overlay is None or plot_widget is None:
+            return None
 
         bw = max(16, int(round(w / 8.0)))
         bh = max(6, int(round(h / 8.0)))
 
+        app_win = plot_widget.window() if plot_widget is not None else None
+        bg_hex = "#141414"
+        if app_win is not None and hasattr(app_win, "theme") and isinstance(app_win.theme, dict):
+            bg_hex = app_win.theme.get("background", "#141414")
+        bg_base = QColor(bg_hex)
+        if not bg_base.isValid():
+            bg_base = QColor(14, 16, 22, 255)
+
         img = QImage(bw, bh, QImage.Format.Format_ARGB32_Premultiplied)
-        img.fill(QColor(14, 16, 22, 255))
+        img.fill(bg_base)
 
         ip = QPainter(img)
         ip.setRenderHint(QPainter.RenderHint.Antialiasing, True)
 
         sx = float(bw) / w
         sy = float(bh) / h
-        hud_pos = self.pos()
-        hx = float(hud_pos.x())
-        hy = float(hud_pos.y())
+        active_col = fallback_color if fallback_color is not None else QColor("#00E5FF")
 
         try:
-            vb = self.plot_widget.plotItem.vb
+            vb = plot_widget.plotItem.vb
             vb_rect = vb.sceneBoundingRect()
             vx = float(vb_rect.left())
             vy = float(vb_rect.top())
@@ -3121,7 +3689,7 @@ class HUDOpenGLBackgroundItem(QGraphicsItem):
             dx = max(1e-6, xmax - xmin)
             dy = max(1e-6, ymax - ymin)
 
-            # 1. Líneas de grilla bajo el HUD
+            # 1. Líneas de grilla bajo la transparencia
             grid_pen = QPen(QColor(55, 62, 78, 120), 1.0)
             ip.setPen(grid_pen)
             for db_grid in (-18.0, -36.0, -54.0, -72.0, -90.0, -108.0):
@@ -3131,8 +3699,15 @@ class HUDOpenGLBackgroundItem(QGraphicsItem):
                     if 0.0 <= ly <= bh:
                         ip.drawLine(QPointF(0.0, ly), QPointF(float(bw), ly))
 
-            # 2. Curvas FFT activas bajo el HUD
-            for entry in getattr(self.overlay, "fft_curves", []):
+            # 2. Curvas FFT activas (incluyendo curvas dinámicas del analizador: In 1, In 2, Out 1, Out 2 y RTA)
+            fft_list = list(getattr(overlay, "fft_curves", []))
+            if app_win is not None:
+                for attr_name in ("fft_curve_in", "fft_curve_in2", "fft_curve_out2", "fft_curve_out1", "rta_curve_item"):
+                    c_obj = getattr(app_win, attr_name, None)
+                    if c_obj is not None and c_obj not in fft_list:
+                        fft_list.append(c_obj)
+
+            for entry in fft_list:
                 if isinstance(entry, dict):
                     curve_item = entry.get("item")
                     c_hex = entry.get("color", "#00E5FF")
@@ -3166,22 +3741,25 @@ class HUDOpenGLBackgroundItem(QGraphicsItem):
                 poly.append(QPointF(float(bx_arr[-1]), float(bh + 4)))
 
                 fill_c = QColor(c_fft)
-                fill_c.setAlpha(95)
-                stroke_c = _brighten_color(c_fft, 0.25)
-                stroke_c.setAlpha(240)
+                fill_c.setAlpha(105)
+                stroke_c = _brighten_color(c_fft, 0.28)
+                stroke_c.setAlpha(245)
                 ip.setBrush(QBrush(fill_c))
-                ip.setPen(QPen(stroke_c, 2.0))
+                ip.setPen(QPen(stroke_c, 2.2))
                 ip.drawPolygon(poly)
 
-            # 3. Curvas EQ bajo el HUD
-            eq_vb = getattr(self.overlay, "eq_vb", None)
+            # 3. Curvas EQ estáticas y dinámicas bajo la transparencia
+            eq_vb = getattr(overlay, "eq_vb", None)
             if eq_vb is not None:
                 eq_range = eq_vb.viewRange()
                 eymin, eymax = float(eq_range[1][0]), float(eq_range[1][1])
                 edy = max(1e-6, eymax - eymin)
                 y0_local = ((vy + (eymax - 0.0) / edy * vh) - hy) * sy
 
-                for b_idx, st_c in enumerate(getattr(self.overlay, "band_fill_curves", [])):
+                band_fill_list = getattr(overlay, "band_fill_curves", [])
+                band_dyn_list = getattr(overlay, "band_dyn_curves", [])
+
+                for b_idx, st_c in enumerate(band_fill_list):
                     if not st_c.isVisible():
                         continue
                     xd, yd = st_c.getData()
@@ -3193,9 +3771,9 @@ class HUDOpenGLBackgroundItem(QGraphicsItem):
                     bx_arr = ((vx + (xs - xmin) / dx * vw) - hx) * sx
                     by_arr = ((vy + (eymax - ys) / edy * vh) - hy) * sy
 
-                    b_col = QColor(self._active_color)
-                    if b_idx < len(self.overlay.eq_engine.bands):
-                        b_col = QColor(self.overlay.eq_engine.bands[b_idx].color)
+                    b_col = QColor(active_col)
+                    if b_idx < len(overlay.eq_engine.bands):
+                        b_col = QColor(overlay.eq_engine.bands[b_idx].color)
 
                     poly = QPolygonF()
                     poly.append(QPointF(float(bx_arr[0]), float(y0_local)))
@@ -3204,16 +3782,82 @@ class HUDOpenGLBackgroundItem(QGraphicsItem):
                     poly.append(QPointF(float(bx_arr[-1]), float(y0_local)))
 
                     fc = QColor(b_col)
-                    fc.setAlpha(90)
+                    fc.setAlpha(95)
                     sc = QColor(b_col)
-                    sc.setAlpha(220)
+                    sc.setAlpha(225)
                     ip.setBrush(QBrush(fc))
                     ip.setPen(QPen(sc, 1.8))
                     ip.drawPolygon(poly)
 
+                    # Curva Dynamic EQ en vivo y sombreado entre curva estática y dinámica
+                    if b_idx < len(band_dyn_list):
+                        dyn_c = band_dyn_list[b_idx]
+                        if dyn_c is not None and dyn_c.isVisible():
+                            dxd, dyd = dyn_c.getData()
+                            if dxd is not None and dyd is not None and len(dxd) >= 4:
+                                dstep = max(1, len(dxd) // 64)
+                                dxs = dxd[::dstep]
+                                dys = dyd[::dstep]
+                                dbx_arr = ((vx + (dxs - xmin) / dx * vw) - hx) * sx
+                                dby_arr = ((vy + (eymax - dys) / edy * vh) - hy) * sy
+
+                                dyn_poly = QPolygonF()
+                                for px_v, py_v in zip(bx_arr, by_arr):
+                                    dyn_poly.append(QPointF(float(px_v), float(py_v)))
+                                for px_v, py_v in zip(reversed(dbx_arr), reversed(dby_arr)):
+                                    dyn_poly.append(QPointF(float(px_v), float(py_v)))
+
+                                dfc = _brighten_color(b_col, 0.20)
+                                dfc.setAlpha(135)
+                                dsc = _brighten_color(b_col, 0.35)
+                                dsc.setAlpha(250)
+                                ip.setBrush(QBrush(dfc))
+                                ip.setPen(QPen(dsc, 2.2))
+                                ip.drawPolygon(dyn_poly)
+
+                # Curva de límite máximo de rango dinámico (dyn_limit_curve)
+                lim_c = getattr(overlay, "dyn_limit_curve", None)
+                if lim_c is not None and lim_c.isVisible():
+                    lxd, lyd = lim_c.getData()
+                    if lxd is not None and lyd is not None and len(lxd) >= 4:
+                        lstep = max(1, len(lxd) // 64)
+                        lxs = lxd[::lstep]
+                        lys = lyd[::lstep]
+                        lbx = ((vx + (lxs - xmin) / dx * vw) - hx) * sx
+                        lby = ((vy + (eymax - lys) / edy * vh) - hy) * sy
+                        lpoly = QPolygonF([QPointF(float(px_v), float(py_v)) for px_v, py_v in zip(lbx, lby)])
+                        lcol = _brighten_color(active_col, 0.25)
+                        lcol.setAlpha(215)
+                        ip.setBrush(Qt.BrushStyle.NoBrush)
+                        ip.setPen(QPen(lcol, 1.6, Qt.PenStyle.DotLine))
+                        ip.drawPolyline(lpoly)
+
+                # Curva Fantasma sugerida (ghost_curve)
+                ghost_c = getattr(overlay, "ghost_curve", None)
+                if ghost_c is not None and ghost_c.isVisible() and not ghost_c.path.isEmpty():
+                    g_col = QColor(245, 195, 85, 185)
+                    ip.setBrush(Qt.BrushStyle.NoBrush)
+                    ip.setPen(QPen(g_col, 1.8))
+                    # Muestreo ligero de la curva fantasma
+                    ex = getattr(overlay, "eval_x", None)
+                    if ex is not None and len(ex) >= 4 and getattr(overlay, "_proposed_band", None) is not None:
+                        try:
+                            pb = overlay._proposed_band
+                            tb = EQBand(filter_type=pb["type"], freq=pb["freq"], gain_db=pb["gain"], q=pb["q"], sr=overlay.eq_engine.sr)
+                            gy = tb.get_static_freq_response_db(overlay.eval_z1, overlay.eval_z2)
+                            gstep = max(1, len(ex) // 48)
+                            gxs = ex[::gstep]
+                            gys = gy[::gstep]
+                            gbx = ((vx + (gxs - xmin) / dx * vw) - hx) * sx
+                            gby = ((vy + (eymax - gys) / edy * vh) - hy) * sy
+                            gpoly = QPolygonF([QPointF(float(px_v), float(py_v)) for px_v, py_v in zip(gbx, gby)])
+                            ip.drawPolyline(gpoly)
+                        except Exception:
+                            pass
+
                 for m_curve, m_col_fb in (
-                    (getattr(self.overlay, "static_master_curve", None), getattr(self.overlay, "curve_eq_a_color", "#FFD54F")),
-                    (getattr(self.overlay, "static_bus_b_curve", None), getattr(self.overlay, "curve_eq_b_color", "#00E5FF")),
+                    (getattr(overlay, "static_master_curve", None), getattr(overlay, "_color_eq_a", "#FFD54F")),
+                    (getattr(overlay, "static_bus_b_curve", None), getattr(overlay, "_color_eq_b", "#00E5FF")),
                 ):
                     if m_curve is None or not m_curve.isVisible():
                         continue
@@ -3232,8 +3876,7 @@ class HUDOpenGLBackgroundItem(QGraphicsItem):
                     ip.setPen(QPen(pen_c, 2.2))
                     ip.drawPolyline(poly)
 
-                # 4. Curvas Crossover bajo el HUD
-                app_win = self.plot_widget.window() if self.plot_widget is not None else None
+                # 4. Curvas Crossover bajo la transparencia
                 for x_curve, x_col_fb in (
                     (getattr(app_win, "xover_curve_a", None), "#00E5FF"),
                     (getattr(app_win, "xover_curve_b", None), "#FFAB40"),
@@ -3263,10 +3906,31 @@ class HUDOpenGLBackgroundItem(QGraphicsItem):
         ptr = img.bits()
         ptr.setsize(bh * bw * 4)
         arr = np.frombuffer(ptr, dtype=np.uint8).reshape((bh, bw, 4)).astype(np.float32)
-        blurred = np.clip(self._separable_gaussian_blur(arr, self._GAUSS_KERNEL), 0.0, 255.0).astype(np.uint8)
-        self._blur_bytes = blurred.tobytes()
-        qimg_blur = QImage(self._blur_bytes, bw, bh, bw * 4, QImage.Format.Format_ARGB32_Premultiplied)
-        self._blur_pixmap = QPixmap.fromImage(qimg_blur)
+        blurred = np.clip(cls._separable_gaussian_blur(arr, cls._GAUSS_KERNEL), 0.0, 255.0).astype(np.uint8)
+        blur_bytes = blurred.tobytes()
+        qimg_blur = QImage(blur_bytes, bw, bh, bw * 4, QImage.Format.Format_ARGB32_Premultiplied).copy()
+        return QPixmap.fromImage(qimg_blur)
+
+    def _update_gaussian_blur_texture(self):
+        now = time.perf_counter()
+        if self._blur_pixmap is not None and (now - self._last_blur_time) < 0.028:
+            return
+        self._last_blur_time = now
+
+        w = float(self._rect.width())
+        h = float(self._rect.height())
+        hud_pos = self.pos()
+        pix = self.render_scene_blur_pixmap(
+            self.overlay,
+            self.plot_widget,
+            float(hud_pos.x()),
+            float(hud_pos.y()),
+            w,
+            h,
+            self._active_color,
+        )
+        if pix is not None:
+            self._blur_pixmap = pix
 
     def paint(self, painter, option, widget=None):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
@@ -4345,7 +5009,7 @@ class LimiterGRMiniWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFixedSize(82, 20)
-        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setToolTip("Reducción de Ganancia (GR) en tiempo real del Limitador Master")
         self.gr_db = 0.0
@@ -4367,15 +5031,12 @@ class LimiterGRMiniWidget(QWidget):
         w = self.width()
         h = self.height()
 
-        # Fondo del widget padre (#101216) para WA_OpaquePaintEvent
-        painter.fillRect(0, 0, w, h, QColor("#101216"))
-
-        # Fondo cápsula
-        bg_col = QColor("#16181E")
-        border_col = QColor("#D500F9" if self.gr_db < -0.2 else "#2B303C")
-        painter.setPen(QPen(border_col, 1))
+        # Fondo cápsula translúcido estilo HUD
+        bg_col = QColor(16, 18, 24, 138)
+        border_col = QColor("#D500F9" if self.gr_db < -0.2 else "#3E4452")
+        painter.setPen(QPen(border_col, 1.15))
         painter.setBrush(QBrush(bg_col))
-        painter.drawRoundedRect(QRectF(0.5, 0.5, w - 1, h - 1), 4.0, 4.0)
+        painter.drawRoundedRect(QRectF(0.8, 0.8, w - 1.6, h - 1.6), 5.0, 5.0)
 
         # Barra de atenuación (Rango 0 dB a -18 dB)
         ratio = float(np.clip(-self.gr_db / 18.0, 0.0, 1.0))
@@ -4389,36 +5050,35 @@ class LimiterGRMiniWidget(QWidget):
         # Texto GR
         font = QFont("Segoe UI", 8, QFont.Weight.Bold)
         painter.setFont(font)
-        text_col = QColor("#FFFFFF" if self.gr_db < -0.2 else "#787C85")
+        text_col = QColor("#FFFFFF" if self.gr_db < -0.2 else "#9EA6B5")
         painter.setPen(text_col)
         txt = f"GR {self.gr_db:.1f}" if self.gr_db < -0.05 else "GR 0.0"
         painter.drawText(QRectF(0, 0, w, h), Qt.AlignmentFlag.AlignCenter, txt)
 
 
-class LimiterControlPopup(QWidget):
+class LimiterControlPopup(HUDPopupDialog):
     """
-    Panel flotante no-modal de controles para el Limitador Master estilo 'Fruity Limiter'.
-    Permite ajustar Threshold, Ceiling, Attack, Release y visualizar la reducción de ganancia en vivo.
+    Panel flotante no-modal de controles para el Limitador Master estilo 'Fruity Limiter'
+    con el diseño translúcido del HUD + Gaussian Blur y renderizado en GPU con OpenGL.
     """
 
     def __init__(self, eq_engine, overlay_ref=None, app_ref=None, parent=None):
-        super().__init__(parent, Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
+        super().__init__(parent=parent, accent_color="#D500F9", corner_radius=10.0)
         self.eq_engine = eq_engine
         self.overlay_ref = overlay_ref
         self.app_ref = app_ref
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
         self.setFixedWidth(340)
 
         self.setStyleSheet("""
             QWidget {
-                background-color: #16181E;
+                background: transparent;
                 color: #ECEFF4;
                 font-family: "Segoe UI", sans-serif;
                 font-size: 11px;
             }
             QSlider::groove:horizontal {
                 height: 4px;
-                background: #252830;
+                background: rgba(37, 40, 48, 200);
                 border-radius: 2px;
             }
             QSlider::sub-page:horizontal {
@@ -4434,29 +5094,27 @@ class LimiterControlPopup(QWidget):
                 border-radius: 6px;
             }
             QPushButton#toggleBtn {
-                background-color: #D500F9;
-                color: #FFFFFF;
+                background-color: rgba(213, 0, 249, 55);
+                color: #F3B8FF;
                 font-weight: bold;
-                border: 1px solid #EA80FC;
-                border-radius: 4px;
+                border: 1.25px solid #D500F9;
+                border-radius: 5px;
                 padding: 4px 10px;
                 font-size: 11px;
             }
-            QPushButton#toggleBtn:checked {
-                background-color: #D500F9;
-                color: #FFFFFF;
-            }
             QPushButton#actionBtn {
-                background-color: #242730;
-                color: #B0B5C0;
-                border: 1px solid #363C48;
-                border-radius: 4px;
+                background-color: rgba(16, 18, 24, 140);
+                color: #C5CDD9;
+                border: 1px solid rgba(62, 68, 82, 165);
+                border-radius: 5px;
                 padding: 3px 10px;
                 font-size: 10px;
+                font-weight: bold;
             }
             QPushButton#actionBtn:hover {
-                background-color: #2F3340;
+                background-color: rgba(213, 0, 249, 36);
                 color: #FFFFFF;
+                border-color: #D500F9;
             }
         """)
 
@@ -4596,21 +5254,21 @@ class LimiterControlPopup(QWidget):
         if enabled:
             self.toggle_btn.setText("Limitador: ACTIVO")
             self.toggle_btn.setStyleSheet("""
-                background-color: #D500F9;
-                color: #FFFFFF;
+                background-color: rgba(213, 0, 249, 55);
+                color: #F3B8FF;
                 font-weight: bold;
-                border: 1px solid #EA80FC;
-                border-radius: 4px;
+                border: 1.25px solid #D500F9;
+                border-radius: 5px;
                 padding: 4px 10px;
             """)
         else:
             self.toggle_btn.setText("Limitador: APAGADO")
             self.toggle_btn.setStyleSheet("""
-                background-color: #262932;
-                color: #7E8594;
+                background-color: rgba(16, 18, 24, 138);
+                color: #9AA2B2;
                 font-weight: bold;
-                border: 1px solid #3E4350;
-                border-radius: 4px;
+                border: 1px solid rgba(62, 68, 82, 165);
+                border-radius: 5px;
                 padding: 4px 10px;
             """)
 
@@ -4941,16 +5599,17 @@ class AutoGainMiniBar(QWidget):
 class CrossoverMenuWidget(QWidget):
     """
     Panel de control para el Crossover Digital de Salidas (Out A / Out B)
-    para alojar dentro de un QMenu con QWidgetAction con estética oscura (#14171F).
+    para alojar dentro de un HUDPopupMenu con QWidgetAction y estética HUD translúcida.
     """
     configChanged = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFixedWidth(290)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setStyleSheet("""
             QWidget {
-                background-color: #14171F;
+                background-color: transparent;
                 color: #ECEFF4;
                 font-family: "Segoe UI", sans-serif;
                 font-size: 11px;
@@ -4964,41 +5623,29 @@ class CrossoverMenuWidget(QWidget):
             QCheckBox::indicator {
                 width: 15px;
                 height: 15px;
-                border: 1px solid #4A5263;
+                border: 1px solid rgba(74, 82, 99, 190);
                 border-radius: 3px;
-                background-color: #1B1E28;
+                background-color: rgba(16, 18, 24, 150);
             }
             QCheckBox::indicator:checked {
                 background-color: #FFB300;
                 border: 1px solid #FFD54F;
             }
             QLabel {
-                color: #9AA2B2;
+                color: #C5CDD9;
                 font-size: 10px;
                 font-weight: 600;
-            }
-            QDoubleSpinBox {
-                background-color: #1B1E28;
-                color: #ECEFF4;
-                border: 1px solid #333A4A;
-                border-radius: 4px;
-                padding: 3px 6px;
-                font-size: 11px;
-                font-weight: 600;
-            }
-            QDoubleSpinBox:focus {
-                border: 1px solid #FFB300;
             }
             QComboBox {
-                background-color: #1B1E28;
+                background-color: rgba(16, 18, 24, 150);
                 color: #ECEFF4;
-                border: 1px solid #333A4A;
-                border-radius: 4px;
+                border: 1px solid rgba(62, 68, 82, 175);
+                border-radius: 5px;
                 padding: 3px 6px;
                 font-size: 10px;
-                font-weight: 500;
+                font-weight: 600;
             }
-            QComboBox:focus {
+            QComboBox:hover, QComboBox:focus {
                 border: 1px solid #FFB300;
             }
         """)
@@ -5014,7 +5661,7 @@ class CrossoverMenuWidget(QWidget):
 
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setStyleSheet("background-color: #242936; min-height: 1px; max-height: 1px;")
+        sep.setStyleSheet("background-color: rgba(255, 255, 255, 28); min-height: 1px; max-height: 1px;")
         layout.addWidget(sep)
 
         grid = QGridLayout()
@@ -5029,6 +5676,7 @@ class CrossoverMenuWidget(QWidget):
         self.spin_freq.setSuffix(" Hz")
         self.spin_freq.setKeyboardTracking(False)
         self.spin_freq.setValue(80.0)
+        style_hud_spinbox(self.spin_freq, accent_color="#FFB300")
         grid.addWidget(lbl_freq, 0, 0)
         grid.addWidget(self.spin_freq, 0, 1)
 
@@ -5036,7 +5684,7 @@ class CrossoverMenuWidget(QWidget):
         lbl_type = QLabel("Tipo de Filtro:", self)
         self.combo_type = QComboBox(self)
         self.combo_type.addItems(["Linkwitz-Riley", "Butterworth"])
-        style_dark_combobox(self.combo_type)
+        style_dark_combobox(self.combo_type, accent_color="#FFB300")
         grid.addWidget(lbl_type, 1, 0)
         grid.addWidget(self.combo_type, 1, 1)
 
@@ -5046,7 +5694,7 @@ class CrossoverMenuWidget(QWidget):
         self.combo_slope.addItem("12 dB/oct", 12)
         self.combo_slope.addItem("24 dB/oct", 24)
         self.combo_slope.addItem("48 dB/oct", 48)
-        style_dark_combobox(self.combo_slope)
+        style_dark_combobox(self.combo_slope, accent_color="#FFB300")
         grid.addWidget(lbl_slope, 2, 0)
         grid.addWidget(self.combo_slope, 2, 1)
 
@@ -5056,7 +5704,7 @@ class CrossoverMenuWidget(QWidget):
         self.combo_routing.addItem("Out A: Tops (HP)  |  Out B: Sub (LP)", "A_Tops_B_Sub")
         self.combo_routing.addItem("Out A: Sub (LP)   |  Out B: Tops (HP)", "A_Sub_B_Tops")
         self.combo_routing.addItem("Out A: Full Range |  Out B: Sub (LP)", "A_Full_B_Sub")
-        style_dark_combobox(self.combo_routing)
+        style_dark_combobox(self.combo_routing, accent_color="#FFB300")
         grid.addWidget(lbl_routing, 3, 0)
         grid.addWidget(self.combo_routing, 3, 1)
 
