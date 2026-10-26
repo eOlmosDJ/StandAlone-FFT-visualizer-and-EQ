@@ -116,7 +116,7 @@ class _HUDPopupGLHelper:
 
         now = time.perf_counter()
         _, pw, ov = _resolve_app_and_plot(self.widget)
-        if (self._blur_pixmap is None or (now - self._last_blur_time) >= 0.030) and pw is not None and ov is not None:
+        if (self._blur_pixmap is None or (now - self._last_blur_time) >= 0.080) and pw is not None and ov is not None:
             self._last_blur_time = now
             global_tl = self.widget.mapToGlobal(QPoint(0, 0))
             local_in_pw = pw.mapFromGlobal(global_tl)
@@ -1798,12 +1798,14 @@ class BandNodeCallout(QWidget):
         full_path = self._build_callout_path(w)
 
         pw = getattr(self.overlay, "plot_widget", None)
-        blur_pix = None
-        if pw is not None:
+        now = time.perf_counter()
+        if (getattr(self, "_blur_pixmap", None) is None or (now - getattr(self, "_last_blur_time", 0.0)) >= 0.080) and pw is not None:
+            self._last_blur_time = now
             scene_pt = pw.mapToScene(self.pos())
-            blur_pix = HUDOpenGLBackgroundItem.render_scene_blur_pixmap(
+            self._blur_pixmap = HUDOpenGLBackgroundItem.render_scene_blur_pixmap(
                 self.overlay, pw, float(scene_pt.x()), float(scene_pt.y()), w, h, QColor(self._band_color)
             )
+        blur_pix = getattr(self, "_blur_pixmap", None)
 
         if blur_pix is not None and not blur_pix.isNull():
             painter.save()
@@ -3628,25 +3630,32 @@ class HUDOpenGLBackgroundItem(QGraphicsItem):
         p.quadTo(QPointF(x_left, y_top), QPointF(x_left + r_corner, y_top))
         p.closeSubpath()
 
-    @staticmethod
-    def _separable_gaussian_blur(arr: np.ndarray, k: np.ndarray) -> np.ndarray:
-        # Dos pasadas separables X + Y para lograr un radio efectivo amplio con costo casi nulo
+    @classmethod
+    def _separable_gaussian_blur(cls, arr: np.ndarray, k: np.ndarray) -> np.ndarray:
+        # Dos pasadas separables X + Y ultra-rápidas mediante vistas continuas (sin sobrecosto de np.pad)
+        bh, bw = arr.shape[0], arr.shape[1]
         for _ in range(2):
-            p = np.pad(arr, ((0, 0), (2, 2), (0, 0)), mode="edge")
+            px = np.empty((bh, bw + 4, 4), dtype=np.float32)
+            px[:, 2:-2, :] = arr
+            px[:, :2, :] = arr[:, 0:1, :]
+            px[:, -2:, :] = arr[:, -1:, :]
             arr = (
-                k[0] * p[:, 0:-4, :]
-                + k[1] * p[:, 1:-3, :]
-                + k[2] * p[:, 2:-2, :]
-                + k[3] * p[:, 3:-1, :]
-                + k[4] * p[:, 4:, :]
+                k[0] * px[:, :-4, :]
+                + k[1] * px[:, 1:-3, :]
+                + k[2] * px[:, 2:-2, :]
+                + k[3] * px[:, 3:-1, :]
+                + k[4] * px[:, 4:, :]
             )
-            p = np.pad(arr, ((2, 2), (0, 0), (0, 0)), mode="edge")
+            py = np.empty((bh + 4, bw, 4), dtype=np.float32)
+            py[2:-2, :, :] = arr
+            py[:2, :, :] = arr[0:1, :, :]
+            py[-2:, :, :] = arr[-1:, :, :]
             arr = (
-                k[0] * p[0:-4, :, :]
-                + k[1] * p[1:-3, :, :]
-                + k[2] * p[2:-2, :, :]
-                + k[3] * p[3:-1, :, :]
-                + k[4] * p[4:, :, :]
+                k[0] * py[:-4, :, :]
+                + k[1] * py[1:-3, :, :]
+                + k[2] * py[2:-2, :, :]
+                + k[3] * py[3:-1, :, :]
+                + k[4] * py[4:, :, :]
             )
         return arr
 
@@ -3913,7 +3922,7 @@ class HUDOpenGLBackgroundItem(QGraphicsItem):
 
     def _update_gaussian_blur_texture(self):
         now = time.perf_counter()
-        if self._blur_pixmap is not None and (now - self._last_blur_time) < 0.028:
+        if self._blur_pixmap is not None and (now - self._last_blur_time) < 0.080:
             return
         self._last_blur_time = now
 

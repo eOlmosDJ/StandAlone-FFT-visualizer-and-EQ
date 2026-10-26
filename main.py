@@ -4769,23 +4769,17 @@ class AudioAnalyzerApp(QMainWindow):
         self.schedule_config_save()
 
     def audio_callback(self, indata, outdata, frames, time_info, status):
-        # Desacoplar ventana visual FFT del blocksize
-        if not hasattr(self, "fft_accum_buf") or self.fft_accum_buf.shape[0] != 4096:
-            self.fft_accum_buf = np.zeros((4096, 2), dtype=np.float32)
-        if frames >= 4096:
-            self.fft_accum_buf[:] = indata[-4096:]
-        else:
-            self.fft_accum_buf[:-frames] = self.fft_accum_buf[frames:]
-            self.fft_accum_buf[-frames:] = indata
-
         # 1. Procesamiento independiente de Input 1
         in1_a, in1_b = self.eq_proc_in1.process_dual_block(indata, apply_limiter=False, apply_autogain=False)
 
         # 2. Lectura y procesamiento independiente de Input 2 (Aux / Mic) desde el ring buffer lock-free
         if not hasattr(self, "in2_block") or self.in2_block.shape[0] != frames:
             self.in2_block = np.zeros((frames, 2), dtype=np.float32)
-        self.in2_ring_buffer.read_into(self.in2_block)
-        in2_a, in2_b = self.eq_proc_in2.process_dual_block(self.in2_block, apply_limiter=False, apply_autogain=False)
+        if self.route_in2_to_a or self.route_in2_to_b:
+            self.in2_ring_buffer.read_into(self.in2_block)
+            in2_a, in2_b = self.eq_proc_in2.process_dual_block(self.in2_block, apply_limiter=False, apply_autogain=False)
+        else:
+            in2_a = in2_b = None
 
         # 3. Matriz de ruteo libre de acoples hacia Out A y Out B
         out_A = np.zeros_like(in1_a)
@@ -4794,9 +4788,9 @@ class AudioAnalyzerApp(QMainWindow):
             out_A += in1_a
         if self.route_in1_to_b:
             out_B += in1_b
-        if self.route_in2_to_a:
+        if self.route_in2_to_a and in2_a is not None:
             out_A += in2_a
-        if self.route_in2_to_b:
+        if self.route_in2_to_b and in2_b is not None:
             out_B += in2_b
 
         # 4. Inyección del Generador de Ruido Blanco RTA con rampa suave (50 ms fade-in / fade-out)
@@ -4892,39 +4886,45 @@ class AudioAnalyzerApp(QMainWindow):
             self.ring_buffer_out_b.write(blk_b)
 
         # 9. Cola de renderizado visual a la UI (In 1, In 2, Out A, Out B)
-        # Para tamaños de bloque micro (64 o 128 muestras), acumulamos hasta >=256 muestras (~180 Hz)
-        # para eliminar el 80% de contención de cola y carga de recolección de basura
-        if not hasattr(self, "_vis_accum_count"):
-            self._vis_accum_count = 0
-            self._vis_in1_buf = []
-            self._vis_in2_buf = []
-            self._vis_outA_buf = []
-            self._vis_outB_buf = []
+        # Prealocación de buffers contiguos de acumulación hasta >=512 muestras para 0% garbage collection
+        if not hasattr(self, "_vis_accum_ptr"):
+            self._vis_accum_ptr = 0
+            self._vis_accum_cap = 512
+            self._vis_in1_arr = np.zeros((self._vis_accum_cap, 2), dtype=np.float32)
+            self._vis_in2_arr = np.zeros((self._vis_accum_cap, 2), dtype=np.float32)
+            self._vis_outA_arr = np.zeros((self._vis_accum_cap, 2), dtype=np.float32)
+            self._vis_outB_arr = np.zeros((self._vis_accum_cap, 2), dtype=np.float32)
 
-        if frames < 256:
-            self._vis_accum_count += frames
-            self._vis_in1_buf.append(indata.copy())
-            self._vis_in2_buf.append(self.in2_block.copy())
-            self._vis_outA_buf.append(out_A.copy())
-            self._vis_outB_buf.append(out_B.copy())
-            if self._vis_accum_count >= 256:
+        p = self._vis_accum_ptr
+        if p + frames <= self._vis_accum_cap:
+            self._vis_in1_arr[p:p + frames] = indata
+            if in2_a is not None:
+                self._vis_in2_arr[p:p + frames] = self.in2_block
+            else:
+                self._vis_in2_arr[p:p + frames] = 0.0
+            self._vis_outA_arr[p:p + frames] = out_A
+            self._vis_outB_arr[p:p + frames] = out_B
+            self._vis_accum_ptr += frames
+            if self._vis_accum_ptr >= self._vis_accum_cap:
                 try:
-                    c_in1 = np.concatenate(self._vis_in1_buf) if len(self._vis_in1_buf) > 1 else self._vis_in1_buf[0]
-                    c_in2 = np.concatenate(self._vis_in2_buf) if len(self._vis_in2_buf) > 1 else self._vis_in2_buf[0]
-                    c_outA = np.concatenate(self._vis_outA_buf) if len(self._vis_outA_buf) > 1 else self._vis_outA_buf[0]
-                    c_outB = np.concatenate(self._vis_outB_buf) if len(self._vis_outB_buf) > 1 else self._vis_outB_buf[0]
-                    self.audio_queue.put_nowait((c_in1, c_in2, c_outA, c_outB))
+                    self.audio_queue.put_nowait((
+                        self._vis_in1_arr.copy(),
+                        self._vis_in2_arr.copy(),
+                        self._vis_outA_arr.copy(),
+                        self._vis_outB_arr.copy(),
+                    ))
                 except (queue.Full, Exception):
                     pass
-                self._vis_accum_count = 0
-                self._vis_in1_buf.clear()
-                self._vis_in2_buf.clear()
-                self._vis_outA_buf.clear()
-                self._vis_outB_buf.clear()
+                self._vis_accum_ptr = 0
         else:
             try:
-                self.audio_queue.put_nowait((indata.copy(), self.in2_block.copy(), out_A.copy(), out_B.copy()))
-            except queue.Full:
+                self.audio_queue.put_nowait((
+                    indata.copy(),
+                    self.in2_block.copy() if in2_a is not None else np.zeros((frames, 2), dtype=np.float32),
+                    out_A.copy(),
+                    out_B.copy(),
+                ))
+            except (queue.Full, Exception):
                 pass
 
     def audio_callback_out_b(self, outdata, frames, time_info, status):
@@ -5342,27 +5342,26 @@ class AudioAnalyzerApp(QMainWindow):
             if show_out2:
                 self._out2_was_shown = True
 
-        # Refrescar elementos HUD translúcidos visibles para que las curvas dinámicas FFT/EQ se vean en vivo a través del cristal
-        if hasattr(self, "eq_panel") and self.eq_panel.isVisible() and self.eq_panel._bg_gl_item is not None:
-            self.eq_panel._bg_gl_item.update()
-            self.eq_panel.update()
-        if hasattr(self, "eq_overlay") and hasattr(self.eq_overlay, "node_callout") and self.eq_overlay.node_callout.isVisible():
-            if self.eq_overlay.node_callout._bg_gl_item is not None:
-                self.eq_overlay.node_callout._bg_gl_item.update()
-            self.eq_overlay.node_callout.update()
-        if hasattr(self, "eq_overlay") and hasattr(self.eq_overlay, "fft_inspector") and self.eq_overlay.fft_inspector.isVisible():
-            self.eq_overlay.fft_inspector.update()
-        for pop_w in (
-            getattr(self, "audio_popup", None),
-            getattr(self, "analyzer_popup", None),
-            getattr(self, "_crossover_menu", None),
-            getattr(getattr(self, "scope_overlay", None), "settings_popup", None),
-            getattr(getattr(self, "scope_overlay", None), "limiter_popup", None),
-        ):
-            if pop_w is not None and pop_w.isVisible() and hasattr(pop_w, "_hud_gl"):
-                if pop_w._hud_gl._bg_gl_item is not None:
-                    pop_w._hud_gl._bg_gl_item.update()
-                pop_w.update()
+        # Actualización desacoplada de fondos translúcidos OpenGL a ~20 FPS para máxima fluidez a 60 FPS
+        if not hasattr(self, "_hud_gl_tick"):
+            self._hud_gl_tick = 0
+        self._hud_gl_tick = (self._hud_gl_tick + 1) % 3
+        if self._hud_gl_tick == 0:
+            if hasattr(self, "eq_panel") and self.eq_panel.isVisible() and self.eq_panel._bg_gl_item is not None:
+                self.eq_panel._bg_gl_item.update()
+            if hasattr(self, "eq_overlay") and hasattr(self.eq_overlay, "node_callout") and self.eq_overlay.node_callout.isVisible():
+                if self.eq_overlay.node_callout._bg_gl_item is not None:
+                    self.eq_overlay.node_callout._bg_gl_item.update()
+            for pop_w in (
+                getattr(self, "audio_popup", None),
+                getattr(self, "analyzer_popup", None),
+                getattr(self, "_crossover_menu", None),
+                getattr(getattr(self, "scope_overlay", None), "settings_popup", None),
+                getattr(getattr(self, "scope_overlay", None), "limiter_popup", None),
+            ):
+                if pop_w is not None and pop_w.isVisible() and hasattr(pop_w, "_hud_gl"):
+                    if pop_w._hud_gl._bg_gl_item is not None:
+                        pop_w._hud_gl._bg_gl_item.update()
 
 
     def closeEvent(self, event):

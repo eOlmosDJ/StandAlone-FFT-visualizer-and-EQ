@@ -200,67 +200,93 @@ def _apply_sos_channel_mode(
     """
     Aplica filtrado SOS in-place sobre un bloque estéreo `(N, 2)` según `channel_mode`.
     Utiliza el kernel directo en C `_c_sosfilt` para máxima velocidad sin asignaciones dinámicas.
+    Soporta formato nativo C-contiguous channel-first `(channels, n_sec, 2)` con cero copias.
     """
-    if block.ndim == 1:
-        if _c_sosfilt is not None:
-            col = np.ascontiguousarray(block, dtype=np.float64)[np.newaxis, :]
-            zi_col = np.ascontiguousarray(zi[:, :, 0], dtype=np.float64)[np.newaxis, :, :]
-            _c_sosfilt(sos, col, zi_col)
-            block[:] = col[0]
-            zi[:, :, 0] = zi_col[0]
-        else:
-            block[:], zi[:, :, 0] = sosfilt(sos, block, zi=zi[:, :, 0])
-        return
+    is_channel_first = (zi.ndim == 3 and zi.shape[0] == 2)
 
-    if block.shape[1] < 2:
+    if block.ndim == 1 or block.shape[1] < 2:
+        col = block if block.ndim == 1 else block[:, 0]
         if _c_sosfilt is not None:
-            col = np.ascontiguousarray(block[:, 0], dtype=np.float64)[np.newaxis, :]
-            zi_col = np.ascontiguousarray(zi[:, :, 0], dtype=np.float64)[np.newaxis, :, :]
-            _c_sosfilt(sos, col, zi_col)
-            block[:, 0] = col[0]
-            zi[:, :, 0] = zi_col[0]
+            c_arr = np.ascontiguousarray(col, dtype=np.float64)[np.newaxis, :]
+            z_arr = zi[0:1] if is_channel_first else np.ascontiguousarray(zi[:, :, 0], dtype=np.float64)[np.newaxis, :, :]
+            _c_sosfilt(sos, c_arr, z_arr)
+            col[:] = c_arr[0]
+            if not is_channel_first:
+                zi[:, :, 0] = z_arr[0]
         else:
-            block[:, 0], zi[:, :, 0] = sosfilt(sos, block[:, 0], zi=zi[:, :, 0])
+            z_in = zi[0] if is_channel_first else zi[:, :, 0]
+            filt, z_out = sosfilt(sos, col, zi=z_in)
+            col[:] = filt
+            if is_channel_first:
+                zi[0] = z_out
+            else:
+                zi[:, :, 0] = z_out
         return
 
     if channel_mode == "L":
         if _c_sosfilt is not None:
-            col = np.ascontiguousarray(block[:, 0], dtype=np.float64)[np.newaxis, :]
-            zi_col = np.ascontiguousarray(zi[:, :, 0], dtype=np.float64)[np.newaxis, :, :]
-            _c_sosfilt(sos, col, zi_col)
-            block[:, 0] = col[0]
-            zi[:, :, 0] = zi_col[0]
+            c_arr = np.ascontiguousarray(block[:, 0], dtype=np.float64)[np.newaxis, :]
+            z_arr = zi[0:1] if is_channel_first else np.ascontiguousarray(zi[:, :, 0], dtype=np.float64)[np.newaxis, :, :]
+            _c_sosfilt(sos, c_arr, z_arr)
+            block[:, 0] = c_arr[0]
+            if not is_channel_first:
+                zi[:, :, 0] = z_arr[0]
         else:
-            block[:, 0], zi[:, :, 0] = sosfilt(sos, block[:, 0], zi=zi[:, :, 0])
+            z_in = zi[0] if is_channel_first else zi[:, :, 0]
+            filt, z_out = sosfilt(sos, block[:, 0], zi=z_in)
+            block[:, 0] = filt
+            if is_channel_first:
+                zi[0] = z_out
+            else:
+                zi[:, :, 0] = z_out
     elif channel_mode == "R":
         if _c_sosfilt is not None:
-            col = np.ascontiguousarray(block[:, 1], dtype=np.float64)[np.newaxis, :]
-            zi_col = np.ascontiguousarray(zi[:, :, 1], dtype=np.float64)[np.newaxis, :, :]
-            _c_sosfilt(sos, col, zi_col)
-            block[:, 1] = col[0]
-            zi[:, :, 1] = zi_col[0]
+            c_arr = np.ascontiguousarray(block[:, 1], dtype=np.float64)[np.newaxis, :]
+            z_arr = zi[1:2] if is_channel_first else np.ascontiguousarray(zi[:, :, 1], dtype=np.float64)[np.newaxis, :, :]
+            _c_sosfilt(sos, c_arr, z_arr)
+            block[:, 1] = c_arr[0]
+            if not is_channel_first:
+                zi[:, :, 1] = z_arr[0]
         else:
-            block[:, 1], zi[:, :, 1] = sosfilt(sos, block[:, 1], zi=zi[:, :, 1])
+            z_in = zi[1] if is_channel_first else zi[:, :, 1]
+            filt, z_out = sosfilt(sos, block[:, 1], zi=z_in)
+            block[:, 1] = filt
+            if is_channel_first:
+                zi[1] = z_out
+            else:
+                zi[:, :, 1] = z_out
     elif channel_mode == "Mid":
         ch_l = block[:, 0]
         ch_r = block[:, 1]
         mid = 0.5 * (ch_l + ch_r)
         side = 0.5 * (ch_l - ch_r)
         if _c_sosfilt is not None:
-            target_zi = zi_mid if zi_mid is not None else zi[:, :, 0]
+            if zi_mid is not None and zi_mid.ndim == 3 and zi_mid.shape[0] == 1:
+                z_arr = zi_mid
+            elif is_channel_first and zi_mid is None:
+                z_arr = zi[0:1]
+            else:
+                target_zi = zi_mid if zi_mid is not None else zi[:, :, 0]
+                z_arr = np.ascontiguousarray(target_zi, dtype=np.float64)[np.newaxis, :, :]
             m_arr = np.ascontiguousarray(mid, dtype=np.float64)[np.newaxis, :]
-            z_arr = np.ascontiguousarray(target_zi, dtype=np.float64)[np.newaxis, :, :]
             _c_sosfilt(sos, m_arr, z_arr)
             mid_f = m_arr[0]
-            if zi_mid is not None:
-                zi_mid[:] = z_arr[0]
-            else:
+            if not is_channel_first and zi_mid is None:
                 zi[:, :, 0] = z_arr[0]
+            elif zi_mid is not None and zi_mid.ndim == 2:
+                zi_mid[:] = z_arr[0]
         else:
+            z_in = zi_mid[0] if (zi_mid is not None and zi_mid.ndim == 3) else (zi_mid if zi_mid is not None else (zi[0] if is_channel_first else zi[:, :, 0]))
+            mid_f, z_out = sosfilt(sos, mid, zi=z_in)
             if zi_mid is not None:
-                mid_f, zi_mid[:] = sosfilt(sos, mid, zi=zi_mid)
+                if zi_mid.ndim == 3:
+                    zi_mid[0] = z_out
+                else:
+                    zi_mid[:] = z_out
+            elif is_channel_first:
+                zi[0] = z_out
             else:
-                mid_f, zi[:, :, 0] = sosfilt(sos, mid, zi=zi[:, :, 0])
+                zi[:, :, 0] = z_out
         block[:, 0] = mid_f + side
         block[:, 1] = mid_f - side
     elif channel_mode == "Side":
@@ -269,31 +295,52 @@ def _apply_sos_channel_mode(
         mid = 0.5 * (ch_l + ch_r)
         side = 0.5 * (ch_l - ch_r)
         if _c_sosfilt is not None:
-            target_zi = zi_side if zi_side is not None else zi[:, :, 1]
+            if zi_side is not None and zi_side.ndim == 3 and zi_side.shape[0] == 1:
+                z_arr = zi_side
+            elif is_channel_first and zi_side is None:
+                z_arr = zi[1:2]
+            else:
+                target_zi = zi_side if zi_side is not None else zi[:, :, 1]
+                z_arr = np.ascontiguousarray(target_zi, dtype=np.float64)[np.newaxis, :, :]
             s_arr = np.ascontiguousarray(side, dtype=np.float64)[np.newaxis, :]
-            z_arr = np.ascontiguousarray(target_zi, dtype=np.float64)[np.newaxis, :, :]
             _c_sosfilt(sos, s_arr, z_arr)
             side_f = s_arr[0]
-            if zi_side is not None:
-                zi_side[:] = z_arr[0]
-            else:
+            if not is_channel_first and zi_side is None:
                 zi[:, :, 1] = z_arr[0]
+            elif zi_side is not None and zi_side.ndim == 2:
+                zi_side[:] = z_arr[0]
         else:
+            z_in = zi_side[0] if (zi_side is not None and zi_side.ndim == 3) else (zi_side if zi_side is not None else (zi[1] if is_channel_first else zi[:, :, 1]))
+            side_f, z_out = sosfilt(sos, side, zi=z_in)
             if zi_side is not None:
-                side_f, zi_side[:] = sosfilt(sos, side, zi=zi_side)
+                if zi_side.ndim == 3:
+                    zi_side[0] = z_out
+                else:
+                    zi_side[:] = z_out
+            elif is_channel_first:
+                zi[1] = z_out
             else:
-                side_f, zi[:, :, 1] = sosfilt(sos, side, zi=zi[:, :, 1])
+                zi[:, :, 1] = z_out
         block[:, 0] = mid + side_f
         block[:, 1] = mid - side_f
     else:  # "LR"
         if _c_sosfilt is not None:
             x_c = np.ascontiguousarray(block[:, 0:2].T, dtype=np.float64)
-            zi_c = np.ascontiguousarray(np.moveaxis(zi[:, :, 0:2], -1, 0), dtype=np.float64)
-            _c_sosfilt(sos, x_c, zi_c)
+            if is_channel_first:
+                _c_sosfilt(sos, x_c, zi[0:2])
+            else:
+                zi_c = np.ascontiguousarray(np.moveaxis(zi[:, :, 0:2], -1, 0), dtype=np.float64)
+                _c_sosfilt(sos, x_c, zi_c)
+                zi[:, :, 0:2] = np.moveaxis(zi_c, 0, -1)
             block[:, 0:2] = x_c.T
-            zi[:, :, 0:2] = np.moveaxis(zi_c, 0, -1)
         else:
-            block[:, 0:2], zi[:, :, 0:2] = sosfilt(sos, block[:, 0:2], axis=0, zi=zi[:, :, 0:2])
+            if is_channel_first:
+                z_sc = np.ascontiguousarray(np.moveaxis(zi[0:2], 0, -1))
+                filt, z_sc_out = sosfilt(sos, block[:, 0:2], axis=0, zi=z_sc)
+                block[:, 0:2] = filt
+                zi[0:2] = np.moveaxis(z_sc_out, -1, 0)
+            else:
+                block[:, 0:2], zi[:, :, 0:2] = sosfilt(sos, block[:, 0:2], axis=0, zi=zi[:, :, 0:2])
 
 
 def _apply_isolate_channel_mode(
@@ -306,18 +353,27 @@ def _apply_isolate_channel_mode(
 ) -> np.ndarray:
     """
     Aplica el filtro Band-Pass de Isolate respetando `channel_mode` con kernel directo en C.
+    Soporta formato nativo C-contiguous channel-first `(channels, n_sec, 2)` con cero copias.
     """
     out = np.zeros_like(indata_f64)
+    is_channel_first = (zi.ndim == 3 and zi.shape[0] == 2)
+
     if indata_f64.ndim == 1 or indata_f64.shape[1] < 2:
         col = indata_f64 if indata_f64.ndim == 1 else indata_f64[:, 0]
         if _c_sosfilt is not None:
             c_arr = np.ascontiguousarray(col, dtype=np.float64)[np.newaxis, :]
-            z_arr = np.ascontiguousarray(zi[:, :, 0], dtype=np.float64)[np.newaxis, :, :]
+            z_arr = zi[0:1] if is_channel_first else np.ascontiguousarray(zi[:, :, 0], dtype=np.float64)[np.newaxis, :, :]
             _c_sosfilt(sos, c_arr, z_arr)
             filt = c_arr[0]
-            zi[:, :, 0] = z_arr[0]
+            if not is_channel_first:
+                zi[:, :, 0] = z_arr[0]
         else:
-            filt, zi[:, :, 0] = sosfilt(sos, col, zi=zi[:, :, 0])
+            z_in = zi[0] if is_channel_first else zi[:, :, 0]
+            filt, z_out = sosfilt(sos, col, zi=z_in)
+            if is_channel_first:
+                zi[0] = z_out
+            else:
+                zi[:, :, 0] = z_out
         if out.ndim == 1:
             out[:] = filt
         else:
@@ -327,70 +383,117 @@ def _apply_isolate_channel_mode(
     if channel_mode == "L":
         if _c_sosfilt is not None:
             c_arr = np.ascontiguousarray(indata_f64[:, 0], dtype=np.float64)[np.newaxis, :]
-            z_arr = np.ascontiguousarray(zi[:, :, 0], dtype=np.float64)[np.newaxis, :, :]
+            z_arr = zi[0:1] if is_channel_first else np.ascontiguousarray(zi[:, :, 0], dtype=np.float64)[np.newaxis, :, :]
             _c_sosfilt(sos, c_arr, z_arr)
             out[:, 0] = c_arr[0]
-            zi[:, :, 0] = z_arr[0]
+            if not is_channel_first:
+                zi[:, :, 0] = z_arr[0]
         else:
-            out[:, 0], zi[:, :, 0] = sosfilt(sos, indata_f64[:, 0], zi=zi[:, :, 0])
+            z_in = zi[0] if is_channel_first else zi[:, :, 0]
+            filt, z_out = sosfilt(sos, indata_f64[:, 0], zi=z_in)
+            out[:, 0] = filt
+            if is_channel_first:
+                zi[0] = z_out
+            else:
+                zi[:, :, 0] = z_out
         out[:, 1] = 0.0
     elif channel_mode == "R":
         out[:, 0] = 0.0
         if _c_sosfilt is not None:
             c_arr = np.ascontiguousarray(indata_f64[:, 1], dtype=np.float64)[np.newaxis, :]
-            z_arr = np.ascontiguousarray(zi[:, :, 1], dtype=np.float64)[np.newaxis, :, :]
+            z_arr = zi[1:2] if is_channel_first else np.ascontiguousarray(zi[:, :, 1], dtype=np.float64)[np.newaxis, :, :]
             _c_sosfilt(sos, c_arr, z_arr)
             out[:, 1] = c_arr[0]
-            zi[:, :, 1] = z_arr[0]
+            if not is_channel_first:
+                zi[:, :, 1] = z_arr[0]
         else:
-            out[:, 1], zi[:, :, 1] = sosfilt(sos, indata_f64[:, 1], zi=zi[:, :, 1])
+            z_in = zi[1] if is_channel_first else zi[:, :, 1]
+            filt, z_out = sosfilt(sos, indata_f64[:, 1], zi=z_in)
+            out[:, 1] = filt
+            if is_channel_first:
+                zi[1] = z_out
+            else:
+                zi[:, :, 1] = z_out
     elif channel_mode == "Mid":
         mid = 0.5 * (indata_f64[:, 0] + indata_f64[:, 1])
         if _c_sosfilt is not None:
-            target_zi = zi_mid if zi_mid is not None else zi[:, :, 0]
+            if zi_mid is not None and zi_mid.ndim == 3 and zi_mid.shape[0] == 1:
+                z_arr = zi_mid
+            elif is_channel_first and zi_mid is None:
+                z_arr = zi[0:1]
+            else:
+                target_zi = zi_mid if zi_mid is not None else zi[:, :, 0]
+                z_arr = np.ascontiguousarray(target_zi, dtype=np.float64)[np.newaxis, :, :]
             m_arr = np.ascontiguousarray(mid, dtype=np.float64)[np.newaxis, :]
-            z_arr = np.ascontiguousarray(target_zi, dtype=np.float64)[np.newaxis, :, :]
             _c_sosfilt(sos, m_arr, z_arr)
             mid_iso = m_arr[0]
-            if zi_mid is not None:
-                zi_mid[:] = z_arr[0]
-            else:
+            if not is_channel_first and zi_mid is None:
                 zi[:, :, 0] = z_arr[0]
+            elif zi_mid is not None and zi_mid.ndim == 2:
+                zi_mid[:] = z_arr[0]
         else:
+            z_in = zi_mid[0] if (zi_mid is not None and zi_mid.ndim == 3) else (zi_mid if zi_mid is not None else (zi[0] if is_channel_first else zi[:, :, 0]))
+            mid_iso, z_out = sosfilt(sos, mid, zi=z_in)
             if zi_mid is not None:
-                mid_iso, zi_mid[:] = sosfilt(sos, mid, zi=zi_mid)
+                if zi_mid.ndim == 3:
+                    zi_mid[0] = z_out
+                else:
+                    zi_mid[:] = z_out
+            elif is_channel_first:
+                zi[0] = z_out
             else:
-                mid_iso, zi[:, :, 0] = sosfilt(sos, mid, zi=zi[:, :, 0])
+                zi[:, :, 0] = z_out
         out[:, 0] = mid_iso
         out[:, 1] = mid_iso
     elif channel_mode == "Side":
         side = 0.5 * (indata_f64[:, 0] - indata_f64[:, 1])
         if _c_sosfilt is not None:
-            target_zi = zi_side if zi_side is not None else zi[:, :, 1]
+            if zi_side is not None and zi_side.ndim == 3 and zi_side.shape[0] == 1:
+                z_arr = zi_side
+            elif is_channel_first and zi_side is None:
+                z_arr = zi[1:2]
+            else:
+                target_zi = zi_side if zi_side is not None else zi[:, :, 1]
+                z_arr = np.ascontiguousarray(target_zi, dtype=np.float64)[np.newaxis, :, :]
             s_arr = np.ascontiguousarray(side, dtype=np.float64)[np.newaxis, :]
-            z_arr = np.ascontiguousarray(target_zi, dtype=np.float64)[np.newaxis, :, :]
             _c_sosfilt(sos, s_arr, z_arr)
             side_iso = s_arr[0]
-            if zi_side is not None:
-                zi_side[:] = z_arr[0]
-            else:
+            if not is_channel_first and zi_side is None:
                 zi[:, :, 1] = z_arr[0]
+            elif zi_side is not None and zi_side.ndim == 2:
+                zi_side[:] = z_arr[0]
         else:
+            z_in = zi_side[0] if (zi_side is not None and zi_side.ndim == 3) else (zi_side if zi_side is not None else (zi[1] if is_channel_first else zi[:, :, 1]))
+            side_iso, z_out = sosfilt(sos, side, zi=z_in)
             if zi_side is not None:
-                side_iso, zi_side[:] = sosfilt(sos, side, zi=zi_side)
+                if zi_side.ndim == 3:
+                    zi_side[0] = z_out
+                else:
+                    zi_side[:] = z_out
+            elif is_channel_first:
+                zi[1] = z_out
             else:
-                side_iso, zi[:, :, 1] = sosfilt(sos, side, zi=zi[:, :, 1])
+                zi[:, :, 1] = z_out
         out[:, 0] = side_iso
         out[:, 1] = -side_iso
     else:  # "LR"
         if _c_sosfilt is not None:
             x_c = np.ascontiguousarray(indata_f64[:, 0:2].T, dtype=np.float64)
-            zi_c = np.ascontiguousarray(np.moveaxis(zi[:, :, 0:2], -1, 0), dtype=np.float64)
-            _c_sosfilt(sos, x_c, zi_c)
+            if is_channel_first:
+                _c_sosfilt(sos, x_c, zi[0:2])
+            else:
+                zi_c = np.ascontiguousarray(np.moveaxis(zi[:, :, 0:2], -1, 0), dtype=np.float64)
+                _c_sosfilt(sos, x_c, zi_c)
+                zi[:, :, 0:2] = np.moveaxis(zi_c, 0, -1)
             out[:, 0:2] = x_c.T
-            zi[:, :, 0:2] = np.moveaxis(zi_c, 0, -1)
         else:
-            out[:, 0:2], zi[:, :, 0:2] = sosfilt(sos, indata_f64[:, 0:2], axis=0, zi=zi[:, :, 0:2])
+            if is_channel_first:
+                z_sc = np.ascontiguousarray(np.moveaxis(zi[0:2], 0, -1))
+                filt, z_sc_out = sosfilt(sos, indata_f64[:, 0:2], axis=0, zi=z_sc)
+                out[:, 0:2] = filt
+                zi[0:2] = np.moveaxis(z_sc_out, -1, 0)
+            else:
+                out[:, 0:2], zi[:, :, 0:2] = sosfilt(sos, indata_f64[:, 0:2], axis=0, zi=zi[:, :, 0:2])
     return out
 
 
@@ -457,24 +560,24 @@ class EQBand:
         self.sc_sos = design_biquad_sos("Band Pass", self.freq, 0.0, self.q, self.sr)
         self.iso_sos = design_isolate_bandpass_sos(self.freq, self.q, self.sr, cascade_sections=2)
 
-        # Estados de filtro independientes para Bus A (1-2) y Bus B (3-4)
+        # Estados de filtro independientes para Bus A (1-2) y Bus B (3-4) en formato channel-first (C-contiguous)
         n_sec = self.sos_static.shape[0]
-        self.zi_A = np.zeros((n_sec, 2, self.channels), dtype=np.float64)
-        self.zi_B = np.zeros((n_sec, 2, self.channels), dtype=np.float64)
-        self.zi_mid_A = np.zeros((n_sec, 2), dtype=np.float64)
-        self.zi_side_A = np.zeros((n_sec, 2), dtype=np.float64)
-        self.zi_mid_B = np.zeros((n_sec, 2), dtype=np.float64)
-        self.zi_side_B = np.zeros((n_sec, 2), dtype=np.float64)
+        self.zi_A = np.zeros((self.channels, n_sec, 2), dtype=np.float64)
+        self.zi_B = np.zeros((self.channels, n_sec, 2), dtype=np.float64)
+        self.zi_mid_A = np.zeros((1, n_sec, 2), dtype=np.float64)
+        self.zi_side_A = np.zeros((1, n_sec, 2), dtype=np.float64)
+        self.zi_mid_B = np.zeros((1, n_sec, 2), dtype=np.float64)
+        self.zi_side_B = np.zeros((1, n_sec, 2), dtype=np.float64)
 
         iso_sec = self.iso_sos.shape[0]
-        self.iso_zi_A = np.zeros((iso_sec, 2, self.channels), dtype=np.float64)
-        self.iso_zi_B = np.zeros((iso_sec, 2, self.channels), dtype=np.float64)
-        self.iso_zi_mid_A = np.zeros((iso_sec, 2), dtype=np.float64)
-        self.iso_zi_side_A = np.zeros((iso_sec, 2), dtype=np.float64)
-        self.iso_zi_mid_B = np.zeros((iso_sec, 2), dtype=np.float64)
-        self.iso_zi_side_B = np.zeros((iso_sec, 2), dtype=np.float64)
+        self.iso_zi_A = np.zeros((self.channels, iso_sec, 2), dtype=np.float64)
+        self.iso_zi_B = np.zeros((self.channels, iso_sec, 2), dtype=np.float64)
+        self.iso_zi_mid_A = np.zeros((1, iso_sec, 2), dtype=np.float64)
+        self.iso_zi_side_A = np.zeros((1, iso_sec, 2), dtype=np.float64)
+        self.iso_zi_mid_B = np.zeros((1, iso_sec, 2), dtype=np.float64)
+        self.iso_zi_side_B = np.zeros((1, iso_sec, 2), dtype=np.float64)
 
-        self.sc_zi = np.zeros((1, 2), dtype=np.float64)
+        self.sc_zi = np.zeros((1, 1, 2), dtype=np.float64)
 
         # Caché de respuesta en frecuencia para no recalcular en IDLE
         self._cache_valid = False
@@ -588,8 +691,8 @@ class EQBand:
         new_sos = design_biquad_sos(
             self.filter_type, self.freq, self.gain_db, self.q, self.sr, self.slope
         )
-        req_shape = (new_sos.shape[0], 2, self.channels)
-        mid_shape = (new_sos.shape[0], 2)
+        req_shape = (self.channels, new_sos.shape[0], 2)
+        mid_shape = (1, new_sos.shape[0], 2)
         if self.zi_A.shape != req_shape:
             self.zi_A = np.zeros(req_shape, dtype=np.float64)
         if self.zi_B.shape != req_shape:
@@ -612,11 +715,11 @@ class EQBand:
 
         self.sc_sos = design_biquad_sos("Band Pass", self.freq, 0.0, self.q, self.sr)
         if self.sc_zi.shape != (1, 2):
-            self.sc_zi = np.zeros((1, 2), dtype=np.float64)
+            self.sc_zi = np.zeros((1, 1, 2), dtype=np.float64)
 
         self.iso_sos = design_isolate_bandpass_sos(self.freq, self.q, self.sr, cascade_sections=2)
-        iso_shape = (self.iso_sos.shape[0], 2, self.channels)
-        iso_mid_shape = (self.iso_sos.shape[0], 2)
+        iso_shape = (self.channels, self.iso_sos.shape[0], 2)
+        iso_mid_shape = (1, self.iso_sos.shape[0], 2)
         if self.iso_zi_A.shape != iso_shape:
             self.iso_zi_A = np.zeros(iso_shape, dtype=np.float64)
         if self.iso_zi_B.shape != iso_shape:
@@ -1250,10 +1353,13 @@ class ParametricEQEngine:
 
                     if _c_sosfilt is not None:
                         sc_arr = np.ascontiguousarray(sc_in, dtype=np.float64)[np.newaxis, :]
-                        sc_zi_arr = np.ascontiguousarray(band.sc_zi, dtype=np.float64)[np.newaxis, :, :]
-                        _c_sosfilt(band.sc_sos, sc_arr, sc_zi_arr)
+                        if band.sc_zi.ndim == 3 and band.sc_zi.shape[0] == 1:
+                            _c_sosfilt(band.sc_sos, sc_arr, band.sc_zi)
+                        else:
+                            sc_zi_arr = np.ascontiguousarray(band.sc_zi, dtype=np.float64)[np.newaxis, :, :]
+                            _c_sosfilt(band.sc_sos, sc_arr, sc_zi_arr)
+                            band.sc_zi[:] = sc_zi_arr[0]
                         band_signal = sc_arr[0]
-                        band.sc_zi[:] = sc_zi_arr[0]
                     else:
                         band_signal, band.sc_zi = sosfilt(band.sc_sos, sc_in, zi=band.sc_zi)
                     rms = np.sqrt(np.mean(band_signal ** 2))
