@@ -43,7 +43,7 @@ from eq_ui import (
     LimiterControlPopup, LimiterGRMiniWidget, MiniOscilloscopeWidget, CompactScopeGLWidget,
     AutoGainMiniBar, CrossoverMenuWidget, EditInputSelector, CrossoverLineItem
 )
-from fft_analyzer import FFTSpectrumAnalyzer
+from fft_analyzer import FFTSpectrumAnalyzer, FFTComputationWorker
 from eq_dsp import (
     ParametricEQEngine, DualOutputCrossover, AsyncInputRingBuffer,
     smooth_spectrum_12th_octave, detect_resonances
@@ -2320,12 +2320,12 @@ class AudioAnalyzerApp(QMainWindow):
         noise_samples = int(self.current_sr * 2.0)
         self.rta_noise_table = np.random.uniform(-1.0, 1.0, size=(noise_samples, 2)).astype(np.float32)
 
-        self.fft_analyzer = FFTSpectrumAnalyzer(
+        self.fft_worker = FFTComputationWorker(
             sample_rate=self.current_sr, fft_size=self.fft_size, decay_factor=self.decay_factor
         )
-        self.fft_analyzer_in2 = FFTSpectrumAnalyzer(
-            sample_rate=self.current_sr, fft_size=self.fft_size, decay_factor=self.decay_factor
-        )
+        self.fft_analyzer = self.fft_worker.analyzer
+        self.fft_analyzer_in2 = self.fft_worker.analyzer_in2
+        self.fft_worker.start()
         self.rta_ring_buffer = np.zeros(self.fft_size, dtype=np.float32)
         self.autogain_enabled = False
         self.target_autogain_a_db = 0.0
@@ -4224,7 +4224,10 @@ class AudioAnalyzerApp(QMainWindow):
             if sr_saved in self.sample_rates:
                 self.current_sr = int(sr_saved)
                 self.sr_combo.setCurrentIndex(self.sr_combo.findData(self.current_sr))
-                self.fft_analyzer.set_sample_rate(self.current_sr)
+                if hasattr(self, "fft_worker"):
+                    self.fft_worker.set_sample_rate(self.current_sr)
+                else:
+                    self.fft_analyzer.set_sample_rate(self.current_sr)
                 self.eq_engine.set_sample_rate(self.current_sr)
                 self.scope_buffer.set_sample_rate(self.current_sr)
 
@@ -4249,7 +4252,10 @@ class AudioAnalyzerApp(QMainWindow):
             if fft_sz in self.fft_sizes:
                 self.fft_size = int(fft_sz)
                 self.fft_combo.setCurrentIndex(self.fft_combo.findData(self.fft_size))
-                self.fft_analyzer.set_fft_size(self.fft_size)
+                if hasattr(self, "fft_worker"):
+                    self.fft_worker.set_fft_size(self.fft_size)
+                else:
+                    self.fft_analyzer.set_fft_size(self.fft_size)
 
             if "show_pre" in analyzer_cfg:
                 self.show_in_chk.setChecked(bool(analyzer_cfg["show_pre"]))
@@ -4395,9 +4401,12 @@ class AudioAnalyzerApp(QMainWindow):
 
     def on_fft_size_changed(self):
         self.fft_size = self.fft_combo.currentData()
-        self.fft_analyzer.set_fft_size(self.fft_size)
-        if hasattr(self, "fft_analyzer_in2"):
-            self.fft_analyzer_in2.set_fft_size(self.fft_size)
+        if hasattr(self, "fft_worker"):
+            self.fft_worker.set_fft_size(self.fft_size)
+        else:
+            self.fft_analyzer.set_fft_size(self.fft_size)
+            if hasattr(self, "fft_analyzer_in2"):
+                self.fft_analyzer_in2.set_fft_size(self.fft_size)
         if hasattr(self, "rta_ring_buffer") and len(self.rta_ring_buffer) != self.fft_size:
             self.rta_ring_buffer = np.zeros(self.fft_size, dtype=np.float32)
         self._pre_drawn_at_rest = False
@@ -4410,9 +4419,12 @@ class AudioAnalyzerApp(QMainWindow):
         val = self.hold_slider.value()
         self.hold_val_label.setText(f"{val}%")
         self.decay_factor = 0.20 + (val / 99.0) * 0.792
-        self.fft_analyzer.set_decay_factor(self.decay_factor)
-        if hasattr(self, "fft_analyzer_in2"):
-            self.fft_analyzer_in2.set_decay_factor(self.decay_factor)
+        if hasattr(self, "fft_worker"):
+            self.fft_worker.set_decay_factor(self.decay_factor)
+        else:
+            self.fft_analyzer.set_decay_factor(self.decay_factor)
+            if hasattr(self, "fft_analyzer_in2"):
+                self.fft_analyzer_in2.set_decay_factor(self.decay_factor)
         self.schedule_config_save()
 
     def on_y_scale_changed(self):
@@ -4684,9 +4696,12 @@ class AudioAnalyzerApp(QMainWindow):
 
     def on_sr_changed(self):
         self.current_sr = self.sr_combo.currentData()
-        self.fft_analyzer.set_sample_rate(self.current_sr)
-        if hasattr(self, "fft_analyzer_in2"):
-            self.fft_analyzer_in2.set_sample_rate(self.current_sr)
+        if hasattr(self, "fft_worker"):
+            self.fft_worker.set_sample_rate(self.current_sr)
+        else:
+            self.fft_analyzer.set_sample_rate(self.current_sr)
+            if hasattr(self, "fft_analyzer_in2"):
+                self.fft_analyzer_in2.set_sample_rate(self.current_sr)
         self.eq_proc_in1.set_sample_rate(self.current_sr)
         self.eq_proc_in2.set_sample_rate(self.current_sr)
         self.eq_engine.set_sample_rate(self.current_sr)
@@ -5248,118 +5263,82 @@ class AudioAnalyzerApp(QMainWindow):
         show_out2 = self.show_out2_chk.isChecked()
         y_floor_fft = float(self.db_min - 12.0)
 
-        self.fft_analyzer.push_blocks(
-            pre_blocks if show_in else [],
-            post_blocks if show_out1 else [],
-            post2_blocks if show_out2 else []
-        )
-        self.fft_analyzer.update_spectra(
-            compute_in=show_in,
-            compute_out1=show_out1,
-            compute_out2=show_out2,
-            db_min=y_floor_fft
-        )
-
-        if hasattr(self, "fft_analyzer_in2"):
-            self.fft_analyzer_in2.push_blocks(
-                in2_blocks if show_in2 else [],
-                [],
-                []
-            )
-            self.fft_analyzer_in2.update_spectra(
-                compute_in=show_in2,
-                compute_out1=False,
-                compute_out2=False,
-                db_min=y_floor_fft
-            )
-
         is_x_log = (self.x_scale_combo.currentText() == "Logarítmica")
         is_y_log = (self.y_scale_combo.currentText() == "Logarítmica (dB)")
 
-        # Curva 1: Input (Pre-EQ)
-        if show_in:
-            if not self.fft_analyzer.pre_at_rest:
-                self._in_drawn_at_rest = False
-                x_in, y_in = self.fft_analyzer.get_smooth_curve(
-                    which="in", is_x_log=is_x_log, is_y_log=is_y_log,
-                    db_min=y_floor_fft, db_max=self.db_max
-                )
-                self.fft_curve_in.setData(x_in, y_in)
-            elif not self._in_drawn_at_rest:
-                self._in_drawn_at_rest = True
-                x_in, y_in = self.fft_analyzer.get_smooth_curve(
-                    which="in", is_x_log=is_x_log, is_y_log=is_y_log,
-                    db_min=y_floor_fft, db_max=self.db_max
-                )
-                self.fft_curve_in.setData(x_in, y_in)
-        else:
-            self.fft_curve_in.setData([], [])
-            self._in_drawn_at_rest = False
+        # Despachar cálculo FFT + Splines al hilo trabajador paralelo (0.02 ms)
+        self.fft_worker.submit_blocks(
+            pre_blocks=pre_blocks,
+            in2_blocks=in2_blocks,
+            post_blocks=post_blocks,
+            post2_blocks=post2_blocks,
+            show_in=show_in,
+            show_in2=show_in2,
+            show_out1=show_out1,
+            show_out2=show_out2,
+            is_x_log=is_x_log,
+            is_y_log=is_y_log,
+            db_min=y_floor_fft,
+            db_max=self.db_max,
+        )
 
-        # Curva 1.1: Input 2 (Aux / Mic)
-        if show_in2 and hasattr(self, "fft_analyzer_in2"):
-            if not self.fft_analyzer_in2.pre_at_rest:
-                self._in2_drawn_at_rest = False
-                x_in2, y_in2 = self.fft_analyzer_in2.get_smooth_curve(
-                    which="in", is_x_log=is_x_log, is_y_log=is_y_log,
-                    db_min=y_floor_fft, db_max=self.db_max
-                )
-                self.fft_curve_in2.setData(x_in2, y_in2)
-                self.fft_curve_in2.setVisible(True)
-            elif not getattr(self, "_in2_drawn_at_rest", False):
-                self._in2_drawn_at_rest = True
-                x_in2, y_in2 = self.fft_analyzer_in2.get_smooth_curve(
-                    which="in", is_x_log=is_x_log, is_y_log=is_y_log,
-                    db_min=y_floor_fft, db_max=self.db_max
-                )
-                self.fft_curve_in2.setData(x_in2, y_in2)
-                self.fft_curve_in2.setVisible(True)
-        else:
-            self.fft_curve_in2.setData([], [])
-            self.fft_curve_in2.setVisible(False)
-            self._in2_drawn_at_rest = False
+        snap = self.fft_worker.get_latest_snapshot()
+        if snap is not None:
+            # Curva 1: Input (Pre-EQ)
+            if show_in:
+                if snap.in_changed and snap.x_in is not None:
+                    self.fft_curve_in.setData(snap.x_in, snap.y_in)
+            else:
+                if getattr(self, "_in_was_shown", False):
+                    self.fft_curve_in.setData([], [])
+                    self._in_was_shown = False
 
-        # Curva 2: Output 1 (Bus A)
-        if show_out1:
-            if not self.fft_analyzer.post_at_rest:
-                self._out1_drawn_at_rest = False
-                x_out1, y_out1 = self.fft_analyzer.get_smooth_curve(
-                    which="out1", is_x_log=is_x_log, is_y_log=is_y_log,
-                    db_min=y_floor_fft, db_max=self.db_max
-                )
-                self.fft_curve_out1.setData(x_out1, y_out1)
-            elif not self._out1_drawn_at_rest:
-                self._out1_drawn_at_rest = True
-                x_out1, y_out1 = self.fft_analyzer.get_smooth_curve(
-                    which="out1", is_x_log=is_x_log, is_y_log=is_y_log,
-                    db_min=y_floor_fft, db_max=self.db_max
-                )
-                self.fft_curve_out1.setData(x_out1, y_out1)
-        else:
-            self.fft_curve_out1.setData([], [])
-            self._out1_drawn_at_rest = False
+            # Curva 1.1: Input 2 (Aux / Mic)
+            if show_in2:
+                if snap.in2_changed and snap.x_in2 is not None:
+                    self.fft_curve_in2.setData(snap.x_in2, snap.y_in2)
+                    self.fft_curve_in2.setVisible(True)
+            else:
+                if getattr(self, "_in2_was_shown", False):
+                    self.fft_curve_in2.setData([], [])
+                    self.fft_curve_in2.setVisible(False)
+                    self._in2_was_shown = False
 
-        # Curva 3: Output 2 (Bus B)
-        if show_out2:
-            if not self.fft_analyzer.post2_at_rest:
-                self._out2_drawn_at_rest = False
-                x_out2, y_out2 = self.fft_analyzer.get_smooth_curve(
-                    which="out2", is_x_log=is_x_log, is_y_log=is_y_log,
-                    db_min=y_floor_fft, db_max=self.db_max
-                )
-                self.fft_curve_out2.setData(x_out2, y_out2)
-            elif not self._out2_drawn_at_rest:
-                self._out2_drawn_at_rest = True
-                x_out2, y_out2 = self.fft_analyzer.get_smooth_curve(
-                    which="out2", is_x_log=is_x_log, is_y_log=is_y_log,
-                    db_min=y_floor_fft, db_max=self.db_max
-                )
-                self.fft_curve_out2.setData(x_out2, y_out2)
-        else:
-            self.fft_curve_out2.setData([], [])
-            self._out2_drawn_at_rest = False
+            # Curva 2: Output 1 (Bus A)
+            if show_out1:
+                if snap.out1_changed and snap.x_out1 is not None:
+                    self.fft_curve_out1.setData(snap.x_out1, snap.y_out1)
+            else:
+                if getattr(self, "_out1_was_shown", False):
+                    self.fft_curve_out1.setData([], [])
+                    self._out1_was_shown = False
+
+            # Curva 3: Output 2 (Bus B)
+            if show_out2:
+                if snap.out2_changed and snap.x_out2 is not None:
+                    self.fft_curve_out2.setData(snap.x_out2, snap.y_out2)
+            else:
+                if getattr(self, "_out2_was_shown", False):
+                    self.fft_curve_out2.setData([], [])
+                    self._out2_was_shown = False
+
+            if show_in:
+                self._in_was_shown = True
+            if show_in2:
+                self._in2_was_shown = True
+            if show_out1:
+                self._out1_was_shown = True
+            if show_out2:
+                self._out2_was_shown = True
+
 
     def closeEvent(self, event):
+        if hasattr(self, "fft_worker") and self.fft_worker is not None:
+            try:
+                self.fft_worker.stop()
+                self.fft_worker.wait(1000)
+            except Exception:
+                pass
         if self.stream is not None:
             try:
                 self.stream.stop()

@@ -148,14 +148,18 @@ class LiquidGlassButton(QPushButton):
         if w <= 0 or h <= 0:
             return
 
+        dpr = float(self.devicePixelRatioF()) if hasattr(self, "devicePixelRatioF") else 1.0
         is_active = (self.isCheckable() and self.isChecked()) or (self._tint_color is not None)
         tint_val = self._tint_color.rgba() if self._tint_color else 0
         act_tint_val = self._active_tint_color.rgba() if self._active_tint_color else 0
-        cache_key = (w, h, self._hovered, is_active, tint_val, act_tint_val, self.text(), self.isEnabled())
+        cache_key = (w, h, dpr, self._hovered, is_active, tint_val, act_tint_val, self.text(), self.isEnabled())
 
         if getattr(self, "_cached_key", None) != cache_key or getattr(self, "_cached_pixmap", None) is None:
             self._cached_key = cache_key
-            pix = QPixmap(w, h)
+            pw = max(1, int(round(w * dpr)))
+            ph = max(1, int(round(h * dpr)))
+            pix = QPixmap(pw, ph)
+            pix.setDevicePixelRatio(dpr)
             pix.fill(Qt.GlobalColor.transparent)
             painter = QPainter(pix)
             painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
@@ -1574,40 +1578,6 @@ class CrossoverLineItem(pg.GraphicsObject):
         self._cached_badge_w = tw + 14.0
         self._cached_badge_h = th + 6.0
 
-        bw = max(10, int(math.ceil(self._cached_badge_w)))
-        bh = max(10, int(math.ceil(self._cached_badge_h)))
-        rect = QRectF(0.5, 0.5, bw - 1.0, bh - 1.0)
-
-        # Pre-render Normal Badge Pixmap (0% overhead in OpenGL render loop)
-        pix_n = QPixmap(bw, bh)
-        pix_n.fill(Qt.GlobalColor.transparent)
-        p_n = QPainter(pix_n)
-        p_n.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        c_n = QColor(255, 171, 64, 180)
-        p_n.setPen(QPen(c_n, 1.2))
-        p_n.setBrush(QBrush(QColor(20, 24, 32, 230)))
-        p_n.drawRoundedRect(rect, 5.0, 5.0)
-        p_n.setFont(self._font)
-        p_n.setPen(c_n)
-        p_n.drawText(rect, Qt.AlignmentFlag.AlignCenter, self._cached_txt)
-        p_n.end()
-        self._badge_pixmap = pix_n
-
-        # Pre-render Hover Badge Pixmap
-        pix_h = QPixmap(bw, bh)
-        pix_h.fill(Qt.GlobalColor.transparent)
-        p_h = QPainter(pix_h)
-        p_h.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        c_h = QColor(255, 213, 79, 230)
-        p_h.setPen(QPen(c_h, 1.2))
-        p_h.setBrush(QBrush(QColor(20, 24, 32, 240)))
-        p_h.drawRoundedRect(rect, 5.0, 5.0)
-        p_h.setFont(self._font)
-        p_h.setPen(c_h)
-        p_h.drawText(rect, Qt.AlignmentFlag.AlignCenter, self._cached_txt)
-        p_h.end()
-        self._badge_pixmap_hover = pix_h
-
     def set_config(self, freq_hz: float, is_x_log: bool = True, clip_lim: float = 36.0):
         self.freq_hz = float(np.clip(freq_hz, 20.0, 20000.0))
         self.is_x_log = bool(is_x_log)
@@ -1632,18 +1602,27 @@ class CrossoverLineItem(pg.GraphicsObject):
         painter.setPen(pen)
         painter.drawLine(QPointF(0.0, -self._clip_lim), QPointF(0.0, self._clip_lim))
 
-        # Badge de texto en coordenadas de pantalla mediante Pixmap precalculado (60 FPS en OpenGL)
+        # Badge vectorial nativo en coordenadas de pantalla con métricas cacheadas (nitidez total en cualquier DPI)
         painter.save()
         tr = painter.transform()
         painter.resetTransform()
 
         center_scene_pt = tr.map(QPointF(0.0, 0.0))
         px = center_scene_pt.x()
-        py = 52.0  # Posición vertical fija debajo de la barra superior
+        py = 52.0  # Posición vertical elegante y siempre visible justo debajo de la barra superior
 
-        pix = self._badge_pixmap_hover if (self.is_hovered or self.is_dragging) else self._badge_pixmap
-        if pix is not None:
-            painter.drawPixmap(QPointF(px - pix.width() * 0.5, py - pix.height() * 0.5), pix)
+        painter.setFont(self._font)
+        badge_w = self._cached_badge_w
+        badge_h = self._cached_badge_h
+        badge_rect = QRectF(px - badge_w * 0.5, py - badge_h * 0.5, badge_w, badge_h)
+
+        border_color = QColor(255, 213, 79, 230) if (self.is_hovered or self.is_dragging) else QColor(255, 171, 64, 180)
+        painter.setPen(QPen(border_color, 1.2))
+        painter.setBrush(QBrush(QColor(20, 24, 32, 230)))
+        painter.drawRoundedRect(badge_rect, 5.0, 5.0)
+
+        painter.setPen(border_color)
+        painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, self._cached_txt)
         painter.restore()
 
     def hoverEnterEvent(self, ev):
