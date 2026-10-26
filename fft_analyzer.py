@@ -1,3 +1,4 @@
+import time
 import numpy as np
 from PyQt6.QtCore import QThread, QMutex, QWaitCondition
 
@@ -205,22 +206,43 @@ class FFTSpectrumAnalyzer:
             self.pre_ring_buffer, self._last_pre_silent = self._push_to_ring(self.pre_ring_buffer, pre_blocks)
             if not self._last_pre_silent:
                 self.pre_at_rest = False
-        else:
-            self._last_pre_silent = True
 
         if post_blocks:
             self.post_ring_buffer, self._last_post_silent = self._push_to_ring(self.post_ring_buffer, post_blocks)
             if not self._last_post_silent:
                 self.post_at_rest = False
-        else:
-            self._last_post_silent = True
 
         if post2_blocks:
             self.post2_ring_buffer, self._last_post2_silent = self._push_to_ring(self.post2_ring_buffer, post2_blocks)
             if not self._last_post2_silent:
                 self.post2_at_rest = False
-        else:
-            self._last_post2_silent = True
+
+    def decay_spectra(self, db_min: float = -90.0):
+        """Decae suavemente las envolventes retenidas hacia el piso cuando no hay señal activa."""
+        floor_mag = 10.0 ** ((db_min - 1.0) / 20.0)
+        if not self.pre_at_rest:
+            if self.held_pre_fft is not None:
+                self.held_pre_fft *= self.decay_factor
+                if np.max(self.held_pre_fft) <= floor_mag:
+                    self.pre_at_rest = True
+            else:
+                self.pre_at_rest = True
+
+        if not self.post_at_rest:
+            if self.held_post_fft is not None:
+                self.held_post_fft *= self.decay_factor
+                if np.max(self.held_post_fft) <= floor_mag:
+                    self.post_at_rest = True
+            else:
+                self.post_at_rest = True
+
+        if not self.post2_at_rest:
+            if self.held_post2_fft is not None:
+                self.held_post2_fft *= self.decay_factor
+                if np.max(self.held_post2_fft) <= floor_mag:
+                    self.post2_at_rest = True
+            else:
+                self.post2_at_rest = True
 
     def _compute_held_spectrum(self, ring: np.ndarray, held_prev: np.ndarray | None, is_silent: bool) -> np.ndarray:
         if is_silent and held_prev is not None:
@@ -400,10 +422,12 @@ class FFTComputationWorker(QThread):
         self._cond = QWaitCondition()
         self._stop_requested = False
 
-        self._pending_pre = []
-        self._pending_in2 = []
-        self._pending_post = []
-        self._pending_post2 = []
+        # FIFOs de acumulación de audio para desensamblar buffers en hops constantes de 60-90 FPS
+        self._fifo_pre = []
+        self._fifo_in2 = []
+        self._fifo_post = []
+        self._fifo_post2 = []
+        self._last_audio_recv_time = time.perf_counter()
 
         self._show_in = True
         self._show_in2 = False
@@ -442,14 +466,34 @@ class FFTComputationWorker(QThread):
         db_max: float = 0.0,
     ):
         self._mutex.lock()
+        has_audio = False
         if pre_blocks:
-            self._pending_pre.extend(pre_blocks)
+            for b in pre_blocks:
+                if b is not None and len(b) > 0:
+                    m = (b[:, 0] + b[:, 1]) * 0.5 if (b.ndim > 1 and b.shape[1] > 1) else (b[:, 0] if b.ndim > 1 else b)
+                    self._fifo_pre.append(m)
+                    has_audio = True
         if in2_blocks:
-            self._pending_in2.extend(in2_blocks)
+            for b in in2_blocks:
+                if b is not None and len(b) > 0:
+                    m = (b[:, 0] + b[:, 1]) * 0.5 if (b.ndim > 1 and b.shape[1] > 1) else (b[:, 0] if b.ndim > 1 else b)
+                    self._fifo_in2.append(m)
+                    has_audio = True
         if post_blocks:
-            self._pending_post.extend(post_blocks)
+            for b in post_blocks:
+                if b is not None and len(b) > 0:
+                    m = (b[:, 0] + b[:, 1]) * 0.5 if (b.ndim > 1 and b.shape[1] > 1) else (b[:, 0] if b.ndim > 1 else b)
+                    self._fifo_post.append(m)
+                    has_audio = True
         if post2_blocks:
-            self._pending_post2.extend(post2_blocks)
+            for b in post2_blocks:
+                if b is not None and len(b) > 0:
+                    m = (b[:, 0] + b[:, 1]) * 0.5 if (b.ndim > 1 and b.shape[1] > 1) else (b[:, 0] if b.ndim > 1 else b)
+                    self._fifo_post2.append(m)
+                    has_audio = True
+
+        if has_audio:
+            self._last_audio_recv_time = time.perf_counter()
 
         self._show_in = bool(show_in)
         self._show_in2 = bool(show_in2)
@@ -462,6 +506,22 @@ class FFTComputationWorker(QThread):
 
         self._cond.wakeOne()
         self._mutex.unlock()
+
+    @staticmethod
+    def _drain_fifo(fifo: list, hop_size: int, max_backlog: int = 4096) -> np.ndarray | None:
+        if not fifo:
+            return None
+        flat = np.concatenate(fifo)
+        fifo.clear()
+        n = len(flat)
+        if n > max_backlog:
+            flat = flat[-max_backlog:]
+            n = len(flat)
+        if n <= hop_size:
+            return flat
+        chunk = flat[:hop_size]
+        fifo.append(flat[hop_size:])
+        return chunk
 
     def get_latest_snapshot(self) -> FFTWorkerSnapshot | None:
         return self._latest_snapshot
@@ -497,6 +557,10 @@ class FFTComputationWorker(QThread):
 
     def reset_buffers(self):
         self._mutex.lock()
+        self._fifo_pre.clear()
+        self._fifo_in2.clear()
+        self._fifo_post.clear()
+        self._fifo_post2.clear()
         self.analyzer.reset_buffers()
         self.analyzer_in2.reset_buffers()
         self._out1_drawn_at_rest = False
@@ -512,30 +576,18 @@ class FFTComputationWorker(QThread):
         self._mutex.unlock()
 
     def run(self):
+        worker_fps = 90
+        target_dt = 1.0 / worker_fps
+
         while not self._stop_requested:
+            loop_start = time.perf_counter()
+
             self._mutex.lock()
-            while (
-                not self._stop_requested
-                and not self._pending_pre
-                and not self._pending_post
-                and not self._pending_post2
-                and not self._pending_in2
-            ):
-                self._cond.wait(self._mutex, 40)
-
-            if self._stop_requested:
-                self._mutex.unlock()
-                break
-
-            pre = self._pending_pre
-            in2 = self._pending_in2
-            post = self._pending_post
-            post2 = self._pending_post2
-
-            self._pending_pre = []
-            self._pending_in2 = []
-            self._pending_post = []
-            self._pending_post2 = []
+            hop_size = int(self.sample_rate / worker_fps)
+            chunk_pre = self._drain_fifo(self._fifo_pre, hop_size)
+            chunk_in2 = self._drain_fifo(self._fifo_in2, hop_size)
+            chunk_post = self._drain_fifo(self._fifo_post, hop_size)
+            chunk_post2 = self._drain_fifo(self._fifo_post2, hop_size)
 
             show_in = self._show_in
             show_in2 = self._show_in2
@@ -545,7 +597,11 @@ class FFTComputationWorker(QThread):
             is_y_log = self._is_y_log
             db_min = self._db_min
             db_max = self._db_max
+            last_audio_time = self._last_audio_recv_time
             self._mutex.unlock()
+
+            idle_dt = time.perf_counter() - last_audio_time
+            is_idle = (idle_dt > 0.080)
 
             # Detección de cambio en escala para forzar redibujado incluso en reposo
             scale_changed = (
@@ -564,27 +620,37 @@ class FFTComputationWorker(QThread):
                 self._out2_drawn_at_rest = False
                 self._in2_drawn_at_rest = False
 
-            # Cálculo de espectro FFT
-            self.analyzer.push_blocks(
-                pre if show_in else [],
-                post if show_out1 else [],
-                post2 if show_out2 else [],
-            )
-            self.analyzer.update_spectra(
-                compute_in=show_in,
-                compute_out1=show_out1,
-                compute_out2=show_out2,
-                db_min=db_min,
-            )
+            has_new_post = (chunk_post is not None and len(chunk_post) > 0)
+            has_new_pre = (chunk_pre is not None and len(chunk_pre) > 0)
+            has_new_post2 = (chunk_post2 is not None and len(chunk_post2) > 0)
 
-            if show_in2:
-                self.analyzer_in2.push_blocks(in2, [], [])
-                self.analyzer_in2.update_spectra(
-                    compute_in=True,
-                    compute_out1=False,
-                    compute_out2=False,
+            if has_new_post or has_new_pre or has_new_post2:
+                self.analyzer.push_blocks(
+                    [chunk_pre] if (show_in and has_new_pre) else [],
+                    [chunk_post] if (show_out1 and has_new_post) else [],
+                    [chunk_post2] if (show_out2 and has_new_post2) else [],
+                )
+                self.analyzer.update_spectra(
+                    compute_in=show_in,
+                    compute_out1=show_out1,
+                    compute_out2=show_out2,
                     db_min=db_min,
                 )
+            elif is_idle:
+                self.analyzer.decay_spectra(db_min=db_min)
+
+            has_new_in2 = (chunk_in2 is not None and len(chunk_in2) > 0)
+            if show_in2:
+                if has_new_in2:
+                    self.analyzer_in2.push_blocks([chunk_in2], [], [])
+                    self.analyzer_in2.update_spectra(
+                        compute_in=True,
+                        compute_out1=False,
+                        compute_out2=False,
+                        db_min=db_min,
+                    )
+                elif is_idle:
+                    self.analyzer_in2.decay_spectra(db_min=db_min)
 
             # Cálculo de curvas suavizadas mediante Hermite Splines precalculados
             x_in, y_in = None, None
@@ -646,4 +712,27 @@ class FFTComputationWorker(QThread):
                 out2_changed=out2_changed,
                 in2_changed=in2_changed,
             )
+
+            all_at_rest = (
+                (not show_in or self.analyzer.pre_at_rest)
+                and (not show_in2 or self.analyzer_in2.pre_at_rest)
+                and (not show_out1 or self.analyzer.post_at_rest)
+                and (not show_out2 or self.analyzer.post2_at_rest)
+            )
+
+            compute_dt = time.perf_counter() - loop_start
+            rem_ms = int(max(0.0, (target_dt - compute_dt) * 1000.0))
+
+            self._mutex.lock()
+            has_pending = (
+                len(self._fifo_pre) > 0
+                or len(self._fifo_in2) > 0
+                or len(self._fifo_post) > 0
+                or len(self._fifo_post2) > 0
+            )
+            if all_at_rest and not has_pending and is_idle:
+                self._cond.wait(self._mutex)
+            elif rem_ms > 0:
+                self._cond.wait(self._mutex, rem_ms)
+            self._mutex.unlock()
 

@@ -7,6 +7,7 @@ from PyQt6.QtWidgets import (
     QGraphicsOpacityEffect, QListView, QSlider, QGraphicsPathItem, QGraphicsItem,
     QApplication, QCheckBox, QDoubleSpinBox, QSpinBox, QGridLayout, QWidgetAction
 )
+from PyQt6.QtOpenGLWidgets import QOpenGLWidget
 from PyQt6.QtCore import Qt, QEvent, QObject, QPoint, QPointF, QRectF, pyqtSignal, QTimer
 from PyQt6.QtGui import (
     QColor, QFont, QPainter, QPainterPath, QPen, QBrush,
@@ -2927,7 +2928,8 @@ class ProQ4Overlay(QWidget):
         return best_idx
 
     def eventFilter(self, obj, event):
-        if obj is not self._viewport:
+        vp = getattr(self, "_viewport", None)
+        if vp is None or obj is not vp:
             return super().eventFilter(obj, event)
 
         etype = event.type()
@@ -3813,8 +3815,8 @@ class HUDOpenGLBackgroundItem(QGraphicsItem):
                                 dyn_poly = QPolygonF()
                                 for px_v, py_v in zip(bx_arr, by_arr):
                                     dyn_poly.append(QPointF(float(px_v), float(py_v)))
-                                for px_v, py_v in zip(reversed(dbx_arr), reversed(dby_arr)):
-                                    dyn_poly.append(QPointF(float(px_v), float(py_v)))
+                                for rpx_v, rpy_v in zip(reversed(dbx_arr), reversed(dby_arr)):
+                                    dyn_poly.append(QPointF(float(rpx_v), float(rpy_v)))
 
                                 dfc = _brighten_color(b_col, 0.20)
                                 dfc.setAlpha(135)
@@ -4999,8 +5001,6 @@ class FloatingBandHUD(QWidget):
                     gain_txt = f"{b.gain_db:+.1f} dB" if b.supports_gain else b.filter_type
                     dyn_txt = f" (Δ {b.current_dyn_offset_db:+.1f})" if (b.is_dynamic_active and abs(b.current_dyn_offset_db) >= 0.1) else ""
                     self.compact_readout.setText(f"{self._fmt_freq(b.freq)}  |  {gain_txt}{dyn_txt}  |  Q {b.q:.2f}")
-        if self._bg_gl_item is not None and self._bg_gl_item.isVisible():
-            self._bg_gl_item.update()
 
 
 # Alias de compatibilidad
@@ -5376,9 +5376,9 @@ class LimiterControlPopup(HUDPopupDialog):
         self._on_rel_changed(50)
 
 
-class MiniOscilloscopeWidget(QWidget):
+class MiniOscilloscopeWidget(QOpenGLWidget):
     """
-    Mini-Osciloscopio a 60 FPS reales y 0% CPU con Scroll Blitting de 1 píxel.
+    Mini-Osciloscopio a 60 FPS reales y 0% CPU acelerado por GPU (OpenGL) con Scroll Blitting de 1 píxel.
     Acumula picos O(1) entre frames visuales sin bucles en Python ni sobrecarga de GPU.
     """
     clicked = pyqtSignal()
@@ -5386,8 +5386,7 @@ class MiniOscilloscopeWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFixedSize(240, 22)
-        self._pixmap = QPixmap(self.size())
-        self._pixmap.fill(Qt.GlobalColor.transparent)
+        self._pixmap = None
         self._pending_min = 0.0
         self._pending_max = 0.0
         self._pending_gr_db = 0.0
@@ -5422,6 +5421,10 @@ class MiniOscilloscopeWidget(QWidget):
     def tick_render(self, wave_color: QColor):
         if not self._has_new_data:
             return
+        if self._pixmap is None:
+            self._pixmap = QPixmap(self.size())
+            self._pixmap.fill(QColor(16, 18, 24))
+
         self._accum_steps += self._step_per_frame
         dx = int(self._accum_steps)
         if dx < 1:
@@ -5436,9 +5439,7 @@ class MiniOscilloscopeWidget(QWidget):
 
         p = QPainter(self._pixmap)
         # 2. Limpiar solo la franja derecha nueva de ancho dx
-        p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
-        p.fillRect(w - dx, 0, dx, h, Qt.GlobalColor.transparent)
-        p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+        p.fillRect(w - dx, 0, dx, h, QColor(16, 18, 24))
 
         # 3. Dibujar onda en la franja nueva
         y1 = int(np.clip(mid_y - self._pending_max * (mid_y - 2), 1, h - 1))
@@ -5458,14 +5459,16 @@ class MiniOscilloscopeWidget(QWidget):
 
     def paintEvent(self, event):
         p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        clip = QPainterPath()
-        clip.addRoundedRect(QRectF(self.rect()), 9.0, 9.0)
-        p.setClipPath(clip)
-        p.drawPixmap(0, 0, self._pixmap)
+        if self._pixmap is not None:
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            clip = QPainterPath()
+            clip.addRoundedRect(QRectF(self.rect()), 6.0, 6.0)
+            p.setClipPath(clip)
+            p.drawPixmap(0, 0, self._pixmap)
 
     def invalidate_canvas(self):
-        self._pixmap.fill(Qt.GlobalColor.transparent)
+        if self._pixmap is not None:
+            self._pixmap.fill(QColor(16, 18, 24))
         self.update()
 
     def set_current_gr(self, gr_db: float):

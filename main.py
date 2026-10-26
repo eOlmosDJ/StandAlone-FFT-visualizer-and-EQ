@@ -7,6 +7,7 @@ import os
 if sys.platform == "win32":
     try:
         import ctypes
+        ctypes.windll.winmm.timeBeginPeriod(1)
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("bdj.ffteq.audioanalyzer.1.0")
     except Exception:
         pass
@@ -27,13 +28,16 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import QTimer, Qt, QRectF, QPoint, QPointF, pyqtSignal
 from PyQt6.QtGui import (
     QColor, QCursor, QPainter, QPainterPath, QPen, QBrush,
-    QLinearGradient, QPolygonF, QFont, QFontMetrics, QPixmap, QIcon
+    QLinearGradient, QPolygonF, QFont, QFontMetrics, QPixmap, QIcon, QSurfaceFormat
 )
 import pyqtgraph as pg
 
-# Activar aceleración por hardware GPU (OpenGL) para descargar la CPU (Intel UHD Graphics / GPU dedicada)
+# Activar aceleración por hardware GPU (OpenGL) y desbloquear VSync para 60+ FPS estables
 try:
     import OpenGL  # noqa: F401
+    fmt = QSurfaceFormat()
+    fmt.setSwapInterval(0)
+    QSurfaceFormat.setDefaultFormat(fmt)
     pg.setConfigOptions(useOpenGL=True, enableExperimental=True, antialias=True)
 except Exception:
     pg.setConfigOptions(antialias=True)
@@ -1823,37 +1827,34 @@ class FullBleedGridItem(pg.GraphicsObject):
     """
     Grilla full-bleed (borde a borde desde x=0 hasta x=w y de y=0 hasta y=h)
     dibujada detrás de las curvas FFT y EQ (zValue = -20).
+    Acelerada mediante textura QPixmap cacheada para 0% uso de CPU a 60 FPS.
     """
 
     def __init__(self, app_ref):
         super().__init__()
         self.app_ref = app_ref
         self.setZValue(-20)
+        self._cache_pixmap = None
+        self._cache_key = None
 
     def boundingRect(self) -> QRectF:
         vb = self.app_ref.plot_widget.getPlotItem().vb
         return vb.sceneBoundingRect()
 
-    def paint(self, painter: QPainter, option, widget=None):
-        vb = self.app_ref.plot_widget.getPlotItem().vb
-        rect = vb.sceneBoundingRect()
-        if rect.width() <= 10 or rect.height() <= 10:
-            return
+    def invalidate_cache(self):
+        self._cache_pixmap = None
+        self.update()
 
-        painter.save()
+    def _render_grid(self, painter: QPainter, vb, rect: QRectF, is_x_log: bool, is_y_log: bool, db_min: float, db_max: float, nyquist: float, grid_base_str: str, alpha_pct: int):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
         painter.setClipRect(rect)
 
-        grid_base = QColor(self.app_ref.theme.get("grid", "#2A2A2A"))
-        alpha_pct = int(self.app_ref.theme.get("grid_alpha", 45))
+        grid_base = QColor(grid_base_str)
         major_alpha = int(np.clip(alpha_pct * 2.1, 18, 160))
         minor_alpha = int(np.clip(alpha_pct * 0.95, 8, 90))
 
         pen_major = QPen(QColor(grid_base.red(), grid_base.green(), grid_base.blue(), major_alpha), 1)
         pen_minor = QPen(QColor(grid_base.red(), grid_base.green(), grid_base.blue(), minor_alpha), 1)
-
-        is_x_log = (self.app_ref.x_scale_combo.currentText() == "Logarítmica")
-        nyquist = self.app_ref.current_sr / 2.0
 
         # Líneas verticales de frecuencia (borde superior a borde inferior)
         if is_x_log:
@@ -1887,15 +1888,12 @@ class FullBleedGridItem(pg.GraphicsObject):
                     painter.drawLine(QPointF(x_s, rect.top()), QPointF(x_s, rect.bottom()))
 
         # Líneas horizontales de dB (desde x=0 hasta el borde derecho)
-        is_y_log = (self.app_ref.y_scale_combo.currentText() == "Logarítmica (dB)")
         if is_y_log:
-            db_min = self.app_ref.db_min
-            db_max = self.app_ref.db_max
             span = db_max - db_min
             step_db = 10 if span <= 140 else 20
             first_tick = int(np.ceil(db_min / step_db) * step_db)
             painter.setPen(pen_major)
-            for db_val in range(first_tick, db_max + 1, step_db):
+            for db_val in range(first_tick, int(db_max) + 1, step_db):
                 y_s = vb.mapViewToScene(QPointF(0.0, float(db_val))).y()
                 if rect.top() <= y_s <= rect.bottom():
                     painter.drawLine(QPointF(rect.left(), y_s), QPointF(rect.right(), y_s))
@@ -1906,7 +1904,33 @@ class FullBleedGridItem(pg.GraphicsObject):
                 if rect.top() <= y_s <= rect.bottom():
                     painter.drawLine(QPointF(rect.left(), y_s), QPointF(rect.right(), y_s))
 
-        painter.restore()
+    def paint(self, painter: QPainter, option, widget=None):
+        vb = self.app_ref.plot_widget.getPlotItem().vb
+        rect = vb.sceneBoundingRect()
+        w = int(rect.width())
+        h = int(rect.height())
+        if w <= 10 or h <= 10:
+            return
+
+        is_x_log = (self.app_ref.x_scale_combo.currentText() == "Logarítmica")
+        is_y_log = (self.app_ref.y_scale_combo.currentText() == "Logarítmica (dB)")
+        db_min = float(self.app_ref.db_min)
+        db_max = float(self.app_ref.db_max)
+        nyquist = float(self.app_ref.current_sr / 2.0)
+        grid_base_str = str(self.app_ref.theme.get("grid", "#2A2A2A"))
+        alpha_pct = int(self.app_ref.theme.get("grid_alpha", 45))
+        key = (w, h, is_x_log, is_y_log, db_min, db_max, nyquist, grid_base_str, alpha_pct)
+
+        if self._cache_pixmap is None or self._cache_key != key:
+            self._cache_pixmap = QPixmap(w, h)
+            self._cache_pixmap.fill(Qt.GlobalColor.transparent)
+            pm_painter = QPainter(self._cache_pixmap)
+            pm_painter.translate(-rect.left(), -rect.top())
+            self._render_grid(pm_painter, vb, rect, is_x_log, is_y_log, db_min, db_max, nyquist, grid_base_str, alpha_pct)
+            pm_painter.end()
+            self._cache_key = key
+
+        painter.drawPixmap(rect.topLeft(), self._cache_pixmap)
 
 
 class FullBleedEdgeMasksAndScalesItem(pg.GraphicsObject):
@@ -1918,24 +1942,25 @@ class FullBleedEdgeMasksAndScalesItem(pg.GraphicsObject):
     4. Escalas Verticales Unificadas a la Derecha:
        - Columna extrema derecha (`#787C85`, 9pt): Escala FFT dBFS (`0, -10, -20 ... -120`).
        - Columna interna adyacente (`#E0B84C`, 9pt bold): Escala de Ganancia EQ (`+9, +6, +3, 0, -3, -6, -9, -12`).
+    Acelerada mediante textura QPixmap cacheada para 0% sobrecosto de CPU a 60 FPS.
     """
 
     def __init__(self, app_ref):
         super().__init__()
         self.app_ref = app_ref
         self.setZValue(25)
+        self._cache_pixmap = None
+        self._cache_key = None
 
     def boundingRect(self) -> QRectF:
         vb = self.app_ref.plot_widget.getPlotItem().vb
         return vb.sceneBoundingRect()
 
-    def paint(self, painter: QPainter, option, widget=None):
-        vb = self.app_ref.plot_widget.getPlotItem().vb
-        rect = vb.sceneBoundingRect()
-        if rect.width() <= 10 or rect.height() <= 10:
-            return
+    def invalidate_cache(self):
+        self._cache_pixmap = None
+        self.update()
 
-        painter.save()
+    def _render_masks_and_scales(self, painter: QPainter, vb, rect: QRectF, is_x_log: bool, is_y_log: bool, db_min: float, db_max: float, nyquist: float, scope_open: bool, eq_range: float):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.setClipRect(rect)
 
@@ -1957,8 +1982,6 @@ class FullBleedEdgeMasksAndScalesItem(pg.GraphicsObject):
         painter.fillRect(QRectF(rect.left(), bot_y0, rect.width(), bot_mask_h), bot_grad)
 
         # 3. Etiquetas de Frecuencia en la franja inferior
-        is_x_log = (self.app_ref.x_scale_combo.currentText() == "Logarítmica")
-        nyquist = self.app_ref.current_sr / 2.0
         font_freq = QFont("Segoe UI", 8, QFont.Weight.DemiBold)
         painter.setFont(font_freq)
         painter.setPen(QColor("#8C919B"))
@@ -1992,29 +2015,20 @@ class FullBleedEdgeMasksAndScalesItem(pg.GraphicsObject):
                     )
 
         # 4. Escalas Verticales Unificadas en el Margen Derecho (junto al vúmetro L/R)
-        is_y_log = (self.app_ref.y_scale_combo.currentText() == "Logarítmica (dB)")
         if is_y_log:
-            # Columna derecha extrema: Nivel de señal FFT dBFS (#787C85, 9pt)
             font_dbfs = QFont("Segoe UI", 9)
             painter.setFont(font_dbfs)
             painter.setPen(QColor("#787C85"))
 
-            db_min = self.app_ref.db_min
-            db_max = self.app_ref.db_max
             span = db_max - db_min
             step_db = 10 if span <= 140 else 20
             first_tick = int(np.ceil(db_min / step_db) * step_db)
             x_dbfs_col = rect.right() - 34.0
 
-            scope_open = (
-                hasattr(self.app_ref, "scope_overlay")
-                and self.app_ref.scope_overlay is not None
-                and self.app_ref.scope_overlay.isVisible()
-            )
             min_tick_y = rect.top() + (212.0 if scope_open else 42.0)
             min_eq_tick_y = rect.top() + (216.0 if scope_open else 62.0)
 
-            for db_val in range(first_tick, db_max + 1, step_db):
+            for db_val in range(first_tick, int(db_max) + 1, step_db):
                 y_s = vb.mapViewToScene(QPointF(0.0, float(db_val))).y()
                 if min_tick_y <= y_s <= rect.bottom() - 16.0:
                     painter.drawText(
@@ -2023,9 +2037,7 @@ class FullBleedEdgeMasksAndScalesItem(pg.GraphicsObject):
                         f"{db_val}",
                     )
 
-            # Columna interna adyacente: Escala de Ganancia EQ (#E0B84C, 9pt bold)
             eq_vb = self.app_ref.eq_overlay.eq_vb
-            eq_range = self.app_ref.eq_overlay.eq_range_db
             font_eq = QFont("Segoe UI", 9, QFont.Weight.Bold)
             painter.setFont(font_eq)
             painter.setPen(QColor("#E0B84C"))
@@ -2046,7 +2058,37 @@ class FullBleedEdgeMasksAndScalesItem(pg.GraphicsObject):
                         lbl_eq,
                     )
 
-        painter.restore()
+    def paint(self, painter: QPainter, option, widget=None):
+        vb = self.app_ref.plot_widget.getPlotItem().vb
+        rect = vb.sceneBoundingRect()
+        w = int(rect.width())
+        h = int(rect.height())
+        if w <= 10 or h <= 10:
+            return
+
+        is_x_log = (self.app_ref.x_scale_combo.currentText() == "Logarítmica")
+        is_y_log = (self.app_ref.y_scale_combo.currentText() == "Logarítmica (dB)")
+        db_min = float(self.app_ref.db_min)
+        db_max = float(self.app_ref.db_max)
+        nyquist = float(self.app_ref.current_sr / 2.0)
+        scope_open = (
+            hasattr(self.app_ref, "scope_overlay")
+            and self.app_ref.scope_overlay is not None
+            and self.app_ref.scope_overlay.isVisible()
+        )
+        eq_range = float(getattr(self.app_ref.eq_overlay, "eq_range_db", 12.0))
+        key = (w, h, is_x_log, is_y_log, db_min, db_max, nyquist, scope_open, eq_range)
+
+        if self._cache_pixmap is None or self._cache_key != key:
+            self._cache_pixmap = QPixmap(w, h)
+            self._cache_pixmap.fill(Qt.GlobalColor.transparent)
+            pm_painter = QPainter(self._cache_pixmap)
+            pm_painter.translate(-rect.left(), -rect.top())
+            self._render_masks_and_scales(pm_painter, vb, rect, is_x_log, is_y_log, db_min, db_max, nyquist, scope_open, eq_range)
+            pm_painter.end()
+            self._cache_key = key
+
+        painter.drawPixmap(rect.topLeft(), self._cache_pixmap)
 
 
 class GraphStageContainer(QWidget):
@@ -2338,6 +2380,7 @@ class AudioAnalyzerApp(QMainWindow):
             self.load_preset_from_file(default_startup_path, mode="all")
 
         self.timer = QTimer()
+        self.timer.setTimerType(Qt.TimerType.PreciseTimer)
         self.timer.timeout.connect(self.update_visuals)
         self.timer.start(16)
 
@@ -5245,9 +5288,6 @@ class AudioAnalyzerApp(QMainWindow):
             for lbl in self.rta_peak_labels:
                 lbl.setVisible(False)
 
-        if not post_blocks and not in2_blocks and not pre_blocks:
-            return
-
         if post_blocks:
             latest_post = post_blocks[-1]
             eps = 1e-10
@@ -5274,10 +5314,25 @@ class AudioAnalyzerApp(QMainWindow):
         show_out2 = self.show_out2_chk.isChecked()
         y_floor_fft = float(self.db_min - 12.0)
 
+        # Ocultamiento inmediato si el usuario desmarca alguna curva
+        if not show_in and getattr(self, "_in_was_shown", False):
+            self.fft_curve_in.setData([], [])
+            self._in_was_shown = False
+        if not show_in2 and getattr(self, "_in2_was_shown", False):
+            self.fft_curve_in2.setData([], [])
+            self.fft_curve_in2.setVisible(False)
+            self._in2_was_shown = False
+        if not show_out1 and getattr(self, "_out1_was_shown", False):
+            self.fft_curve_out1.setData([], [])
+            self._out1_was_shown = False
+        if not show_out2 and getattr(self, "_out2_was_shown", False):
+            self.fft_curve_out2.setData([], [])
+            self._out2_was_shown = False
+
         is_x_log = (self.x_scale_combo.currentText() == "Logarítmica")
         is_y_log = (self.y_scale_combo.currentText() == "Logarítmica (dB)")
 
-        # Despachar cálculo FFT + Splines al hilo trabajador paralelo (0.02 ms)
+        # Despachar bloques y parámetros al hilo trabajador paralelo
         self.fft_worker.submit_blocks(
             pre_blocks=pre_blocks,
             in2_blocks=in2_blocks,
@@ -5294,74 +5349,29 @@ class AudioAnalyzerApp(QMainWindow):
         )
 
         snap = self.fft_worker.get_latest_snapshot()
-        if snap is not None:
+        if snap is not None and snap is not getattr(self, "_last_rendered_snapshot", None):
+            self._last_rendered_snapshot = snap
+
             # Curva 1: Input (Pre-EQ)
-            if show_in:
-                if snap.in_changed and snap.x_in is not None:
-                    self.fft_curve_in.setData(snap.x_in, snap.y_in)
-            else:
-                if getattr(self, "_in_was_shown", False):
-                    self.fft_curve_in.setData([], [])
-                    self._in_was_shown = False
+            if show_in and snap.in_changed and snap.x_in is not None:
+                self.fft_curve_in.setData(snap.x_in, snap.y_in)
+                self._in_was_shown = True
 
             # Curva 1.1: Input 2 (Aux / Mic)
-            if show_in2:
-                if snap.in2_changed and snap.x_in2 is not None:
-                    self.fft_curve_in2.setData(snap.x_in2, snap.y_in2)
-                    self.fft_curve_in2.setVisible(True)
-            else:
-                if getattr(self, "_in2_was_shown", False):
-                    self.fft_curve_in2.setData([], [])
-                    self.fft_curve_in2.setVisible(False)
-                    self._in2_was_shown = False
+            if show_in2 and snap.in2_changed and snap.x_in2 is not None:
+                self.fft_curve_in2.setData(snap.x_in2, snap.y_in2)
+                self.fft_curve_in2.setVisible(True)
+                self._in2_was_shown = True
 
             # Curva 2: Output 1 (Bus A)
-            if show_out1:
-                if snap.out1_changed and snap.x_out1 is not None:
-                    self.fft_curve_out1.setData(snap.x_out1, snap.y_out1)
-            else:
-                if getattr(self, "_out1_was_shown", False):
-                    self.fft_curve_out1.setData([], [])
-                    self._out1_was_shown = False
+            if show_out1 and snap.out1_changed and snap.x_out1 is not None:
+                self.fft_curve_out1.setData(snap.x_out1, snap.y_out1)
+                self._out1_was_shown = True
 
             # Curva 3: Output 2 (Bus B)
-            if show_out2:
-                if snap.out2_changed and snap.x_out2 is not None:
-                    self.fft_curve_out2.setData(snap.x_out2, snap.y_out2)
-            else:
-                if getattr(self, "_out2_was_shown", False):
-                    self.fft_curve_out2.setData([], [])
-                    self._out2_was_shown = False
-
-            if show_in:
-                self._in_was_shown = True
-            if show_in2:
-                self._in2_was_shown = True
-            if show_out1:
-                self._out1_was_shown = True
-            if show_out2:
+            if show_out2 and snap.out2_changed and snap.x_out2 is not None:
+                self.fft_curve_out2.setData(snap.x_out2, snap.y_out2)
                 self._out2_was_shown = True
-
-        # Actualización desacoplada de fondos translúcidos OpenGL a ~20 FPS para máxima fluidez a 60 FPS
-        if not hasattr(self, "_hud_gl_tick"):
-            self._hud_gl_tick = 0
-        self._hud_gl_tick = (self._hud_gl_tick + 1) % 3
-        if self._hud_gl_tick == 0:
-            if hasattr(self, "eq_panel") and self.eq_panel.isVisible() and self.eq_panel._bg_gl_item is not None:
-                self.eq_panel._bg_gl_item.update()
-            if hasattr(self, "eq_overlay") and hasattr(self.eq_overlay, "node_callout") and self.eq_overlay.node_callout.isVisible():
-                if self.eq_overlay.node_callout._bg_gl_item is not None:
-                    self.eq_overlay.node_callout._bg_gl_item.update()
-            for pop_w in (
-                getattr(self, "audio_popup", None),
-                getattr(self, "analyzer_popup", None),
-                getattr(self, "_crossover_menu", None),
-                getattr(getattr(self, "scope_overlay", None), "settings_popup", None),
-                getattr(getattr(self, "scope_overlay", None), "limiter_popup", None),
-            ):
-                if pop_w is not None and pop_w.isVisible() and hasattr(pop_w, "_hud_gl"):
-                    if pop_w._hud_gl._bg_gl_item is not None:
-                        pop_w._hud_gl._bg_gl_item.update()
 
 
     def closeEvent(self, event):
@@ -5392,6 +5402,12 @@ class AudioAnalyzerApp(QMainWindow):
         if self.config_save_timer.isActive():
             self.config_save_timer.stop()
         self.save_app_config()
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                ctypes.windll.winmm.timeEndPeriod(1)
+            except Exception:
+                pass
         event.accept()
 
     def showEvent(self, event):
@@ -5401,6 +5417,24 @@ class AudioAnalyzerApp(QMainWindow):
                 apply_windows_taskbar_icon(int(self.winId()), self._icon_path)
         except Exception:
             pass
+
+        # Desbloquear DWM VSync en Windows para fluidez completa a 60+ FPS en OpenGL
+        if sys.platform == "win32" and hasattr(self, "plot_widget") and self.plot_widget is not None:
+            try:
+                vp = self.plot_widget.viewport()
+                if hasattr(vp, "makeCurrent"):
+                    vp.makeCurrent()
+                import ctypes
+                wgl = ctypes.windll.opengl32
+                wgl.wglGetProcAddress.restype = ctypes.c_void_p
+                wgl.wglGetProcAddress.argtypes = [ctypes.c_char_p]
+                ptr = wgl.wglGetProcAddress(b"wglSwapIntervalEXT")
+                if ptr:
+                    proto = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_int)
+                    swap_fn = proto(ptr)
+                    swap_fn(0)
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
