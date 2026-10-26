@@ -76,3 +76,7 @@ El proyecto está estructurado en componentes fuertemente desacoplados que opera
 7. **Compatibilidad con UAC y Directorios Protegidos (Program Files):**
    - Queda estrictamente prohibido usar llamadas relativas directas del tipo `os.makedirs("presets")` o asumir que `_app_dir()` es escribible.
    - Todo guardado de datos mutables (presets, `config.json`, archivos temporales) debe verificar `_is_writable_dir(_app_dir())`: si es escribible (entorno de desarrollo o modo portable), se utiliza la ruta local; si la aplicación está instalada en `C:\Program Files` u otra ruta protegida por UAC en Windows, los datos se deben escribir y cargar desde `%APPDATA%\BDJ_FFT_EQ\`.
+8. **Arquitectura Dual-Input e Input 2 (Aux / Mic):**
+   - El stream secundario (`stream_in2`) opera en un hilo independiente de PortAudio desacoplado del stream maestro mediante `AsyncInputRingBuffer` con protección de concurrencia (`threading.Lock()`).
+   - El hilo maestro `audio_callback` debe vaciar y procesar `in2_block` continuamente siempre que `stream_in2` esté activo para alimentar el analizador espectral FFT y la medición acústica RTA, independientemente de si el ruteo acústico hacia los altavoces (`route_in2_to_a` / `route_in2_to_b`) está silenciado.
+   - La apertura de Input 2 debe implementar tolerancia de fallos multinivel (baja latencia -> buffer por defecto -> sample rate nativo) y remuestreo dinámico en tiempo real si la frecuencia de la entrada difiere de `current_sr`.

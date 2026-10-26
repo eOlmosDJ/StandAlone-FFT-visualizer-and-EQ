@@ -1660,13 +1660,15 @@ class AsyncInputRingBuffer:
         self.read_ptr = 0
         self.available = 0
         self.target_fill = 2048
+        self._lock = threading.Lock()
 
     def reset(self, target_fill: int = 2048):
-        self.buffer.fill(0.0)
-        self.target_fill = int(target_fill)
-        self.write_ptr = self.target_fill
-        self.read_ptr = 0
-        self.available = self.target_fill
+        with self._lock:
+            self.buffer.fill(0.0)
+            self.target_fill = int(target_fill)
+            self.write_ptr = self.target_fill
+            self.read_ptr = 0
+            self.available = self.target_fill
 
     def write(self, data: np.ndarray):
         n = data.shape[0]
@@ -1679,29 +1681,31 @@ class AsyncInputRingBuffer:
         else:
             frames = data[:, :2]
 
-        # Prevención de overflow (corrección de clock drift positivo)
-        max_allowed = self.capacity - n
-        if self.available > max_allowed:
-            drop = self.available - self.target_fill
-            self.read_ptr = (self.read_ptr + drop) % self.capacity
-            self.available = self.target_fill
+        with self._lock:
+            # Prevención de overflow (corrección de clock drift positivo)
+            max_allowed = self.capacity - n
+            if self.available > max_allowed:
+                drop = self.available - self.target_fill
+                self.read_ptr = (self.read_ptr + drop) % self.capacity
+                self.available = self.target_fill
 
-        idx = (self.write_ptr + np.arange(n)) % self.capacity
-        self.buffer[idx] = frames
-        self.write_ptr = (self.write_ptr + n) % self.capacity
-        self.available += n
+            idx = (self.write_ptr + np.arange(n)) % self.capacity
+            self.buffer[idx] = frames
+            self.write_ptr = (self.write_ptr + n) % self.capacity
+            self.available += n
 
     def read_into(self, out_array: np.ndarray) -> bool:
         n = out_array.shape[0]
-        if self.available < n:
-            # Corrección de underrun (clock drift negativo) sin bloquear el callback maestro
-            out_array.fill(0.0)
-            return False
-        idx = (self.read_ptr + np.arange(n)) % self.capacity
-        np.copyto(out_array, self.buffer[idx])
-        self.read_ptr = (self.read_ptr + n) % self.capacity
-        self.available -= n
-        return True
+        with self._lock:
+            if self.available < n:
+                # Corrección de underrun (clock drift negativo) sin bloquear el callback maestro
+                out_array.fill(0.0)
+                return False
+            idx = (self.read_ptr + np.arange(n)) % self.capacity
+            np.copyto(out_array, self.buffer[idx])
+            self.read_ptr = (self.read_ptr + n) % self.capacity
+            self.available -= n
+            return True
 
 
 def smooth_spectrum_12th_octave(freqs_hz: np.ndarray, mag_db: np.ndarray) -> np.ndarray:

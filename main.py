@@ -2911,19 +2911,27 @@ class AudioAnalyzerApp(QMainWindow):
         grid.addWidget(QLabel("Input 2 (Aux / Mic):"), 3, 0)
         self.in2_combo = QComboBox()
         style_dark_combobox(self.in2_combo)
-        self.in2_combo.setMinimumWidth(320)
+        self.in2_combo.setMinimumWidth(240)
         self.in2_combo.setToolTip("Entrada secundaria opcional (ej. Micrófono de Medición o Entrada Auxiliar)")
         self.in2_combo.currentIndexChanged.connect(self._on_in2_device_changed)
-        grid.addWidget(self.in2_combo, 3, 1)
 
-        # 2.1 Ruteo Input 2 (DESMARCADO POR DEFECTO PARA EVITAR ACOPLE CON MICRÓFONO)
+        in2_h_layout = QHBoxLayout()
+        in2_h_layout.setSpacing(10)
+        in2_h_layout.addWidget(self.in2_combo, 1)
+        self.lbl_in2_status = QLabel("● Desactivado")
+        self.lbl_in2_status.setStyleSheet("color: #8C96A5; font-size: 10px; font-weight: bold;")
+        self.lbl_in2_status.setToolTip("Estado y nivel de señal en vivo de Input 2")
+        in2_h_layout.addWidget(self.lbl_in2_status, 0)
+        grid.addLayout(in2_h_layout, 3, 1)
+
+        # 2.1 Ruteo Input 2
         grid.addWidget(QLabel("Enviar In 2 a:"), 4, 0)
         route_in2_row = QHBoxLayout()
         route_in2_row.setSpacing(14)
-        self.chk_route_in2_a = QCheckBox("Out A")
+        self.chk_route_in2_a = QCheckBox("Out A (Tops / Bus 1)")
         self.chk_route_in2_a.setChecked(self.route_in2_to_a)
         self.chk_route_in2_a.toggled.connect(self._on_routing_changed)
-        self.chk_route_in2_b = QCheckBox("Out B")
+        self.chk_route_in2_b = QCheckBox("Out B (Sub / Bus 2)")
         self.chk_route_in2_b.setChecked(self.route_in2_to_b)
         self.chk_route_in2_b.toggled.connect(self._on_routing_changed)
         route_in2_row.addWidget(self.chk_route_in2_a)
@@ -4203,6 +4211,12 @@ class AudioAnalyzerApp(QMainWindow):
                 "host_api_index": self.host_api_combo.currentData() if hasattr(self, "host_api_combo") else 0,
                 "input_device_name": self.in_combo.currentText(),
                 "input_device_index": self.in_combo.currentData(),
+                "input2_device_name": self.in2_combo.currentText() if hasattr(self, "in2_combo") else "",
+                "input2_device_index": self.in2_combo.currentData() if hasattr(self, "in2_combo") else None,
+                "route_in1_to_a": bool(self.route_in1_to_a),
+                "route_in1_to_b": bool(self.route_in1_to_b),
+                "route_in2_to_a": bool(self.route_in2_to_a),
+                "route_in2_to_b": bool(self.route_in2_to_b),
                 "output_device_name": self.out_combo.currentText(),
                 "output_device_index": self.out_combo.currentData(),
                 "output_b_device_name": self.out_b_combo.currentText(),
@@ -4216,6 +4230,7 @@ class AudioAnalyzerApp(QMainWindow):
             "analyzer": {
                 "fft_size": int(self.fft_size),
                 "show_pre": bool(self.show_in_chk.isChecked()),
+                "show_in2": bool(self.show_in2_chk.isChecked()) if hasattr(self, "show_in2_chk") else False,
                 "show_post": bool(self.show_out1_chk.isChecked()),
                 "show_post2": bool(self.show_out2_chk.isChecked()),
                 "x_scale": self.x_scale_combo.currentText(),
@@ -4282,6 +4297,39 @@ class AudioAnalyzerApp(QMainWindow):
             elif isinstance(out_b_idx_saved, int) and self.out_b_combo.findData(out_b_idx_saved) >= 0:
                 self.out_b_combo.setCurrentIndex(self.out_b_combo.findData(out_b_idx_saved))
 
+            in2_name = audio_cfg.get("input2_device_name")
+            in2_idx_saved = audio_cfg.get("input2_device_index")
+            if hasattr(self, "in2_combo") and in2_name and in2_name != "— Ninguno / Desactivado —":
+                if self.in2_combo.findText(in2_name) >= 0:
+                    self.in2_combo.setCurrentIndex(self.in2_combo.findText(in2_name))
+                elif isinstance(in2_idx_saved, int) and self.in2_combo.findData(in2_idx_saved) >= 0:
+                    self.in2_combo.setCurrentIndex(self.in2_combo.findData(in2_idx_saved))
+
+            if "route_in1_to_a" in audio_cfg:
+                self.route_in1_to_a = bool(audio_cfg["route_in1_to_a"])
+                if hasattr(self, "chk_route_in1_a"):
+                    self.chk_route_in1_a.blockSignals(True)
+                    self.chk_route_in1_a.setChecked(self.route_in1_to_a)
+                    self.chk_route_in1_a.blockSignals(False)
+            if "route_in1_to_b" in audio_cfg:
+                self.route_in1_to_b = bool(audio_cfg["route_in1_to_b"])
+                if hasattr(self, "chk_route_in1_b"):
+                    self.chk_route_in1_b.blockSignals(True)
+                    self.chk_route_in1_b.setChecked(self.route_in1_to_b)
+                    self.chk_route_in1_b.blockSignals(False)
+            if "route_in2_to_a" in audio_cfg:
+                self.route_in2_to_a = bool(audio_cfg["route_in2_to_a"])
+                if hasattr(self, "chk_route_in2_a"):
+                    self.chk_route_in2_a.blockSignals(True)
+                    self.chk_route_in2_a.setChecked(self.route_in2_to_a)
+                    self.chk_route_in2_a.blockSignals(False)
+            if "route_in2_to_b" in audio_cfg:
+                self.route_in2_to_b = bool(audio_cfg["route_in2_to_b"])
+                if hasattr(self, "chk_route_in2_b"):
+                    self.chk_route_in2_b.blockSignals(True)
+                    self.chk_route_in2_b.setChecked(self.route_in2_to_b)
+                    self.chk_route_in2_b.blockSignals(False)
+
             # 2. Buffer Size / Latency
             buf_sz = audio_cfg.get("buffer_size", audio_cfg.get("audio_block_size"))
             if buf_sz in getattr(self, "buffer_sizes", [64, 128, 256, 512, 1024]):
@@ -4330,6 +4378,8 @@ class AudioAnalyzerApp(QMainWindow):
 
             if "show_pre" in analyzer_cfg:
                 self.show_in_chk.setChecked(bool(analyzer_cfg["show_pre"]))
+            if "show_in2" in analyzer_cfg and hasattr(self, "show_in2_chk"):
+                self.show_in2_chk.setChecked(bool(analyzer_cfg["show_in2"]))
             if "show_post" in analyzer_cfg:
                 self.show_out1_chk.setChecked(bool(analyzer_cfg["show_post"]))
             if "show_post2" in analyzer_cfg:
@@ -4683,6 +4733,18 @@ class AudioAnalyzerApp(QMainWindow):
 
     def _on_in2_device_changed(self):
         if not self._loading_config:
+            dev_idx = self.in2_combo.currentData() if hasattr(self, "in2_combo") else None
+            if dev_idx is not None:
+                # Si ambas salidas están desmarcadas, habilitar Out A para que el usuario escuche la entrada
+                if not self.route_in2_to_a and not self.route_in2_to_b:
+                    self.route_in2_to_a = True
+                    if hasattr(self, "chk_route_in2_a"):
+                        self.chk_route_in2_a.blockSignals(True)
+                        self.chk_route_in2_a.setChecked(True)
+                        self.chk_route_in2_a.blockSignals(False)
+                # Auto-activar curva FFT de In 2 si no estaba activa
+                if hasattr(self, "show_in2_chk") and not self.show_in2_chk.isChecked():
+                    self.show_in2_chk.setChecked(True)
             self._restart_in2_stream()
             self.schedule_config_save()
 
@@ -4699,6 +4761,9 @@ class AudioAnalyzerApp(QMainWindow):
             return
         dev_idx = self.in2_combo.currentData()
         if dev_idx is None:
+            if hasattr(self, "lbl_in2_status"):
+                self.lbl_in2_status.setText("● Desactivado")
+                self.lbl_in2_status.setStyleSheet("color: #8C96A5; font-size: 10px; font-weight: bold;")
             return
 
         try:
@@ -4714,30 +4779,113 @@ class AudioAnalyzerApp(QMainWindow):
             except Exception:
                 in2_wasapi = None
 
-            stream_in2_kwargs = {
-                "device": dev_idx,
-                "channels": ch,
-                "samplerate": self.current_sr,
-                "blocksize": self.audio_block_size,
-                "latency": "low",
-                "callback": self.audio_callback_in2,
-            }
-            if in2_wasapi is not None:
-                stream_in2_kwargs["extra_settings"] = in2_wasapi
+            # Estrategia de apertura robusta de 3 niveles para compatibilidad total con MME, DirectSound y WASAPI
+            opened = False
+            last_err = None
 
-            self.stream_in2 = sd.InputStream(**stream_in2_kwargs)
-            self.stream_in2.start()
+            # Nivel 1: Con baja latencia y blocksize maestro
+            try:
+                kwargs = {
+                    "device": dev_idx,
+                    "channels": ch,
+                    "samplerate": self.current_sr,
+                    "blocksize": self.audio_block_size,
+                    "latency": "low",
+                    "callback": self.audio_callback_in2,
+                }
+                if in2_wasapi is not None:
+                    kwargs["extra_settings"] = in2_wasapi
+                self.stream_in2 = sd.InputStream(**kwargs)
+                self.stream_in2.start()
+                self.in2_stream_sr = self.current_sr
+                opened = True
+            except Exception as e1:
+                last_err = e1
+
+            # Nivel 2: Blocksize y latencia por defecto del driver de sonido
+            if not opened:
+                try:
+                    kwargs = {
+                        "device": dev_idx,
+                        "channels": ch,
+                        "samplerate": self.current_sr,
+                        "callback": self.audio_callback_in2,
+                    }
+                    if in2_wasapi is not None:
+                        kwargs["extra_settings"] = in2_wasapi
+                    self.stream_in2 = sd.InputStream(**kwargs)
+                    self.stream_in2.start()
+                    self.in2_stream_sr = self.current_sr
+                    opened = True
+                except Exception as e2:
+                    last_err = e2
+
+            # Nivel 3: Sample rate nativo del dispositivo (con remuestreo automático en callback)
+            if not opened:
+                try:
+                    native_sr = int(dev_info.get("default_samplerate", 44100))
+                    kwargs = {
+                        "device": dev_idx,
+                        "channels": ch,
+                        "samplerate": native_sr,
+                        "callback": self.audio_callback_in2,
+                    }
+                    self.stream_in2 = sd.InputStream(**kwargs)
+                    self.stream_in2.start()
+                    self.in2_stream_sr = native_sr
+                    opened = True
+                except Exception as e3:
+                    last_err = e3
+
+            if opened:
+                if hasattr(self, "lbl_in2_status"):
+                    self.lbl_in2_status.setText(f"● Conectado ({int(self.in2_stream_sr)} Hz)")
+                    self.lbl_in2_status.setStyleSheet("color: #00E676; font-size: 10px; font-weight: bold;")
+            else:
+                self.stream_in2 = None
+                print(f"[WARN] Error al abrir Input 2 ({dev_idx}): {last_err}")
+                if hasattr(self, "lbl_in2_status"):
+                    self.lbl_in2_status.setText(f"⚠ Error de Audio")
+                    self.lbl_in2_status.setStyleSheet("color: #FF5252; font-size: 10px; font-weight: bold;")
         except Exception as e:
             self.stream_in2 = None
-            print(f"[WARN] Error al abrir Input 2 ({dev_idx}): {e}")
+            print(f"[WARN] Excepción inesperada en Input 2 ({dev_idx}): {e}")
 
     def audio_callback_in2(self, indata, frames, time_info, status):
-        # Bloqueador de DC offset para micrófonos (elimina artefactos por debajo de 15 Hz)
-        if indata.size > 0:
-            clean_in = (indata - np.mean(indata, axis=0, keepdims=True)).astype(np.float32)
-            self.in2_ring_buffer.write(clean_in)
+        if indata.size == 0:
+            return
+
+        # 1. Asegurar matriz estéreo (frames, 2)
+        if indata.ndim == 1:
+            stereo = np.column_stack((indata, indata))
+        elif indata.shape[1] == 1:
+            stereo = np.repeat(indata, 2, axis=1)
         else:
-            self.in2_ring_buffer.write(indata)
+            stereo = indata[:, 0:2].astype(np.float32, copy=False)
+
+        # 2. Remuestreo dinámico si el sample rate del stream difiere del motor DSP
+        in2_sr = getattr(self, "in2_stream_sr", self.current_sr)
+        if in2_sr != self.current_sr and frames > 1:
+            target_frames = int(round(frames * self.current_sr / float(in2_sr)))
+            x_orig = np.linspace(0.0, 1.0, frames, endpoint=False)
+            x_target = np.linspace(0.0, 1.0, target_frames, endpoint=False)
+            resampled = np.empty((target_frames, 2), dtype=np.float32)
+            resampled[:, 0] = np.interp(x_target, x_orig, stereo[:, 0])
+            resampled[:, 1] = np.interp(x_target, x_orig, stereo[:, 1])
+            stereo = resampled
+
+        # 3. DC Blocker continuo a 15 Hz sin artefactos de bloque ni saltos
+        if not hasattr(self, "_in2_dc_zi"):
+            self._in2_dc_b = np.array([1.0, -1.0], dtype=np.float32)
+            self._in2_dc_a = np.array([1.0, -0.998], dtype=np.float32)
+            self._in2_dc_zi = np.zeros((1, 2), dtype=np.float32)
+
+        try:
+            from scipy.signal import lfilter
+            clean_in, self._in2_dc_zi = lfilter(self._in2_dc_b, self._in2_dc_a, stereo, axis=0, zi=self._in2_dc_zi)
+            self.in2_ring_buffer.write(clean_in.astype(np.float32))
+        except Exception:
+            self.in2_ring_buffer.write(stereo.astype(np.float32))
 
     def _on_routing_changed(self):
         self.route_in1_to_a = bool(self.chk_route_in1_a.isChecked())
@@ -4897,10 +5045,11 @@ class AudioAnalyzerApp(QMainWindow):
         # 2. Lectura y procesamiento independiente de Input 2 (Aux / Mic) desde el ring buffer lock-free
         if not hasattr(self, "in2_block") or self.in2_block.shape[0] != frames:
             self.in2_block = np.zeros((frames, 2), dtype=np.float32)
-        if self.route_in2_to_a or self.route_in2_to_b:
+        if self.stream_in2 is not None:
             self.in2_ring_buffer.read_into(self.in2_block)
             in2_a, in2_b = self.eq_proc_in2.process_dual_block(self.in2_block, apply_limiter=False, apply_autogain=False)
         else:
+            self.in2_block.fill(0.0)
             in2_a = in2_b = None
 
         # 3. Matriz de ruteo libre de acoples hacia Out A y Out B
@@ -5020,7 +5169,7 @@ class AudioAnalyzerApp(QMainWindow):
         p = self._vis_accum_ptr
         if p + frames <= self._vis_accum_cap:
             self._vis_in1_arr[p:p + frames] = indata
-            if in2_a is not None:
+            if self.stream_in2 is not None:
                 self._vis_in2_arr[p:p + frames] = self.in2_block
             else:
                 self._vis_in2_arr[p:p + frames] = 0.0
@@ -5042,7 +5191,7 @@ class AudioAnalyzerApp(QMainWindow):
             try:
                 self.audio_queue.put_nowait((
                     indata.copy(),
-                    self.in2_block.copy() if in2_a is not None else np.zeros((frames, 2), dtype=np.float32),
+                    self.in2_block.copy() if self.stream_in2 is not None else np.zeros((frames, 2), dtype=np.float32),
                     out_A.copy(),
                     out_B.copy(),
                 ))
@@ -5386,6 +5535,33 @@ class AudioAnalyzerApp(QMainWindow):
         if (has_b_routed or has_secondary_device) and not getattr(self, "_auto_out2_activated", False):
             self.show_out2_chk.setChecked(True)
             self._auto_out2_activated = True
+
+        # Activación inteligente por defecto de Input 2 (Aux / Mic):
+        has_in2_device = (self.stream_in2 is not None) or (
+            hasattr(self, "in2_combo") and self.in2_combo.currentIndex() > 0
+        )
+        if has_in2_device and not getattr(self, "_auto_in2_activated", False):
+            if hasattr(self, "show_in2_chk"):
+                self.show_in2_chk.setChecked(True)
+            self._auto_in2_activated = True
+        elif not has_in2_device:
+            self._auto_in2_activated = False
+
+        # Actualizar medidor/estado de Input 2 en el menú de Audio I/O
+        if hasattr(self, "lbl_in2_status"):
+            if self.stream_in2 is not None:
+                eps = 1e-10
+                peak_in2 = float(np.max(np.abs(self.in2_block))) if hasattr(self, "in2_block") else 0.0
+                if peak_in2 > 0.0002:
+                    db_in2 = float(20.0 * np.log10(peak_in2 + eps))
+                    self.lbl_in2_status.setText(f"● Activo ({db_in2:+.1f} dB)")
+                    self.lbl_in2_status.setStyleSheet("color: #00E676; font-size: 10px; font-weight: bold;")
+                else:
+                    self.lbl_in2_status.setText("● Conectado (Silencio)")
+                    self.lbl_in2_status.setStyleSheet("color: #BA68C8; font-size: 10px; font-weight: bold;")
+            else:
+                self.lbl_in2_status.setText("● Desactivado")
+                self.lbl_in2_status.setStyleSheet("color: #8C96A5; font-size: 10px; font-weight: bold;")
 
         show_in = self.show_in_chk.isChecked()
         show_in2 = self.show_in2_chk.isChecked() if hasattr(self, "show_in2_chk") else False
