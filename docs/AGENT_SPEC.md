@@ -73,3 +73,6 @@ El proyecto está estructurado en componentes fuertemente desacoplados que opera
    - Toda la interfaz sigue la estética oscura profesional `#0D0F14` con componentes Liquid Glass translúcidos. Queda prohibido cualquier estilo de controles nativos claros de Windows o el antiguo modo retro VFD.
 6. **Compilación de Instaladores y Versionado:**
    - El script oficial de Inno Setup es `setup.iss` (con alias `setup.ino` y `build_installer.iss`), configurado para generar `setup.exe` con compresión `lzma2/ultra64` y modo 64 bits (`x64compatible`).
+7. **Compatibilidad con UAC y Directorios Protegidos (Program Files):**
+   - Queda estrictamente prohibido usar llamadas relativas directas del tipo `os.makedirs("presets")` o asumir que `_app_dir()` es escribible.
+   - Todo guardado de datos mutables (presets, `config.json`, archivos temporales) debe verificar `_is_writable_dir(_app_dir())`: si es escribible (entorno de desarrollo o modo portable), se utiliza la ruta local; si la aplicación está instalada en `C:\Program Files` u otra ruta protegida por UAC en Windows, los datos se deben escribir y cargar desde `%APPDATA%\BDJ_FFT_EQ\`.

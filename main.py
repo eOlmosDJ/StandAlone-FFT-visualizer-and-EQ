@@ -164,12 +164,65 @@ def _app_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 
-def _config_candidates():
-    paths = [os.path.join(_app_dir(), CONFIG_FILENAME)]
+def _is_writable_dir(path: str) -> bool:
+    """Comprueba de forma segura y fiable si un directorio permite escritura en Windows."""
+    if not path or not os.path.isdir(path):
+        return False
+    # En Windows, evitar escribir dentro de Program Files o System32 si la app está instalada
+    lower = os.path.abspath(path).lower()
+    prog_files = os.environ.get("ProgramFiles", "C:\\Program Files").lower()
+    prog_files_x86 = os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)").lower()
+    if lower.startswith(prog_files) or lower.startswith(prog_files_x86) or "system32" in lower:
+        return False
+    test_file = os.path.join(path, f".write_test_{os.getpid()}.tmp")
+    try:
+        with open(test_file, "w", encoding="utf-8") as f:
+            f.write("1")
+        if os.path.isfile(test_file):
+            os.remove(test_file)
+        return True
+    except (OSError, PermissionError):
+        return False
+
+
+def _user_data_dir() -> str:
+    """
+    Retorna el directorio de datos de usuario (%APPDATA%\\BDJ_FFT_EQ).
+    Garantiza que la carpeta exista con permisos de lectura/escritura completos.
+    """
     appdata = os.environ.get("APPDATA")
     if appdata:
-        paths.append(os.path.join(appdata, "AnalizadorFFT", CONFIG_FILENAME))
-    return paths
+        base = os.path.join(appdata, "BDJ_FFT_EQ")
+    else:
+        base = os.path.join(os.path.expanduser("~"), ".bdj_fft_eq")
+    try:
+        os.makedirs(base, exist_ok=True)
+    except OSError:
+        pass
+    return base
+
+
+def _config_candidates():
+    paths = []
+    user_cfg = os.path.join(_user_data_dir(), CONFIG_FILENAME)
+    appdata = os.environ.get("APPDATA")
+    legacy_cfg = os.path.join(appdata, "AnalizadorFFT", CONFIG_FILENAME) if appdata else None
+    app_cfg = os.path.join(_app_dir(), CONFIG_FILENAME)
+
+    if _is_writable_dir(_app_dir()):
+        # Modo desarrollo o portátil: prioridad a la carpeta local junto al .exe
+        paths.append(app_cfg)
+        paths.append(user_cfg)
+        if legacy_cfg:
+            paths.append(legacy_cfg)
+    else:
+        # Modo instalado en Program Files: prioridad absoluta a datos de usuario
+        paths.append(user_cfg)
+        if legacy_cfg:
+            paths.append(legacy_cfg)
+        paths.append(app_cfg)
+
+    return [p for p in paths if p]
 
 
 def load_full_config() -> dict:
@@ -3644,36 +3697,65 @@ class AudioAnalyzerApp(QMainWindow):
         return self.eq_engine.bands if hasattr(self, "eq_engine") else []
 
     def _get_presets_dir(self) -> str:
-        """Crea y retorna la ruta a la carpeta presets tanto relativa como junto al ejecutable."""
-        os.makedirs("presets", exist_ok=True)
-        p_dir = os.path.join(_app_dir(), "presets")
-        os.makedirs(p_dir, exist_ok=True)
-        return p_dir
+        r"""
+        Retorna la ruta hacia la carpeta de presets del usuario garantizando permisos de escritura.
+        Si la carpeta del ejecutable es escribible (modo desarrollo/portátil), se usa 'presets' local.
+        De lo contrario (instalada en C:\Program Files), se usa %APPDATA%\BDJ_FFT_EQ\presets.
+        """
+        app_d = _app_dir()
+        if _is_writable_dir(app_d):
+            p_dir = os.path.join(app_d, "presets")
+            try:
+                os.makedirs(p_dir, exist_ok=True)
+                return p_dir
+            except OSError:
+                pass
+
+        user_presets = os.path.join(_user_data_dir(), "presets")
+        try:
+            os.makedirs(user_presets, exist_ok=True)
+        except OSError:
+            pass
+        return user_presets
 
     def _get_default_startup_preset_path(self) -> str:
         """Ruta hacia default_startup.json."""
-        p_app = os.path.join(self._get_presets_dir(), "default_startup.json")
-        if os.path.isfile(p_app):
-            return p_app
-        p_rel = os.path.join("presets", "default_startup.json")
-        if os.path.isfile(p_rel):
-            return p_rel
-        return p_app
+        user_p = os.path.join(self._get_presets_dir(), "default_startup.json")
+        if os.path.isfile(user_p):
+            return user_p
+        app_p = os.path.join(_app_dir(), "presets", "default_startup.json")
+        if os.path.isfile(app_p):
+            return app_p
+        return user_p
 
     def _get_preset_files(self) -> list[tuple[str, str]]:
         """Retorna la lista de presets disponibles (nombre_sin_ext, ruta) excluyendo default_startup.json."""
         files = []
         seen = set()
-        for folder in (self._get_presets_dir(), "presets"):
+        search_dirs = [self._get_presets_dir()]
+        app_presets = os.path.join(_app_dir(), "presets")
+        if app_presets not in search_dirs and os.path.isdir(app_presets):
+            search_dirs.append(app_presets)
+
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            legacy_dir = os.path.join(appdata, "AnalizadorFFT", "presets")
+            if legacy_dir not in search_dirs and os.path.isdir(legacy_dir):
+                search_dirs.append(legacy_dir)
+
+        for folder in search_dirs:
             if not os.path.isdir(folder):
                 continue
-            for fname in sorted(os.listdir(folder)):
-                if fname.lower().endswith(".json") and fname.lower() != "default_startup.json":
-                    display_name = os.path.splitext(fname)[0]
-                    full_p = os.path.abspath(os.path.join(folder, fname))
-                    if display_name not in seen and os.path.isfile(full_p):
-                        seen.add(display_name)
-                        files.append((display_name, full_p))
+            try:
+                for fname in sorted(os.listdir(folder)):
+                    if fname.lower().endswith(".json") and fname.lower() != "default_startup.json":
+                        display_name = os.path.splitext(fname)[0]
+                        full_p = os.path.abspath(os.path.join(folder, fname))
+                        if display_name not in seen and os.path.isfile(full_p):
+                            seen.add(display_name)
+                            files.append((display_name, full_p))
+            except OSError:
+                continue
         return sorted(files, key=lambda x: x[0].lower())
 
     def save_preset_to_file(self, filepath: str) -> bool:
@@ -3744,7 +3826,7 @@ class AudioAnalyzerApp(QMainWindow):
             if os.path.isfile(cand):
                 target = cand
             else:
-                cand2 = os.path.join("presets", os.path.basename(filepath))
+                cand2 = os.path.join(_app_dir(), "presets", os.path.basename(filepath))
                 if os.path.isfile(cand2):
                     target = cand2
                 else:
@@ -3878,15 +3960,12 @@ class AudioAnalyzerApp(QMainWindow):
 
     def _restore_factory_startup(self):
         """Restaura el inicio de fábrica eliminando default_startup.json."""
-        for p in (
-            os.path.join(self._get_presets_dir(), "default_startup.json"),
-            os.path.join("presets", "default_startup.json"),
-        ):
-            if os.path.isfile(p):
-                try:
-                    os.remove(p)
-                except Exception as e:
-                    print(f"[ERROR] Error al eliminar preset de inicio: {e}")
+        target = os.path.join(self._get_presets_dir(), "default_startup.json")
+        if os.path.isfile(target):
+            try:
+                os.remove(target)
+            except Exception as e:
+                print(f"[ERROR] Error al eliminar preset de inicio: {e}")
 
     def _on_save_preset_dialog(self):
         """Abre un diálogo oscuro pidiendo el nombre del preset."""

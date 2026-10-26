@@ -29,6 +29,10 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
 Name: "autostart"; Description: "Iniciar automáticamente con Windows"; GroupDescription: "Inicio automático:"
 
+[Dirs]
+Name: "{app}\presets"; Permissions: users-modify
+Name: "{userappdata}\BDJ_FFT_EQ\presets"; Flags: uninsneveruninstall
+
 [Files]
 Source: "dist\FFTEQ&LIM.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "icon.ico"; DestDir: "{app}"; Flags: ignoreversion
