@@ -22,7 +22,7 @@ from PyQt6.QtWidgets import (
     QComboBox, QLabel, QGroupBox, QMessageBox,
     QPushButton, QSlider, QSpinBox, QDoubleSpinBox, QDialog, QColorDialog,
     QGridLayout, QDialogButtonBox, QMenu, QCheckBox, QFrame,
-    QInputDialog, QStyleFactory, QLineEdit, QWidgetAction
+    QInputDialog, QStyleFactory, QLineEdit, QWidgetAction, QSizePolicy
 )
 from PyQt6.QtCore import QTimer, Qt, QRectF, QPoint, QPointF, pyqtSignal
 from PyQt6.QtGui import (
@@ -89,31 +89,36 @@ DEFAULT_PRESET_NAME = "Gris Puro de Estudio (Default)"
 THEME_PRESETS = {
     "Gris Puro de Estudio (Default)": {
         "background": "#141414", "curve": "#00E5FF", "curve_width": 15,
-        "curve_in": "#9E9E9E", "curve_out1": "#00E5FF", "curve_out2": "#00E676",
+        "curve_in": "#9E9E9E", "curve_in2": "#BA68C8", "curve_out1": "#00E5FF", "curve_out2": "#00E676",
+        "curve_rta": "#FFD740", "curve_eq_a": "#FFD54F", "curve_eq_b": "#00E5FF",
         "fill": "#6E747E", "fill_alpha": 40,
         "grid": "#2A2A2A", "grid_alpha": 45, "axis_text": "#8C919B",
     },
     "Carbón de Estudio": {
         "background": "#1E1E1E", "curve": "#C5CAD3", "curve_width": 16,
-        "curve_in": "#9E9E9E", "curve_out1": "#00E5FF", "curve_out2": "#00E676",
+        "curve_in": "#9E9E9E", "curve_in2": "#BA68C8", "curve_out1": "#00E5FF", "curve_out2": "#00E676",
+        "curve_rta": "#FFD740", "curve_eq_a": "#FFD54F", "curve_eq_b": "#00E5FF",
         "fill": "#767C87", "fill_alpha": 42,
         "grid": "#333333", "grid_alpha": 45, "axis_text": "#989EA8",
     },
     "Negro Absoluto": {
         "background": "#080808", "curve": "#00E5FF", "curve_width": 17,
-        "curve_in": "#9E9E9E", "curve_out1": "#00E5FF", "curve_out2": "#00E676",
+        "curve_in": "#9E9E9E", "curve_in2": "#BA68C8", "curve_out1": "#00E5FF", "curve_out2": "#00E676",
+        "curve_rta": "#FFD740", "curve_eq_a": "#FFD54F", "curve_eq_b": "#00E5FF",
         "fill": "#00ACC1", "fill_alpha": 42,
         "grid": "#222222", "grid_alpha": 45, "axis_text": "#858A94",
     },
     "Azul Estudio": {
         "background": "#0D1017", "curve": "#A0AAB8", "curve_width": 15,
-        "curve_in": "#9E9E9E", "curve_out1": "#00E5FF", "curve_out2": "#00E676",
+        "curve_in": "#9E9E9E", "curve_in2": "#BA68C8", "curve_out1": "#00E5FF", "curve_out2": "#00E676",
+        "curve_rta": "#FFD740", "curve_eq_a": "#FFD54F", "curve_eq_b": "#00E5FF",
         "fill": "#606B7D", "fill_alpha": 38,
         "grid": "#2D3340", "grid_alpha": 30, "axis_text": "#7A8496",
     },
     "Ámbar Analógico": {
         "background": "#140C02", "curve": "#FFB300", "curve_width": 20,
-        "curve_in": "#9E9E9E", "curve_out1": "#FFB300", "curve_out2": "#00E676",
+        "curve_in": "#9E9E9E", "curve_in2": "#BA68C8", "curve_out1": "#FFB300", "curve_out2": "#00E676",
+        "curve_rta": "#FFD740", "curve_eq_a": "#FFD54F", "curve_eq_b": "#00E5FF",
         "fill": "#FF8F00", "fill_alpha": 50,
         "grid": "#8A6A3A", "grid_alpha": 35, "axis_text": "#D9B98A",
     },
@@ -127,7 +132,11 @@ BACKGROUND_COLOR_PRESETS = [
 ]
 
 THEME_NUMERIC_RANGES = {"curve_width": (10, 60), "fill_alpha": (0, 255), "grid_alpha": (5, 100)}
-THEME_COLOR_KEYS = ("background", "curve", "fill", "grid", "axis_text", "curve_in", "curve_out1", "curve_out2")
+THEME_COLOR_KEYS = (
+    "background", "curve", "fill", "grid", "axis_text",
+    "curve_in", "curve_in2", "curve_out1", "curve_out2",
+    "curve_rta", "curve_eq_a", "curve_eq_b"
+)
 CONFIG_FILENAME = "config.json"
 CURRENT_CONFIG_VERSION = 4
 
@@ -187,10 +196,18 @@ def load_full_config() -> dict:
 
     if "curve_in" not in theme:
         theme["curve_in"] = "#9E9E9E"
+    if "curve_in2" not in theme:
+        theme["curve_in2"] = "#BA68C8"
     if "curve_out1" not in theme:
         theme["curve_out1"] = theme.get("curve", "#00E5FF")
     if "curve_out2" not in theme:
         theme["curve_out2"] = "#00E676"
+    if "curve_rta" not in theme:
+        theme["curve_rta"] = "#FFD740"
+    if "curve_eq_a" not in theme:
+        theme["curve_eq_a"] = "#FFD54F"
+    if "curve_eq_b" not in theme:
+        theme["curve_eq_b"] = "#00E5FF"
 
     raw_data["theme"] = theme
     return raw_data
@@ -708,19 +725,23 @@ class WaveformScopeWidget(QWidget):
         self.env_buffer = env_buffer
         self._limit_glow_alpha: float = 0.0
         self.current_duration_sec: int = 10
-        self.setFixedSize(338, 30)
+        self.setFixedHeight(30)
+        self.setMinimumWidth(130)
+        self.setMaximumWidth(240)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
 
         row = QHBoxLayout(self)
-        row.setContentsMargins(7, 3, 6, 3)
+        row.setContentsMargins(5, 3, 5, 3)
         row.setSpacing(4)
 
         self.mini_scope = MiniOscilloscopeWidget(self)
-        self.mini_scope.setFixedSize(240, 22)
+        self.mini_scope.setFixedHeight(22)
+        self.mini_scope.setMinimumWidth(60)
+        self.mini_scope.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.mini_scope.set_time_window(10.0)
         self.mini_scope.clicked.connect(self.toggleExpandedRequested.emit)
         self.canvas = self.mini_scope  # compat alias
-        row.addWidget(self.mini_scope)
+        row.addWidget(self.mini_scope, 1)
 
         self.dur_btn = LiquidGlassButton("10s", self, pill_radius=10.0)
         self.dur_btn.setFixedSize(36, 22)
@@ -1396,8 +1417,8 @@ class WaveformOverlayWidget(QWidget):
             p.setPen(QColor("#8E95A4"))
             p.drawText(QRectF(x_s - 18.0, h - 18.0, 36.0, 15.0), Qt.AlignmentFlag.AlignCenter, lbl)
 
-        # Badges de señales activas junto a los botones
-        cur_x = 608.0
+        # Badges de señales activas junto a los botones (desplazado a la derecha de dur_btn para evitar solapamiento)
+        cur_x = 668.0
         font_badge = QFont("Segoe UI", 8, QFont.Weight.DemiBold)
         p.setFont(font_badge)
         fm = QFontMetrics(font_badge)
@@ -1708,9 +1729,13 @@ class ColorSettingsDialog(QDialog):
 
     COLOR_ROWS = [
         ("background", "Fondo del gráfico"),
-        ("curve_in", "Curva Input (Pre-EQ)"),
+        ("curve_in", "Curva Input 1 (Pre-EQ)"),
+        ("curve_in2", "Curva Mic / Input 2"),
         ("curve_out1", "Curva Output 1 (Bus A)"),
         ("curve_out2", "Curva Output 2 (Bus B)"),
+        ("curve_rta", "Curva RTA (Medición Sala)"),
+        ("curve_eq_a", "Curva Sumatoria EQ Out A"),
+        ("curve_eq_b", "Curva Sumatoria EQ Out B"),
         ("fill", "Relleno bajo el espectro"),
         ("grid", "Líneas de grilla / frecuencia"),
         ("axis_text", "Texto de los ejes"),
@@ -2173,15 +2198,16 @@ class AudioAnalyzerApp(QMainWindow):
         screen = QApplication.primaryScreen()
         if screen is not None:
             avail = screen.availableGeometry()
-            w = min(1140, int(avail.width() * 0.86))
-            h = min(700, int(avail.height() * 0.85))
+            w = min(1360, max(1240, int(avail.width() * 0.82)))
+            h = min(820, max(680, int(avail.height() * 0.82)))
             self.resize(w, h)
             self.move(
                 avail.x() + (avail.width() - w) // 2,
                 avail.y() + (avail.height() - h) // 2,
             )
         else:
-            self.resize(1120, 680)
+            self.resize(1280, 720)
+        self.setMinimumSize(1020, 600)
 
         # Estética Gris Puro Neutro de Estudio (#141414 lienzo, #1C1C1C barras/paneles, #2A2A2A bordes/grilla)
         self.setStyleSheet("""
@@ -2440,7 +2466,7 @@ class AudioAnalyzerApp(QMainWindow):
         self.pre_curve = self.fft_curve_in  # compat alias
 
         # 1.1 Curva FFT Input 2 (Aux / Mic)
-        c_in2 = QColor("#BA68C8")
+        c_in2 = QColor(self.theme.get("curve_in2", "#BA68C8"))
         self.fft_curve_in2 = self.plot_widget.plot(
             pen=pg.mkPen(color=c_in2, width=1.1, style=Qt.PenStyle.DashLine),
             fillLevel=float(self.db_min - 12.0)
@@ -2466,15 +2492,16 @@ class AudioAnalyzerApp(QMainWindow):
         self.curve = self.fft_curve_out1  # compat alias
 
         # 4. Curva RTA (Promedio 10s) y Marcadores de Resonancia
+        c_rta = QColor(self.theme.get("curve_rta", "#FFD740"))
         self.rta_curve_item = self.plot_widget.plot(
-            pen=pg.mkPen(color=QColor("#FFD740"), width=2.0)
+            pen=pg.mkPen(color=c_rta, width=2.0)
         )
         self.rta_curve_item.setZValue(12)
         self.rta_curve_item.setVisible(False)
 
         self.rta_peak_labels = []
         for _ in range(3):
-            lbl = pg.TextItem(text="", color=QColor("#FFD740"), anchor=(0.5, 1.2), fill=QColor(20, 24, 32, 220))
+            lbl = pg.TextItem(text="", color=c_rta, anchor=(0.5, 1.2), fill=QColor(20, 24, 32, 220))
             lbl.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
             lbl.setZValue(15)
             lbl.setVisible(False)
@@ -2482,6 +2509,10 @@ class AudioAnalyzerApp(QMainWindow):
             self.rta_peak_labels.append(lbl)
 
         self.eq_overlay = ProQ4Overlay(self.plot_widget, self.eq_engine, self.graph_container)
+        self.eq_overlay.set_curve_colors(
+            self.theme.get("curve_eq_a", "#FFD54F"),
+            self.theme.get("curve_eq_b", "#00E5FF")
+        )
         self.eq_overlay.band_modified.connect(self.recalculate_autogain_target)
 
         # Curvas y línea interactiva del Crossover Digital de Salidas alojadas en el ViewBox de EQ
@@ -2518,27 +2549,27 @@ class AudioAnalyzerApp(QMainWindow):
         self.top_bar = QWidget(self.graph_container)
         self.top_bar.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         top_layout = QHBoxLayout(self.top_bar)
-        top_layout.setContentsMargins(4, 2, 4, 2)
-        top_layout.setSpacing(8)
+        top_layout.setContentsMargins(3, 2, 3, 2)
+        top_layout.setSpacing(4)
 
         logo_path = get_resource_path(os.path.join("assets", "logo.png"))
         if os.path.exists(logo_path):
             logo_lbl = QLabel(self.top_bar)
             logo_pix = QPixmap(logo_path).scaled(
-                22, 22, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
+                20, 20, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
             )
             logo_lbl.setPixmap(logo_pix)
-            logo_lbl.setContentsMargins(2, 0, 0, 0)
+            logo_lbl.setContentsMargins(1, 0, 0, 0)
             top_layout.addWidget(logo_lbl)
 
         brand_label = QLabel(
-            "<b style='color:#00E5FF; font-size:13px; letter-spacing:0.8px;'>BDJ</b> "
-            "<b style='color:#FFD54F; font-size:13px;'>FFT-EQ</b>"
+            "<b style='color:#00E5FF; font-size:12px; letter-spacing:0.6px;'>BDJ</b> "
+            "<b style='color:#FFD54F; font-size:12px;'>FFT-EQ</b>"
         )
-        brand_label.setContentsMargins(0, 0, 4, 0)
+        brand_label.setContentsMargins(0, 0, 2, 0)
         top_layout.addWidget(brand_label)
 
-        self.mute_btn = LiquidGlassButton("🔇 Muted (Activar)", self.top_bar, tint_color="#FF5252", active_tint_color="#FF5252")
+        self.mute_btn = LiquidGlassButton("🔇 Mute", self.top_bar, tint_color="#FF5252", active_tint_color="#FF5252")
         self.mute_btn.setCheckable(True)
         self.mute_btn.setChecked(True)
         self.mute_btn.clicked.connect(self.toggle_mute)
@@ -2546,14 +2577,14 @@ class AudioAnalyzerApp(QMainWindow):
         top_layout.addWidget(self.mute_btn)
 
         # Panel emergente de Dispositivos de Audio y Sample Rate
-        self.audio_menu_btn = LiquidGlassButton("🎧 Audio I/O ▾", self.top_bar)
+        self.audio_menu_btn = LiquidGlassButton("🎧 Audio ▾", self.top_bar)
         self.audio_menu_btn.setToolTip("Seleccionar Dispositivo de Entrada, Salida y Sample Rate")
         self.audio_menu_btn.clicked.connect(self._show_audio_popup)
         self._build_audio_io_popup()
         top_layout.addWidget(self.audio_menu_btn)
 
         # Panel emergente de Analizador FFT (incluye FFT Samples y Color de Fondo)
-        self.analyzer_menu_btn = LiquidGlassButton("📊 Analyzer: In+Out1 ▾", self.top_bar)
+        self.analyzer_menu_btn = LiquidGlassButton("📊 FFT: In+Out1 ▾", self.top_bar)
         self.analyzer_menu_btn.setToolTip("Configurar Analizador FFT, Curvas, Escalas, Rango dB y Colores")
         self.analyzer_menu_btn.clicked.connect(self._show_analyzer_popup)
         self._build_analyzer_popup()
@@ -2564,22 +2595,18 @@ class AudioAnalyzerApp(QMainWindow):
         self.edit_input_selector.inputChanged.connect(self.set_active_edit_input)
         top_layout.addWidget(self.edit_input_selector)
 
-        top_layout.addStretch(1)
-
-        # --- MINI-OSCILOSCOPIO EN CÁPSULA LIQUID GLASS ---
+        # --- MINI-OSCILOSCOPIO EN CÁPSULA LIQUID GLASS (Expandible dinámicamente) ---
         self.scope_widget = WaveformScopeWidget(self.scope_buffer, self.top_bar)
         self.scope_widget.toggleExpandedRequested.connect(self.toggle_expanded_scope)
         self.scope_widget.durationChanged.connect(self._on_scope_duration_changed)
-        top_layout.addWidget(self.scope_widget)
+        top_layout.addWidget(self.scope_widget, 1)
 
         # --- AUTO-GAIN MINI BAR ---
         self.autogain_mini_bar = AutoGainMiniBar(self.top_bar)
         self.autogain_mini_bar.toggled.connect(self._on_autogain_toggled)
-        top_layout.addWidget(self.autogain_mini_bar)
+        top_layout.addWidget(self.autogain_mini_bar, 0)
 
-        top_layout.addStretch(1)
-
-        self.crossover_btn = LiquidGlassButton("🔀 Crossover ▾", self.top_bar, active_tint_color="#FFB300")
+        self.crossover_btn = LiquidGlassButton("🔀 X-Over ▾", self.top_bar, active_tint_color="#FFB300")
         self.crossover_btn.setToolTip("Crossover Digital de Salidas (Out A / Out B)")
         self.crossover_btn.clicked.connect(self._show_crossover_menu)
         top_layout.addWidget(self.crossover_btn)
@@ -2600,21 +2627,21 @@ class AudioAnalyzerApp(QMainWindow):
         action_xover.setDefaultWidget(self.crossover_widget)
         self._crossover_menu.addAction(action_xover)
 
-        self.bypass_btn = LiquidGlassButton("Bypass EQ", self.top_bar, active_tint_color="#FF5252")
+        self.bypass_btn = LiquidGlassButton("Bypass", self.top_bar, active_tint_color="#FF5252")
         self.bypass_btn.setCheckable(True)
         self.bypass_btn.setToolTip("Desactivar temporalmente todas las bandas del ecualizador")
         self.bypass_btn.clicked.connect(self._on_global_bypass_toggled)
         top_layout.addWidget(self.bypass_btn)
 
         self.presets_btn = LiquidGlassButton("💾 Presets ▾", self.top_bar)
-        self.presets_btn.setMinimumWidth(92)
+        self.presets_btn.setMinimumWidth(78)
         self.presets_btn.setToolTip("Gestión de Presets: Guardar, Cargar, Resetear y Auto-inicio")
         self.presets_btn.clicked.connect(self._show_presets_menu)
         self.reset_eq_btn = self.presets_btn
         top_layout.addWidget(self.presets_btn)
 
         self.fullscreen_btn = LiquidGlassButton("⛶", self.top_bar)
-        self.fullscreen_btn.setFixedWidth(34)
+        self.fullscreen_btn.setFixedWidth(28)
         self.fullscreen_btn.setToolTip("Pantalla completa (Atajo: F11)")
         self.fullscreen_btn.clicked.connect(self.toggle_fullscreen)
         top_layout.addWidget(self.fullscreen_btn)
@@ -3289,9 +3316,13 @@ class AudioAnalyzerApp(QMainWindow):
         colors_layout = QVBoxLayout()
         colors_layout.setSpacing(4)
 
-        btn_color_in = QPushButton("🎨 Color Curva Input (Pre)...")
-        btn_color_in.clicked.connect(lambda: (self.analyzer_popup.close(), self._pick_curve_color("curve_in", "Curva Input (Pre)")))
+        btn_color_in = QPushButton("🎨 Color Curva Input 1 (Pre)...")
+        btn_color_in.clicked.connect(lambda: (self.analyzer_popup.close(), self._pick_curve_color("curve_in", "Curva Input 1 (Pre)")))
         colors_layout.addWidget(btn_color_in)
+
+        btn_color_in2 = QPushButton("🎨 Color Curva Mic / Input 2...")
+        btn_color_in2.clicked.connect(lambda: (self.analyzer_popup.close(), self._pick_curve_color("curve_in2", "Curva Mic / Input 2")))
+        colors_layout.addWidget(btn_color_in2)
 
         btn_color_out1 = QPushButton("🎨 Color Curva Output 1 (Bus A)...")
         btn_color_out1.clicked.connect(lambda: (self.analyzer_popup.close(), self._pick_curve_color("curve_out1", "Curva Output 1 (Bus A)")))
@@ -3300,6 +3331,18 @@ class AudioAnalyzerApp(QMainWindow):
         btn_color_out2 = QPushButton("🎨 Color Curva Output 2 (Bus B)...")
         btn_color_out2.clicked.connect(lambda: (self.analyzer_popup.close(), self._pick_curve_color("curve_out2", "Curva Output 2 (Bus B)")))
         colors_layout.addWidget(btn_color_out2)
+
+        btn_color_rta = QPushButton("🎨 Color Curva RTA (Sala)...")
+        btn_color_rta.clicked.connect(lambda: (self.analyzer_popup.close(), self._pick_curve_color("curve_rta", "Curva RTA Sala")))
+        colors_layout.addWidget(btn_color_rta)
+
+        btn_color_eq_a = QPushButton("🎨 Color Curva EQ Out A...")
+        btn_color_eq_a.clicked.connect(lambda: (self.analyzer_popup.close(), self._pick_curve_color("curve_eq_a", "Curva EQ Out A")))
+        colors_layout.addWidget(btn_color_eq_a)
+
+        btn_color_eq_b = QPushButton("🎨 Color Curva EQ Out B...")
+        btn_color_eq_b.clicked.connect(lambda: (self.analyzer_popup.close(), self._pick_curve_color("curve_eq_b", "Curva EQ Out B")))
+        colors_layout.addWidget(btn_color_eq_b)
 
         colors_btn = QPushButton("⚙ Configuración Completa de Colores...")
         colors_btn.clicked.connect(lambda: (self.analyzer_popup.close(), self.open_color_settings()))
@@ -3398,9 +3441,9 @@ class AudioAnalyzerApp(QMainWindow):
             active.append("RTA")
 
         if active:
-            txt = f"📊 Analyzer: {'+'.join(active)} ▾"
+            txt = f"📊 FFT: {'+'.join(active)} ▾" if len(active) <= 2 else f"📊 FFT ({len(active)}) ▾"
         else:
-            txt = "📊 Analyzer: Off ▾"
+            txt = "📊 FFT: Off ▾"
         self.analyzer_menu_btn.setText(txt)
         self.schedule_config_save()
 
@@ -4363,12 +4406,28 @@ class AudioAnalyzerApp(QMainWindow):
         c_in = QColor(t.get("curve_in", "#9E9E9E"))
         self.fft_curve_in.setPen(pg.mkPen(color=c_in, width=1.1))
 
+        c_in2 = QColor(t.get("curve_in2", "#BA68C8"))
+        if hasattr(self, "fft_curve_in2"):
+            self.fft_curve_in2.setPen(pg.mkPen(color=c_in2, width=1.1, style=Qt.PenStyle.DashLine))
+
         c_out1 = QColor(t.get("curve_out1", t.get("curve", "#00E5FF")))
         w_curve = float(t.get("curve_width", 16)) / 10.0
         self.fft_curve_out1.setPen(pg.mkPen(color=c_out1, width=w_curve))
 
         c_out2 = QColor(t.get("curve_out2", "#00E676"))
         self.fft_curve_out2.setPen(pg.mkPen(color=c_out2, width=w_curve))
+
+        c_rta = QColor(t.get("curve_rta", "#FFD740"))
+        if hasattr(self, "rta_curve_item"):
+            self.rta_curve_item.setPen(pg.mkPen(color=c_rta, width=2.0))
+        if hasattr(self, "rta_peak_labels"):
+            for lbl in self.rta_peak_labels:
+                lbl.setColor(c_rta)
+
+        c_eq_a = str(t.get("curve_eq_a", "#FFD54F"))
+        c_eq_b = str(t.get("curve_eq_b", "#00E5FF"))
+        if hasattr(self, "eq_overlay") and hasattr(self.eq_overlay, "set_curve_colors"):
+            self.eq_overlay.set_curve_colors(c_eq_a, c_eq_b)
 
         self._update_curve_brush()
         self.plot_widget.showGrid(x=False, y=False)
@@ -4377,11 +4436,11 @@ class AudioAnalyzerApp(QMainWindow):
 
     def _update_mute_button_style(self):
         if self.is_muted:
-            self.mute_btn.setText("🔇 Muted (Activar)")
+            self.mute_btn.setText("🔇 Mute")
             self.mute_btn.setTintColor("#FF5252")
             self.mute_btn.setActiveTintColor("#FF5252")
         else:
-            self.mute_btn.setText("🔊 Audio ON")
+            self.mute_btn.setText("🔊 ON")
             self.mute_btn.setTintColor("#2ECC71")
             self.mute_btn.setActiveTintColor("#2ECC71")
         self.mute_btn.update()
@@ -4619,7 +4678,12 @@ class AudioAnalyzerApp(QMainWindow):
             print(f"[WARN] Error al abrir Input 2 ({dev_idx}): {e}")
 
     def audio_callback_in2(self, indata, frames, time_info, status):
-        self.in2_ring_buffer.write(indata)
+        # Bloqueador de DC offset para micrófonos (elimina artefactos por debajo de 15 Hz)
+        if indata.size > 0:
+            clean_in = (indata - np.mean(indata, axis=0, keepdims=True)).astype(np.float32)
+            self.in2_ring_buffer.write(clean_in)
+        else:
+            self.in2_ring_buffer.write(indata)
 
     def _on_routing_changed(self):
         self.route_in1_to_a = bool(self.chk_route_in1_a.isChecked())
@@ -4645,6 +4709,8 @@ class AudioAnalyzerApp(QMainWindow):
         self.rta_navg = 0
         self.rta_power_accum = None
         self.rta_peaks = []
+        if hasattr(self, "rta_ring_buffer"):
+            self.rta_ring_buffer.fill(0.0)
         self.rta_measurement_done = False
         self.rta_measuring = True
 
@@ -5182,6 +5248,7 @@ class AudioAnalyzerApp(QMainWindow):
             if listen_blocks:
                 for blk in listen_blocks:
                     mono = (blk[:, 0] + blk[:, 1]) * 0.5 if (blk.ndim > 1 and blk.shape[1] > 1) else (blk[:, 0] if blk.ndim > 1 else blk)
+                    mono = mono - float(np.mean(mono))
                     n = len(mono)
                     if n >= self.fft_size:
                         self.rta_ring_buffer[:] = mono[-self.fft_size:]
@@ -5216,8 +5283,15 @@ class AudioAnalyzerApp(QMainWindow):
             valid_m = freqs >= 20.0
             f_eval = freqs[valid_m]
             y_eval = self.rta_smoothed_db[valid_m]
-            self.rta_curve_item.setData(f_eval, y_eval)
-            self.rta_curve_item.setVisible(True)
+            if len(f_eval) > 0:
+                y_floor = float(self.db_min - 12.0)
+                first_y = float(y_eval[0])
+                f_anchors = np.array([10.0, 15.0, 18.0], dtype=np.float64)
+                y_anchors = np.array([y_floor, y_floor + 0.35 * (first_y - y_floor), y_floor + 0.70 * (first_y - y_floor)], dtype=np.float64)
+                f_plot = np.concatenate([f_anchors, f_eval])
+                y_plot = np.concatenate([y_anchors, y_eval])
+                self.rta_curve_item.setData(f_plot, y_plot)
+                self.rta_curve_item.setVisible(True)
 
             is_x_log = (self.x_scale_combo.currentText() == "Logarítmica")
             for i, lbl in enumerate(self.rta_peak_labels):
@@ -5396,7 +5470,8 @@ if __name__ == "__main__":
     }
     QMenu::item {
         background-color: transparent;
-        padding: 6px 22px 6px 12px;
+        min-height: 22px;
+        padding: 4px 22px 4px 12px;
         border-radius: 4px;
         color: #D8DEE9;
         font-size: 11px;
@@ -5446,6 +5521,11 @@ if __name__ == "__main__":
         border-radius: 6px;
         padding: 4px;
         outline: none;
+    }
+    QComboBox QAbstractItemView::item {
+        min-height: 24px;
+        padding: 4px 10px;
+        border-radius: 4px;
     }
     QScrollBar:vertical {
         background: #181A20;

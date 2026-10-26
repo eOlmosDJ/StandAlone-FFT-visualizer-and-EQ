@@ -27,6 +27,8 @@ from eq_dsp import (
 def style_dark_combobox(combo: QComboBox):
     """Fuerza a PyQt6 a renderizar la lista desplegable internamente con estética oscura de alto contraste."""
     list_view = QListView(combo)
+    list_view.setUniformItemSizes(True)
+    list_view.setSpacing(2)
     list_view.setStyleSheet("""
         QListView {
             background-color: #181A20;
@@ -37,7 +39,8 @@ def style_dark_combobox(combo: QComboBox):
             outline: none;
         }
         QListView::item {
-            padding: 6px 10px;
+            min-height: 24px;
+            padding: 4px 10px;
             border-radius: 4px;
             color: #F0F2F5;
             background-color: transparent;
@@ -1895,17 +1898,19 @@ class ProQ4Overlay(QWidget):
         self.dyn_limit_curve.setZValue(18)
         self.eq_vb.addItem(self.dyn_limit_curve)
 
-        # Curva Maestra EQ Salida A (1-2) en dorado (#FFD54F)
+        # Curva Maestra EQ Salida A (1-2) en dorado (#FFD54F por defecto)
+        self._color_eq_a = "#FFD54F"
+        self._color_eq_b = "#00E5FF"
         self.static_master_curve = pg.PlotDataItem(
-            pen=pg.mkPen(color="#FFD54F", width=2.2),
+            pen=pg.mkPen(color=self._color_eq_a, width=2.2),
             connect='finite',
         )
         self.static_master_curve.setZValue(20)
         self.eq_vb.addItem(self.static_master_curve)
 
-        # Curva Maestra EQ Salida B (3-4) en cian eléctrico (#00E5FF)
+        # Curva Maestra EQ Salida B (3-4) en cian eléctrico (#00E5FF por defecto)
         self.static_bus_b_curve = pg.PlotDataItem(
-            pen=pg.mkPen(color="#00E5FF", width=2.0, style=Qt.PenStyle.DashLine),
+            pen=pg.mkPen(color=self._color_eq_b, width=2.0, style=Qt.PenStyle.DashLine),
             connect='finite',
         )
         self.static_bus_b_curve.setZValue(21)
@@ -2323,6 +2328,15 @@ class ProQ4Overlay(QWidget):
         self.eq_engine.sr = float(sr)
         self._rebuild_eval_freqs()
         self.update_y_range(self._current_y_floor, self._current_y_ceil)
+
+    def set_curve_colors(self, color_a: str = "#FFD54F", color_b: str = "#00E5FF"):
+        """Permite personalizar interactivamente los colores de las curvas maestras de EQ (Out A y Out B)."""
+        self._color_eq_a = str(color_a)
+        self._color_eq_b = str(color_b)
+        if hasattr(self, "static_master_curve"):
+            self.static_master_curve.setPen(pg.mkPen(color=self._color_eq_a, width=2.2))
+        if hasattr(self, "static_bus_b_curve"):
+            self.static_bus_b_curve.setPen(pg.mkPen(color=self._color_eq_b, width=2.0, style=Qt.PenStyle.DashLine))
 
     def freq_to_x(self, freq: float) -> float:
         f = float(np.clip(freq, 10.0, self.nyquist))
@@ -3111,6 +3125,11 @@ class FloatingBandHUD(QWidget):
                 color: #FFFFFF;
                 border-color: #5E6575;
             }
+            QPushButton:checked {
+                background-color: rgba(0, 229, 255, 0.25);
+                color: #00E5FF;
+                border: 1px solid #00E5FF;
+            }
         """)
 
         self._build_ui()
@@ -3196,6 +3215,11 @@ class FloatingBandHUD(QWidget):
         self._auto_expand = bool(enabled)
         self.auto_expand_btn.setChecked(self._auto_expand)
         self.compact_auto_btn.setChecked(self._auto_expand)
+        self.auto_expand_btn.setText("📌 Auto ON" if self._auto_expand else "📌 Auto")
+        active_css = "background-color: rgba(0, 229, 255, 0.25); color: #00E5FF; border: 1px solid #00E5FF; border-radius: 5px; font-size: 10px; font-weight: bold;"
+        idle_css = "background-color: rgba(32, 35, 42, 210); color: #D8DEE9; border: 1px solid #3C404C; border-radius: 5px; font-size: 10px; font-weight: bold;"
+        self.auto_expand_btn.setStyleSheet(active_css if self._auto_expand else idle_css)
+        self.compact_auto_btn.setStyleSheet(active_css if self._auto_expand else idle_css)
 
     def enterEvent(self, event):
         super().enterEvent(event)
@@ -3319,8 +3343,8 @@ class FloatingBandHUD(QWidget):
 
         self.auto_expand_btn = QPushButton("📌 Auto", self.expanded_container)
         self.auto_expand_btn.setCheckable(True)
-        self.auto_expand_btn.setFixedSize(58, 18)
-        self.auto_expand_btn.move(584, 38)
+        self.auto_expand_btn.setFixedSize(62, 18)
+        self.auto_expand_btn.move(580, 38)
         self.auto_expand_btn.setToolTip("Auto-expandir al pasar el cursor (vuelve a minimizar tras 0.4s)")
         self.auto_expand_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.auto_expand_btn.clicked.connect(self.toggle_auto_expand)
@@ -4787,7 +4811,8 @@ class EditInputSelector(QWidget):
         layout.setContentsMargins(2, 0, 2, 0)
         layout.setSpacing(4)
 
-        lbl = QLabel("🎛️ Edit EQ:", self)
+        lbl = QLabel("🎛️", self)
+        lbl.setToolTip("Banco de EQ activo para editar (Entrada 1 o 2)")
         lbl.setStyleSheet("color: #C5CDD9; font-size: 11px; font-weight: bold; background: transparent;")
         layout.addWidget(lbl)
 
