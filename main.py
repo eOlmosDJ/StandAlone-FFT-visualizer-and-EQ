@@ -743,18 +743,28 @@ class WaveformScopeWidget(QWidget):
         self.canvas = self.mini_scope  # compat alias
         row.addWidget(self.mini_scope, 1)
 
-        self.dur_btn = LiquidGlassButton("10s", self, pill_radius=10.0)
+        self.dur_btn = LiquidGlassButton("10s", self, pill_radius=6.0)
         self.dur_btn.setFixedSize(36, 22)
         self.dur_btn.setToolTip("Alternar tiempo del osciloscopio: 1s -> 5s -> 10s")
         self.dur_btn.clicked.connect(self._cycle_duration)
         self.btn_scope_time = self.dur_btn  # compat alias
         row.addWidget(self.dur_btn)
 
-        self.expand_btn = LiquidGlassButton("▾", self, active_tint_color="#00E5FF", pill_radius=10.0)
+        self.expand_btn = LiquidGlassButton("▾", self, active_tint_color="#00E5FF", pill_radius=6.0)
+        self.expand_btn.setCheckable(True)
         self.expand_btn.setFixedSize(24, 22)
         self.expand_btn.setToolTip("Desplegar / Plegar Osciloscopio detallado")
         self.expand_btn.clicked.connect(self.toggleExpandedRequested.emit)
         row.addWidget(self.expand_btn)
+        self._accent_color = QColor("#00E5FF")
+        self._expanded = False
+
+    def setAccentColor(self, hex_color: str):
+        if hex_color:
+            self._accent_color = QColor(hex_color)
+            self.dur_btn.setActiveTintColor(hex_color)
+            self.expand_btn.setActiveTintColor(hex_color)
+            self.update()
 
     def update_gr(self, gr_db: float):
         """Actualiza el nivel de reducción de ganancia y modula el glow del LED analógico."""
@@ -785,8 +795,10 @@ class WaveformScopeWidget(QWidget):
             self.env_buffer.duration_sec = sec
 
     def set_expanded_indicator(self, expanded: bool):
+        self._expanded = bool(expanded)
         self.expand_btn.setText("▴" if expanded else "▾")
         self.expand_btn.setChecked(expanded)
+        self.update()
 
     def refresh_scope(self):
         self.mini_scope.refresh_scope()
@@ -796,30 +808,34 @@ class WaveformScopeWidget(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        rect = QRectF(0.75, 0.75, self.width() - 1.5, self.height() - 1.5)
+        rect = QRectF(1.0, 1.0, self.width() - 2.0, self.height() - 2.0)
+        r = 7.0
 
-        fill_grad = QLinearGradient(0.0, rect.top(), 0.0, rect.bottom())
-        fill_grad.setColorAt(0.0, QColor(58, 62, 72, 175))
-        fill_grad.setColorAt(0.45, QColor(34, 36, 42, 165))
-        fill_grad.setColorAt(1.0, QColor(24, 26, 30, 185))
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QBrush(fill_grad))
-        painter.drawRoundedRect(rect, 14.0, 14.0)
+        painter.setBrush(QColor(16, 18, 24, 132))
+        painter.drawRoundedRect(rect, r, r)
 
-        # "LED" de Alerta: Resplandor (Glow) en la cápsula Liquid Glass
+        if getattr(self, "_expanded", False):
+            tint = QColor(self._accent_color)
+            tint.setAlpha(28)
+            painter.setBrush(tint)
+            painter.drawRoundedRect(rect, r, r)
+
+        # "LED" de Alerta: Resplandor (Glow) del Limitador Master
         if self._limit_glow_alpha > 0.0:
-            glow_pen = QPen(QColor(213, 0, 249, int(150 * self._limit_glow_alpha)), 1.8)
+            glow_pen = QPen(QColor(213, 0, 249, int(175 * self._limit_glow_alpha)), 1.8)
             painter.setPen(glow_pen)
             painter.setBrush(QBrush(QColor(213, 0, 249, int(35 * self._limit_glow_alpha))))
-            painter.drawRoundedRect(rect, 14.0, 14.0)
-
-        spec_grad = QLinearGradient(rect.left(), rect.top(), rect.right(), rect.bottom())
-        spec_grad.setColorAt(0.0, QColor(255, 255, 255, 115))
-        spec_grad.setColorAt(0.5, QColor(255, 255, 255, 32))
-        spec_grad.setColorAt(1.0, QColor(255, 255, 255, 16))
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.setPen(QPen(QBrush(spec_grad), 1.2))
-        painter.drawRoundedRect(rect, 14.0, 14.0)
+            painter.drawRoundedRect(rect, r, r)
+        else:
+            if getattr(self, "_expanded", False):
+                b_col = QColor(self._accent_color)
+                b_col.setAlpha(185)
+                painter.setPen(QPen(b_col, 1.2))
+            else:
+                painter.setPen(QPen(QColor(62, 68, 82, 155), 1.05))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRoundedRect(rect, r, r)
 
 
 class ScopeSignalSettingsPopup(QWidget):
@@ -1049,7 +1065,7 @@ class WaveformOverlayWidget(QWidget):
        o transparencias costosas sobre el lienzo OpenGL.
     2. Scroll Blitting multi-canal (< 1% CPU): Desplaza `self.wave_canvas` hacia la izquierda `dx`
        píxeles y dibuja únicamente la franja nueva de ancho `dx` para todas las señales activadas.
-    3. Selector interactivo `⚙ Señales y Color ▾` y control de opacidad en la cabecera.
+    3. Selector interactivo `Señales y Color ▾` y control de opacidad en la cabecera.
     """
 
     collapseRequested = pyqtSignal()
@@ -1076,86 +1092,21 @@ class WaveformOverlayWidget(QWidget):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setToolTip("Clic para plegar el osciloscopio de vuelta a la barra superior")
 
-        self.settings_btn = QPushButton("⚙ Señales y Color ▾", self)
-        self.settings_btn.setFixedSize(126, 20)
-        self.settings_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.settings_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #20242C;
-                color: #D8DEE9;
-                border: 1px solid #363C48;
-                border-radius: 9px;
-                padding: 1px 6px;
-                font-size: 10px;
-                font-weight: 600;
-            }
-            QPushButton:hover {
-                background-color: #2B303C;
-                border: 1px solid #4E5666;
-                color: #FFFFFF;
-            }
-            QPushButton:pressed {
-                background-color: #1A1D24;
-            }
-        """)
+        self.settings_btn = LiquidGlassButton("Señales y Color ▾", self, active_tint_color="#00E5FF", pill_radius=6.0)
+        self.settings_btn.setFixedSize(118, 20)
         self.settings_btn.clicked.connect(self._toggle_settings_popup)
 
-        self.limiter_btn = QPushButton("🛡 Limitador ▾", self)
-        self.limiter_btn.setFixedSize(116, 20)
-        self.limiter_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.limiter_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #20242C;
-                color: #EA80FC;
-                border: 1px solid #7B1FA2;
-                border-radius: 9px;
-                padding: 1px 6px;
-                font-size: 10px;
-                font-weight: 600;
-            }
-            QPushButton:hover {
-                background-color: #2E1B38;
-                border: 1px solid #D500F9;
-                color: #FFFFFF;
-            }
-            QPushButton:pressed {
-                background-color: #1A1D24;
-            }
-        """)
+        self.limiter_btn = LiquidGlassButton("Limitador ▾", self, active_tint_color="#D500F9", pill_radius=6.0)
+        self.limiter_btn.setFixedSize(102, 20)
         self.limiter_btn.clicked.connect(self._toggle_limiter_popup)
 
         self.gr_meter_widget = LimiterGRMiniWidget(self)
         self.gr_meter_widget.clicked.connect(self._toggle_limiter_popup)
 
-        self.btn_scope_autogain = QPushButton("⚖ Auto-Gain", self)
-        self.btn_scope_autogain.setFixedSize(96, 20)
+        self.btn_scope_autogain = LiquidGlassButton("Auto-Gain", self, active_tint_color="#00E5FF", pill_radius=6.0)
+        self.btn_scope_autogain.setFixedSize(86, 20)
         self.btn_scope_autogain.setCheckable(True)
-        self.btn_scope_autogain.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_scope_autogain.setToolTip("Auto-Gain (Compensación de Loudness)\nClic para Activar / Desactivar")
-        self.btn_scope_autogain.setStyleSheet("""
-            QPushButton {
-                background-color: #20242C;
-                color: #8C96A5;
-                border: 1px solid #363C48;
-                border-radius: 9px;
-                padding: 1px 6px;
-                font-size: 10px;
-                font-weight: 600;
-            }
-            QPushButton:hover {
-                background-color: #2B303C;
-                border: 1px solid #00E5FF;
-                color: #FFFFFF;
-            }
-            QPushButton:checked {
-                background-color: #142834;
-                border: 1px solid #00E5FF;
-                color: #00E5FF;
-            }
-            QPushButton:pressed {
-                background-color: #1A1D24;
-            }
-        """)
         self.btn_scope_autogain.toggled.connect(self._on_autogain_toggled)
 
         self.lbl_scope_ag = QLabel("AG: OFF", self)
@@ -1170,29 +1121,9 @@ class WaveformOverlayWidget(QWidget):
             }
         """)
 
-        self.dur_btn = QPushButton(f"{self.env_buffer.duration_sec}s", self)
+        self.dur_btn = LiquidGlassButton(f"{self.env_buffer.duration_sec}s", self, active_tint_color="#00E5FF", pill_radius=6.0)
         self.dur_btn.setFixedSize(38, 20)
-        self.dur_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.dur_btn.setToolTip("Alternar ventana de tiempo: 1s -> 5s -> 10s")
-        self.dur_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #20242C;
-                color: #00E5FF;
-                border: 1px solid #363C48;
-                border-radius: 9px;
-                padding: 1px 6px;
-                font-size: 10px;
-                font-weight: 600;
-            }
-            QPushButton:hover {
-                background-color: #2B303C;
-                border: 1px solid #00E5FF;
-                color: #FFFFFF;
-            }
-            QPushButton:pressed {
-                background-color: #1A1D24;
-            }
-        """)
         self.dur_btn.clicked.connect(self._cycle_duration)
 
         self.hide()
@@ -1251,6 +1182,9 @@ class WaveformOverlayWidget(QWidget):
     def update_gr(self, gr_db: float):
         if hasattr(self, "gr_meter_widget"):
             self.gr_meter_widget.set_gr(gr_db)
+        if hasattr(self, "limiter_btn") and self.app_ref and hasattr(self.app_ref, "eq_engine"):
+            lim_on = bool(self.app_ref.eq_engine.limiter_a.enabled)
+            self.limiter_btn.setForceActive(lim_on)
         if self.limiter_popup is not None and self.limiter_popup.isVisible():
             self.limiter_popup.set_live_gr(gr_db)
 
@@ -2569,7 +2503,7 @@ class AudioAnalyzerApp(QMainWindow):
         brand_label.setContentsMargins(0, 0, 2, 0)
         top_layout.addWidget(brand_label)
 
-        self.mute_btn = LiquidGlassButton("🔇 Mute", self.top_bar, tint_color="#FF5252", active_tint_color="#FF5252")
+        self.mute_btn = LiquidGlassButton("Mute", self.top_bar, active_tint_color="#FF5252")
         self.mute_btn.setCheckable(True)
         self.mute_btn.setChecked(True)
         self.mute_btn.clicked.connect(self.toggle_mute)
@@ -2577,14 +2511,14 @@ class AudioAnalyzerApp(QMainWindow):
         top_layout.addWidget(self.mute_btn)
 
         # Panel emergente de Dispositivos de Audio y Sample Rate
-        self.audio_menu_btn = LiquidGlassButton("🎧 Audio ▾", self.top_bar)
+        self.audio_menu_btn = LiquidGlassButton("Audio I/O ▾", self.top_bar)
         self.audio_menu_btn.setToolTip("Seleccionar Dispositivo de Entrada, Salida y Sample Rate")
         self.audio_menu_btn.clicked.connect(self._show_audio_popup)
         self._build_audio_io_popup()
         top_layout.addWidget(self.audio_menu_btn)
 
         # Panel emergente de Analizador FFT (incluye FFT Samples y Color de Fondo)
-        self.analyzer_menu_btn = LiquidGlassButton("📊 FFT: In+Out1 ▾", self.top_bar)
+        self.analyzer_menu_btn = LiquidGlassButton("FFT: In+Out1 ▾", self.top_bar)
         self.analyzer_menu_btn.setToolTip("Configurar Analizador FFT, Curvas, Escalas, Rango dB y Colores")
         self.analyzer_menu_btn.clicked.connect(self._show_analyzer_popup)
         self._build_analyzer_popup()
@@ -2595,7 +2529,7 @@ class AudioAnalyzerApp(QMainWindow):
         self.edit_input_selector.inputChanged.connect(self.set_active_edit_input)
         top_layout.addWidget(self.edit_input_selector)
 
-        # --- MINI-OSCILOSCOPIO EN CÁPSULA LIQUID GLASS (Expandible dinámicamente) ---
+        # --- MINI-OSCILOSCOPIO EN CÁPSULA HUD (Expandible dinámicamente) ---
         self.scope_widget = WaveformScopeWidget(self.scope_buffer, self.top_bar)
         self.scope_widget.toggleExpandedRequested.connect(self.toggle_expanded_scope)
         self.scope_widget.durationChanged.connect(self._on_scope_duration_changed)
@@ -2606,7 +2540,7 @@ class AudioAnalyzerApp(QMainWindow):
         self.autogain_mini_bar.toggled.connect(self._on_autogain_toggled)
         top_layout.addWidget(self.autogain_mini_bar, 0)
 
-        self.crossover_btn = LiquidGlassButton("🔀 X-Over ▾", self.top_bar, active_tint_color="#FFB300")
+        self.crossover_btn = LiquidGlassButton("X-Over ▾", self.top_bar, active_tint_color="#FFB300")
         self.crossover_btn.setToolTip("Crossover Digital de Salidas (Out A / Out B)")
         self.crossover_btn.clicked.connect(self._show_crossover_menu)
         top_layout.addWidget(self.crossover_btn)
@@ -2633,8 +2567,8 @@ class AudioAnalyzerApp(QMainWindow):
         self.bypass_btn.clicked.connect(self._on_global_bypass_toggled)
         top_layout.addWidget(self.bypass_btn)
 
-        self.presets_btn = LiquidGlassButton("💾 Presets ▾", self.top_bar)
-        self.presets_btn.setMinimumWidth(78)
+        self.presets_btn = LiquidGlassButton("Presets ▾", self.top_bar, active_tint_color="#FFD54F")
+        self.presets_btn.setMinimumWidth(74)
         self.presets_btn.setToolTip("Gestión de Presets: Guardar, Cargar, Resetear y Auto-inicio")
         self.presets_btn.clicked.connect(self._show_presets_menu)
         self.reset_eq_btn = self.presets_btn
@@ -2647,7 +2581,7 @@ class AudioAnalyzerApp(QMainWindow):
         top_layout.addWidget(self.fullscreen_btn)
 
         # --- BADGE INTERACTIVO DE RANGO EQ (+12 dB / +30 dB) EN LA ESCALA DERECHA ---
-        self.eq_range_badge = LiquidGlassButton("+12 dB", self.graph_container, tint_color="#E0B84C", active_tint_color="#E0B84C", pill_radius=9.0)
+        self.eq_range_badge = LiquidGlassButton("+12 dB", self.graph_container, active_tint_color="#FFD54F", pill_radius=6.0)
         self.eq_range_badge.setFixedSize(48, 20)
         self.eq_range_badge.setCheckable(True)
         self.eq_range_badge.setChecked(True)
@@ -2759,11 +2693,11 @@ class AudioAnalyzerApp(QMainWindow):
             act.setChecked(self.theme.get("background", "").lower() == hex_val.lower())
             act.triggered.connect(lambda _=False, hv=hex_val: self._set_background_color(hv))
 
-        act_custom = menu.addAction("🎨 Personalizado...")
+        act_custom = menu.addAction("Personalizado...")
         act_custom.triggered.connect(self._pick_custom_background_color)
 
         menu.addSeparator()
-        act_dlg = menu.addAction("⚙ Configuración Completa de Colores...")
+        act_dlg = menu.addAction("Configuración Completa de Colores...")
         act_dlg.triggered.connect(self.open_color_settings)
 
         pos = self.theme_menu_btn.mapToGlobal(QPoint(0, self.theme_menu_btn.height() + 4))
@@ -2967,23 +2901,28 @@ class AudioAnalyzerApp(QMainWindow):
         self.delay_out1_spin.valueChanged.connect(self._on_user_delay_a_changed)
         delay_a_layout.addWidget(self.delay_out1_spin)
 
-        self.auto_sync_btn = QPushButton("⚡ Auto Sync")
+        self.auto_sync_btn = QPushButton("Auto Sync")
         self.auto_sync_btn.setToolTip("Calcula y sincroniza automáticamente la latencia acústica entre Salida 1 y Salida 2")
         self.auto_sync_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.auto_sync_btn.setStyleSheet("""
             QPushButton {
-                background-color: rgba(0, 229, 255, 0.12);
-                color: #00E5FF;
-                border: 1px solid #00E5FF;
+                background-color: rgba(16, 18, 24, 145);
+                color: #C5CDD9;
+                border: 1px solid rgba(62, 68, 82, 165);
                 border-radius: 5px;
                 padding: 3px 10px;
                 font-size: 10px;
                 font-weight: bold;
             }
             QPushButton:hover {
-                background-color: rgba(0, 229, 255, 0.28);
+                background-color: rgba(24, 28, 36, 180);
                 color: #FFFFFF;
-                border-color: #33EBFF;
+                border-color: #00E5FF;
+            }
+            QPushButton:pressed {
+                background-color: rgba(0, 229, 255, 55);
+                color: #00E5FF;
+                border-color: #00E5FF;
             }
         """)
         self.auto_sync_btn.clicked.connect(self.auto_sync_delays)
@@ -3020,7 +2959,7 @@ class AudioAnalyzerApp(QMainWindow):
         sep3.setStyleSheet("background-color: rgba(255, 255, 255, 0.12); min-height: 1px; max-height: 1px;")
         grid.addWidget(sep3, 13, 0, 1, 2)
 
-        lbl_rta_title = QLabel("📏 Medición Acústica RTA (10s)")
+        lbl_rta_title = QLabel("Medición Acústica RTA (10s)")
         lbl_rta_title.setStyleSheet("color: #FFD740; font-size: 12px; font-weight: bold; padding-top: 2px;")
         grid.addWidget(lbl_rta_title, 14, 0, 1, 2)
 
@@ -3062,42 +3001,53 @@ class AudioAnalyzerApp(QMainWindow):
         rta_btn_row = QHBoxLayout()
         rta_btn_row.setSpacing(8)
 
-        self.rta_start_btn = QPushButton("▶ Medir Sala (10s Ruido Blanco)")
+        self.rta_start_btn = QPushButton("Medir Sala (10s Ruido Blanco)")
         self.rta_start_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.rta_start_btn.setStyleSheet("""
             QPushButton {
-                background-color: rgba(255, 215, 64, 0.15);
+                background-color: rgba(16, 18, 24, 145);
                 color: #FFD740;
-                border: 1px solid #FFD740;
+                border: 1px solid rgba(255, 215, 64, 165);
                 border-radius: 5px;
                 padding: 6px 14px;
                 font-size: 11px;
                 font-weight: bold;
             }
             QPushButton:hover {
-                background-color: rgba(255, 215, 64, 0.32);
+                background-color: rgba(255, 215, 64, 42);
                 color: #FFFFFF;
                 border-color: #FFE082;
+            }
+            QPushButton:pressed {
+                background-color: rgba(255, 215, 64, 68);
+                color: #FFE082;
+                border-color: #FFD740;
             }
         """)
         self.rta_start_btn.clicked.connect(self.start_rta_measurement)
         rta_btn_row.addWidget(self.rta_start_btn)
 
-        self.rta_clear_btn = QPushButton("🗑️ Borrar Curva RTA")
+        self.rta_clear_btn = QPushButton("Borrar Curva RTA")
         self.rta_clear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.rta_clear_btn.setStyleSheet("""
             QPushButton {
-                background-color: rgba(255, 82, 82, 0.12);
+                background-color: rgba(16, 18, 24, 145);
                 color: #FF5252;
-                border: 1px solid #FF5252;
+                border: 1px solid rgba(255, 82, 82, 165);
                 border-radius: 5px;
                 padding: 6px 12px;
                 font-size: 11px;
                 font-weight: bold;
             }
             QPushButton:hover {
-                background-color: rgba(255, 82, 82, 0.28);
+                background-color: rgba(255, 82, 82, 42);
                 color: #FFFFFF;
+                border-color: #FF5252;
+            }
+            QPushButton:pressed {
+                background-color: rgba(255, 82, 82, 68);
+                color: #FF8A80;
+                border-color: #FF5252;
             }
         """)
         self.rta_clear_btn.clicked.connect(self.clear_rta_measurement)
@@ -3316,35 +3266,35 @@ class AudioAnalyzerApp(QMainWindow):
         colors_layout = QVBoxLayout()
         colors_layout.setSpacing(4)
 
-        btn_color_in = QPushButton("🎨 Color Curva Input 1 (Pre)...")
+        btn_color_in = QPushButton("Color Curva Input 1 (Pre)...")
         btn_color_in.clicked.connect(lambda: (self.analyzer_popup.close(), self._pick_curve_color("curve_in", "Curva Input 1 (Pre)")))
         colors_layout.addWidget(btn_color_in)
 
-        btn_color_in2 = QPushButton("🎨 Color Curva Mic / Input 2...")
+        btn_color_in2 = QPushButton("Color Curva Mic / Input 2...")
         btn_color_in2.clicked.connect(lambda: (self.analyzer_popup.close(), self._pick_curve_color("curve_in2", "Curva Mic / Input 2")))
         colors_layout.addWidget(btn_color_in2)
 
-        btn_color_out1 = QPushButton("🎨 Color Curva Output 1 (Bus A)...")
+        btn_color_out1 = QPushButton("Color Curva Output 1 (Bus A)...")
         btn_color_out1.clicked.connect(lambda: (self.analyzer_popup.close(), self._pick_curve_color("curve_out1", "Curva Output 1 (Bus A)")))
         colors_layout.addWidget(btn_color_out1)
 
-        btn_color_out2 = QPushButton("🎨 Color Curva Output 2 (Bus B)...")
+        btn_color_out2 = QPushButton("Color Curva Output 2 (Bus B)...")
         btn_color_out2.clicked.connect(lambda: (self.analyzer_popup.close(), self._pick_curve_color("curve_out2", "Curva Output 2 (Bus B)")))
         colors_layout.addWidget(btn_color_out2)
 
-        btn_color_rta = QPushButton("🎨 Color Curva RTA (Sala)...")
+        btn_color_rta = QPushButton("Color Curva RTA (Sala)...")
         btn_color_rta.clicked.connect(lambda: (self.analyzer_popup.close(), self._pick_curve_color("curve_rta", "Curva RTA Sala")))
         colors_layout.addWidget(btn_color_rta)
 
-        btn_color_eq_a = QPushButton("🎨 Color Curva EQ Out A...")
+        btn_color_eq_a = QPushButton("Color Curva EQ Out A...")
         btn_color_eq_a.clicked.connect(lambda: (self.analyzer_popup.close(), self._pick_curve_color("curve_eq_a", "Curva EQ Out A")))
         colors_layout.addWidget(btn_color_eq_a)
 
-        btn_color_eq_b = QPushButton("🎨 Color Curva EQ Out B...")
+        btn_color_eq_b = QPushButton("Color Curva EQ Out B...")
         btn_color_eq_b.clicked.connect(lambda: (self.analyzer_popup.close(), self._pick_curve_color("curve_eq_b", "Curva EQ Out B")))
         colors_layout.addWidget(btn_color_eq_b)
 
-        colors_btn = QPushButton("⚙ Configuración Completa de Colores...")
+        colors_btn = QPushButton("Configuración Completa de Colores...")
         colors_btn.clicked.connect(lambda: (self.analyzer_popup.close(), self.open_color_settings()))
         colors_layout.addWidget(colors_btn)
 
@@ -3441,10 +3391,11 @@ class AudioAnalyzerApp(QMainWindow):
             active.append("RTA")
 
         if active:
-            txt = f"📊 FFT: {'+'.join(active)} ▾" if len(active) <= 2 else f"📊 FFT ({len(active)}) ▾"
+            txt = f"FFT: {'+'.join(active)} ▾" if len(active) <= 2 else f"FFT ({len(active)}) ▾"
         else:
-            txt = "📊 FFT: Off ▾"
+            txt = "FFT: Off ▾"
         self.analyzer_menu_btn.setText(txt)
+        self.analyzer_menu_btn.setForceActive(bool(active))
         self.schedule_config_save()
 
     def _on_global_bypass_toggled(self, checked: bool):
@@ -3626,7 +3577,8 @@ class AudioAnalyzerApp(QMainWindow):
         self.xover_line.setVisible(is_enabled)
 
         if hasattr(self, "crossover_btn"):
-            self.crossover_btn.setTintColor("#FFB300" if is_enabled else None)
+            self.crossover_btn.setActiveTintColor("#FFB300")
+            self.crossover_btn.setForceActive(is_enabled)
 
         if not is_enabled:
             if hasattr(self, "xover_curve_a"):
@@ -4018,16 +3970,16 @@ class AudioAnalyzerApp(QMainWindow):
         """)
 
         # 1. Resetear EQ
-        act_reset = menu.addAction("🔄 Resetear EQ Actual (Plano)")
+        act_reset = menu.addAction("Resetear EQ Actual (Plano)")
         act_reset.triggered.connect(lambda: self.eq_panel._on_reset_eq())
 
-        act_reset_all = menu.addAction("🔄 Resetear Todo (EQ + Crossover)")
+        act_reset_all = menu.addAction("Resetear Todo (EQ + Crossover)")
         act_reset_all.triggered.connect(self._reset_all_eq_and_crossover)
 
         menu.addSeparator()
 
         # 2. Guardar Preset
-        act_save = menu.addAction("💾 Guardar Preset Como...")
+        act_save = menu.addAction("Guardar Preset Como...")
         act_save.triggered.connect(self._on_save_preset_dialog)
 
         # 3. Submenús dinámicos
@@ -4039,16 +3991,16 @@ class AudioAnalyzerApp(QMainWindow):
         def _make_deleter(p):
             return lambda: self._delete_preset_file(p)
 
-        sub_load_all = menu.addMenu("📂 Cargar Completo (EQ + Crossover)")
+        sub_load_all = menu.addMenu("Cargar Completo (EQ + Crossover)")
         sub_load_all.setStyle(QStyleFactory.create("Fusion"))
 
-        sub_load_eq = menu.addMenu("🎚️ Cargar Solo EQ")
+        sub_load_eq = menu.addMenu("Cargar Solo EQ")
         sub_load_eq.setStyle(QStyleFactory.create("Fusion"))
 
-        sub_load_xover = menu.addMenu("🔀 Cargar Solo Crossover")
+        sub_load_xover = menu.addMenu("Cargar Solo Crossover")
         sub_load_xover.setStyle(QStyleFactory.create("Fusion"))
 
-        sub_del = menu.addMenu("🗑️ Eliminar Preset")
+        sub_del = menu.addMenu("Eliminar Preset")
         sub_del.setStyle(QStyleFactory.create("Fusion"))
 
         if not preset_files:
@@ -4065,11 +4017,11 @@ class AudioAnalyzerApp(QMainWindow):
         menu.addSeparator()
 
         # 4. Predeterminado al iniciar
-        act_default = menu.addAction("⭐ Fijar Actual como Predeterminado al Iniciar")
+        act_default = menu.addAction("Fijar Actual como Predeterminado al Iniciar")
         act_default.triggered.connect(self._set_current_as_default_startup)
 
         # 5. Restaurar fábrica
-        act_factory = menu.addAction("🧹 Restaurar Inicio de Fábrica (Plano)")
+        act_factory = menu.addAction("Restaurar Inicio de Fábrica (Plano)")
         act_factory.triggered.connect(self._restore_factory_startup)
 
         btn_pos = self.presets_btn.mapToGlobal(QPoint(0, self.presets_btn.height() + 2))
@@ -4101,10 +4053,10 @@ class AudioAnalyzerApp(QMainWindow):
             QMenu::item:selected { background-color: #2E3440; color: #FFF; }
         """)
 
-        act_add = menu.addAction("➕ Añadir Banda EQ (Doble clic en gráfico)")
+        act_add = menu.addAction("+ Añadir Banda EQ (Doble clic en gráfico)")
         act_add.triggered.connect(self.eq_panel._on_add_band)
 
-        act_bypass = menu.addAction("🔇 Bypass Global EQ")
+        act_bypass = menu.addAction("Bypass Global EQ")
         act_bypass.setCheckable(True)
         act_bypass.setChecked(self.eq_engine.bypass)
         act_bypass.triggered.connect(lambda c: (
@@ -4114,31 +4066,31 @@ class AudioAnalyzerApp(QMainWindow):
 
         menu.addSeparator()
 
-        act_scope = menu.addAction("📈 Desplegar Osciloscopio sobre FFT")
+        act_scope = menu.addAction("Desplegar Osciloscopio sobre FFT")
         act_scope.setCheckable(True)
         act_scope.setChecked(self.scope_overlay.isVisible())
         act_scope.triggered.connect(self.toggle_expanded_scope)
 
-        act_fs = menu.addAction("⛶ Pantalla Completa (F11)")
+        act_fs = menu.addAction("Pantalla Completa (F11)")
         act_fs.setCheckable(True)
         act_fs.setChecked(self.isFullScreen())
         act_fs.triggered.connect(self.toggle_fullscreen)
 
         menu.addSeparator()
 
-        act_mute = menu.addAction("🔇 Salida Física Muteada")
+        act_mute = menu.addAction("Salida Física Muteada")
         act_mute.setCheckable(True)
         act_mute.setChecked(self.is_muted)
         act_mute.triggered.connect(lambda: self.toggle_mute(not self.is_muted))
 
-        bg_menu = menu.addMenu("🎨 Color de Fondo")
+        bg_menu = menu.addMenu("Color de Fondo")
         for label, hex_val in BACKGROUND_COLOR_PRESETS:
             act_bg = bg_menu.addAction(_make_swatch_icon(hex_val, 12), label)
             act_bg.triggered.connect(lambda _=False, hv=hex_val: self._set_background_color(hv))
         act_bg_custom = bg_menu.addAction("Personalizado...")
         act_bg_custom.triggered.connect(self._pick_custom_background_color)
 
-        act_colors = menu.addAction("⚙ Configurar Colores del Espectro...")
+        act_colors = menu.addAction("Configurar Colores del Espectro...")
         act_colors.triggered.connect(self.open_color_settings)
 
         menu.exec(QCursor.pos())
@@ -4429,20 +4381,39 @@ class AudioAnalyzerApp(QMainWindow):
         if hasattr(self, "eq_overlay") and hasattr(self.eq_overlay, "set_curve_colors"):
             self.eq_overlay.set_curve_colors(c_eq_a, c_eq_b)
 
+        # Sincronizar colores contextuales de los botones con el resto de la interfaz
+        c_out1_hex = c_out1.name()
+        c_in2_hex = c_in2.name()
+        for btn_attr in ("audio_menu_btn", "analyzer_menu_btn", "fullscreen_btn"):
+            btn_w = getattr(self, btn_attr, None)
+            if btn_w is not None and hasattr(btn_w, "setActiveTintColor"):
+                btn_w.setActiveTintColor(c_out1_hex)
+        if hasattr(self, "scope_widget") and hasattr(self.scope_widget, "setAccentColor"):
+            self.scope_widget.setAccentColor(c_out1_hex)
+        if hasattr(self, "autogain_mini_bar") and hasattr(self.autogain_mini_bar, "setAccentColor"):
+            self.autogain_mini_bar.setAccentColor(c_out1_hex)
+        if hasattr(self, "edit_input_selector"):
+            self.edit_input_selector.btn_in1.setActiveTintColor(c_out1_hex)
+            self.edit_input_selector.btn_in2.setActiveTintColor(c_in2_hex)
+        if hasattr(self, "presets_btn"):
+            self.presets_btn.setActiveTintColor(c_eq_a)
+        if hasattr(self, "eq_range_badge"):
+            self.eq_range_badge.setActiveTintColor(c_eq_a)
+        if hasattr(self, "scope_overlay"):
+            for s_attr in ("settings_btn", "btn_scope_autogain", "dur_btn"):
+                sw = getattr(self.scope_overlay, s_attr, None)
+                if sw is not None and hasattr(sw, "setActiveTintColor"):
+                    sw.setActiveTintColor(c_out1_hex)
+
         self._update_curve_brush()
         self.plot_widget.showGrid(x=False, y=False)
         self.full_bleed_grid.update()
         self.edge_masks_and_scales.update()
 
     def _update_mute_button_style(self):
-        if self.is_muted:
-            self.mute_btn.setText("🔇 Mute")
-            self.mute_btn.setTintColor("#FF5252")
-            self.mute_btn.setActiveTintColor("#FF5252")
-        else:
-            self.mute_btn.setText("🔊 ON")
-            self.mute_btn.setTintColor("#2ECC71")
-            self.mute_btn.setActiveTintColor("#2ECC71")
+        self.mute_btn.setText("Mute")
+        self.mute_btn.setActiveTintColor("#FF5252")
+        self.mute_btn.setChecked(bool(self.is_muted))
         self.mute_btn.update()
 
     def toggle_mute(self, checked=None):
@@ -4714,11 +4685,11 @@ class AudioAnalyzerApp(QMainWindow):
         self.rta_measurement_done = False
         self.rta_measuring = True
 
-        self.rta_start_btn.setText("⏹ Midiendo... (restan 10.0s)")
+        self.rta_start_btn.setText("Midiendo... (restan 10.0s)")
         self.rta_start_btn.setStyleSheet("""
             QPushButton {
-                background-color: rgba(255, 171, 64, 0.28);
-                color: #FFB300;
+                background-color: rgba(255, 179, 0, 58);
+                color: #FFE082;
                 border: 1px solid #FFB300;
                 border-radius: 5px;
                 padding: 6px 14px;
@@ -4730,21 +4701,26 @@ class AudioAnalyzerApp(QMainWindow):
     def stop_rta_measurement(self):
         self.rta_measuring = False
         if hasattr(self, "rta_start_btn"):
-            self.rta_start_btn.setText("▶ Medir Sala (10s Ruido Blanco)")
+            self.rta_start_btn.setText("Medir Sala (10s Ruido Blanco)")
             self.rta_start_btn.setStyleSheet("""
                 QPushButton {
-                    background-color: rgba(255, 215, 64, 0.15);
+                    background-color: rgba(16, 18, 24, 145);
                     color: #FFD740;
-                    border: 1px solid #FFD740;
+                    border: 1px solid rgba(255, 215, 64, 165);
                     border-radius: 5px;
                     padding: 6px 14px;
                     font-size: 11px;
                     font-weight: bold;
                 }
                 QPushButton:hover {
-                    background-color: rgba(255, 215, 64, 0.32);
+                    background-color: rgba(255, 215, 64, 42);
                     color: #FFFFFF;
                     border-color: #FFE082;
+                }
+                QPushButton:pressed {
+                    background-color: rgba(255, 215, 64, 68);
+                    color: #FFE082;
+                    border-color: #FFD740;
                 }
             """)
 
@@ -5243,7 +5219,7 @@ class AudioAnalyzerApp(QMainWindow):
         if getattr(self, "rta_measuring", False):
             rem_sec = max(0.0, (self.rta_total_frames - self.rta_elapsed_frames) / float(self.current_sr))
             if hasattr(self, "rta_start_btn"):
-                self.rta_start_btn.setText(f"⏹ Midiendo... (restan {rem_sec:.1f}s)")
+                self.rta_start_btn.setText(f"Midiendo... (restan {rem_sec:.1f}s)")
 
             if listen_blocks:
                 for blk in listen_blocks:
