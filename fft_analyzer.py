@@ -508,20 +508,19 @@ class FFTComputationWorker(QThread):
         self._mutex.unlock()
 
     @staticmethod
-    def _drain_fifo(fifo: list, hop_size: int, max_backlog: int = 4096) -> np.ndarray | None:
+    def _drain_fifo(fifo: list, hop_size: int, max_backlog: int = 0) -> np.ndarray | None:
+        # Se drena TODO el audio pendiente de forma contigua. Descartar muestras del
+        # medio (recorte de backlog fijo) o trocear con un hop menor al flujo real
+        # introduce saltos en el ring buffer que el FFT ve como clicks de banda ancha
+        # (falsos "skirts" hacia agudos con un seno puro). El ring buffer ya retiene
+        # solo las últimas `fft_size` muestras, por lo que nada útil se pierde.
         if not fifo:
             return None
-        flat = np.concatenate(fifo)
+        flat = fifo[0] if len(fifo) == 1 else np.concatenate(fifo)
         fifo.clear()
-        n = len(flat)
-        if n > max_backlog:
+        if max_backlog and len(flat) > max_backlog:
             flat = flat[-max_backlog:]
-            n = len(flat)
-        if n <= hop_size:
-            return flat
-        chunk = flat[:hop_size]
-        fifo.append(flat[hop_size:])
-        return chunk
+        return flat
 
     def get_latest_snapshot(self) -> FFTWorkerSnapshot | None:
         return self._latest_snapshot
