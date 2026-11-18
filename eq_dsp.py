@@ -1,4 +1,6 @@
+import math
 import threading
+from audio_sync import AdaptiveResamplingRingBuffer as _AdaptiveResamplingRingBuffer
 import numpy as np
 from scipy.signal import sosfilt, butter, sosfreqz, find_peaks
 
@@ -71,44 +73,45 @@ def design_biquad_sos(
     del Audio EQ Cookbook (Robert Bristow-Johnson).
     """
     sr = float(max(sr, 8000.0))
-    f0 = float(np.clip(freq, 10.0, 0.495 * sr))
-    q_val = float(np.clip(q, 0.1, 24.0))
-    g_db = float(np.clip(gain_db, -40.0, 40.0))
+    max_f = 0.495 * sr
+    f0 = 10.0 if freq < 10.0 else (max_f if freq > max_f else float(freq))
+    q_val = 0.1 if q < 0.1 else (24.0 if q > 24.0 else float(q))
+    g_db = -40.0 if gain_db < -40.0 else (40.0 if gain_db > 40.0 else float(gain_db))
 
-    w0 = 2.0 * np.pi * f0 / sr
-    cos_w0 = np.cos(w0)
-    sin_w0 = np.sin(w0)
+    w0 = 2.0 * math.pi * f0 / sr
+    cos_w0 = math.cos(w0)
+    sin_w0 = math.sin(w0)
     alpha = sin_w0 / (2.0 * q_val)
-    A = 10.0 ** (g_db / 40.0)
+    A = 10.0 ** (g_db * 0.025)
 
     if filter_type == "Bell":
         b0 = 1.0 + alpha * A
         b1 = -2.0 * cos_w0
         b2 = 1.0 - alpha * A
-        a0 = 1.0 + alpha / A
+        inv_a0 = 1.0 / (1.0 + alpha / A)
         a1 = -2.0 * cos_w0
         a2 = 1.0 - alpha / A
-        return np.array([[b0 / a0, b1 / a0, b2 / a0, 1.0, a1 / a0, a2 / a0]], dtype=np.float64)
+        return np.array([[b0 * inv_a0, b1 * inv_a0, b2 * inv_a0, 1.0, a1 * inv_a0, a2 * inv_a0]], dtype=np.float64)
 
     elif filter_type == "Low Shelf":
-        two_sqrt_A_alpha = 2.0 * np.sqrt(A) * alpha
+        two_sqrt_A_alpha = 2.0 * math.sqrt(A) * alpha
         b0 = A * ((A + 1.0) - (A - 1.0) * cos_w0 + two_sqrt_A_alpha)
         b1 = 2.0 * A * ((A - 1.0) - (A + 1.0) * cos_w0)
         b2 = A * ((A + 1.0) - (A - 1.0) * cos_w0 - two_sqrt_A_alpha)
-        a0 = (A + 1.0) + (A - 1.0) * cos_w0 + two_sqrt_A_alpha
+        inv_a0 = 1.0 / ((A + 1.0) + (A - 1.0) * cos_w0 + two_sqrt_A_alpha)
         a1 = -2.0 * ((A - 1.0) + (A + 1.0) * cos_w0)
         a2 = (A + 1.0) + (A - 1.0) * cos_w0 - two_sqrt_A_alpha
-        return np.array([[b0 / a0, b1 / a0, b2 / a0, 1.0, a1 / a0, a2 / a0]], dtype=np.float64)
+        return np.array([[b0 * inv_a0, b1 * inv_a0, b2 * inv_a0, 1.0, a1 * inv_a0, a2 * inv_a0]], dtype=np.float64)
 
     elif filter_type == "High Shelf":
-        two_sqrt_A_alpha = 2.0 * np.sqrt(A) * alpha
+        two_sqrt_A_alpha = 2.0 * math.sqrt(A) * alpha
         b0 = A * ((A + 1.0) + (A - 1.0) * cos_w0 + two_sqrt_A_alpha)
         b1 = -2.0 * A * ((A - 1.0) + (A + 1.0) * cos_w0)
         b2 = A * ((A + 1.0) + (A - 1.0) * cos_w0 - two_sqrt_A_alpha)
-        a0 = (A + 1.0) - (A - 1.0) * cos_w0 + two_sqrt_A_alpha
+        inv_a0 = 1.0 / ((A + 1.0) - (A - 1.0) * cos_w0 + two_sqrt_A_alpha)
         a1 = 2.0 * ((A - 1.0) - (A + 1.0) * cos_w0)
         a2 = (A + 1.0) - (A - 1.0) * cos_w0 - two_sqrt_A_alpha
-        return np.array([[b0 / a0, b1 / a0, b2 / a0, 1.0, a1 / a0, a2 / a0]], dtype=np.float64)
+        return np.array([[b0 * inv_a0, b1 * inv_a0, b2 * inv_a0, 1.0, a1 * inv_a0, a2 * inv_a0]], dtype=np.float64)
 
     elif filter_type in ("Low Cut", "High Cut"):
         n_sections = max(1, min(4, int(slope) // 12))
@@ -116,9 +119,10 @@ def design_biquad_sos(
         sections = []
         q_user_scale = q_val / 0.70710678
         for k in range(n_sections):
-            theta = np.pi * (2 * k + 1) / (2.0 * order)
-            q_butter = 1.0 / (2.0 * np.cos(theta))
-            q_sec = float(np.clip(q_butter * (q_user_scale if k == n_sections - 1 else 1.0), 0.1, 24.0))
+            theta = math.pi * (2 * k + 1) / (2.0 * order)
+            q_butter = 1.0 / (2.0 * math.cos(theta))
+            q_raw = q_butter * (q_user_scale if k == n_sections - 1 else 1.0)
+            q_sec = 0.1 if q_raw < 0.1 else (24.0 if q_raw > 24.0 else q_raw)
             alpha_k = sin_w0 / (2.0 * q_sec)
             if filter_type == "Low Cut":
                 b0 = (1.0 + cos_w0) * 0.5
@@ -128,29 +132,29 @@ def design_biquad_sos(
                 b0 = (1.0 - cos_w0) * 0.5
                 b1 = 1.0 - cos_w0
                 b2 = (1.0 - cos_w0) * 0.5
-            a0 = 1.0 + alpha_k
+            inv_a0 = 1.0 / (1.0 + alpha_k)
             a1 = -2.0 * cos_w0
             a2 = 1.0 - alpha_k
-            sections.append([b0 / a0, b1 / a0, b2 / a0, 1.0, a1 / a0, a2 / a0])
+            sections.append([b0 * inv_a0, b1 * inv_a0, b2 * inv_a0, 1.0, a1 * inv_a0, a2 * inv_a0])
         return np.array(sections, dtype=np.float64)
 
     elif filter_type == "Notch":
         b0 = 1.0
         b1 = -2.0 * cos_w0
         b2 = 1.0
-        a0 = 1.0 + alpha
+        inv_a0 = 1.0 / (1.0 + alpha)
         a1 = -2.0 * cos_w0
         a2 = 1.0 - alpha
-        return np.array([[b0 / a0, b1 / a0, b2 / a0, 1.0, a1 / a0, a2 / a0]], dtype=np.float64)
+        return np.array([[b0 * inv_a0, b1 * inv_a0, b2 * inv_a0, 1.0, a1 * inv_a0, a2 * inv_a0]], dtype=np.float64)
 
     elif filter_type == "Band Pass":
         b0 = alpha
         b1 = 0.0
         b2 = -alpha
-        a0 = 1.0 + alpha
+        inv_a0 = 1.0 / (1.0 + alpha)
         a1 = -2.0 * cos_w0
         a2 = 1.0 - alpha
-        return np.array([[b0 / a0, b1 / a0, b2 / a0, 1.0, a1 / a0, a2 / a0]], dtype=np.float64)
+        return np.array([[b0 * inv_a0, b1 * inv_a0, b2 * inv_a0, 1.0, a1 * inv_a0, a2 * inv_a0]], dtype=np.float64)
 
     return np.array([[1.0, 0.0, 0.0, 1.0, 0.0, 0.0]], dtype=np.float64)
 
@@ -187,6 +191,86 @@ def design_isolate_bandpass_sos(
     row = [b0 / a0, b1 / a0, b2 / a0, 1.0, a1 / a0, a2 / a0]
     n_sec = max(1, int(cascade_sections))
     return np.array([row for _ in range(n_sec)], dtype=np.float64)
+
+
+def _apply_sos_channel_first_inplace(
+    sos: np.ndarray,
+    buf_2xN: np.ndarray,
+    zi: np.ndarray,
+    channel_mode: str,
+    zi_mid: np.ndarray | None = None,
+    zi_side: np.ndarray | None = None,
+    scratch_2xN: np.ndarray | None = None,
+) -> None:
+    """
+    Aplica filtrado SOS in-place directamente sobre un buffer C-contiguous channel-first
+    `(2, N)` en float64 con cero transposición y cero asignaciones en estado estable.
+    """
+    n_sec = sos.shape[0]
+    frames = buf_2xN.shape[1]
+
+    if _c_sosfilt is None:
+        blk = np.ascontiguousarray(buf_2xN.T, dtype=np.float64)
+        _apply_sos_channel_mode(sos, blk, zi, channel_mode, zi_mid=zi_mid, zi_side=zi_side)
+        buf_2xN[0] = blk[:, 0]
+        buf_2xN[1] = blk[:, 1]
+        return
+
+    if channel_mode == "LR":
+        if zi.ndim == 3 and zi.shape[0] >= 2 and zi.shape[1] == n_sec:
+            _c_sosfilt(sos, buf_2xN, zi[0:2])
+        else:
+            z_tmp = np.zeros((2, n_sec, 2), dtype=np.float64)
+            _c_sosfilt(sos, buf_2xN, z_tmp)
+        return
+
+    if channel_mode == "L":
+        if zi.ndim == 3 and zi.shape[0] >= 1 and zi.shape[1] == n_sec:
+            _c_sosfilt(sos, buf_2xN[0:1], zi[0:1])
+        else:
+            z_tmp = np.zeros((1, n_sec, 2), dtype=np.float64)
+            _c_sosfilt(sos, buf_2xN[0:1], z_tmp)
+        return
+
+    if channel_mode == "R":
+        if zi.ndim == 3 and zi.shape[0] >= 2 and zi.shape[1] == n_sec:
+            _c_sosfilt(sos, buf_2xN[1:2], zi[1:2])
+        else:
+            z_tmp = np.zeros((1, n_sec, 2), dtype=np.float64)
+            _c_sosfilt(sos, buf_2xN[1:2], z_tmp)
+        return
+
+    if scratch_2xN is None or scratch_2xN.shape != (2, frames):
+        scratch_2xN = np.empty((2, frames), dtype=np.float64)
+
+    ch_l = buf_2xN[0]
+    ch_r = buf_2xN[1]
+    mid_1d = scratch_2xN[0]
+    side_1d = scratch_2xN[1]
+    np.add(ch_l, ch_r, out=mid_1d)
+    mid_1d *= 0.5
+    np.subtract(ch_l, ch_r, out=side_1d)
+    side_1d *= 0.5
+
+    if channel_mode == "Mid":
+        if zi_mid is not None and zi_mid.ndim == 3 and zi_mid.shape[0] == 1 and zi_mid.shape[1] == n_sec:
+            z_arr = zi_mid
+        elif zi.ndim == 3 and zi.shape[0] >= 1 and zi.shape[1] == n_sec and zi_mid is None:
+            z_arr = zi[0:1]
+        else:
+            z_arr = np.zeros((1, n_sec, 2), dtype=np.float64)
+        _c_sosfilt(sos, scratch_2xN[0:1], z_arr)
+    else:  # "Side"
+        if zi_side is not None and zi_side.ndim == 3 and zi_side.shape[0] == 1 and zi_side.shape[1] == n_sec:
+            z_arr = zi_side
+        elif zi.ndim == 3 and zi.shape[0] >= 2 and zi.shape[1] == n_sec and zi_side is None:
+            z_arr = zi[1:2]
+        else:
+            z_arr = np.zeros((1, n_sec, 2), dtype=np.float64)
+        _c_sosfilt(sos, scratch_2xN[1:2], z_arr)
+
+    np.add(mid_1d, side_1d, out=ch_l)
+    np.subtract(mid_1d, side_1d, out=ch_r)
 
 
 def _apply_sos_channel_mode(
@@ -713,13 +797,14 @@ class EQBand:
         else:
             self._update_instant_sos()
 
-        self.sc_sos = design_biquad_sos("Band Pass", self.freq, 0.0, self.q, self.sr)
-        if self.sc_zi.shape != (1, 2):
+        new_sc_sos = design_biquad_sos("Band Pass", self.freq, 0.0, self.q, self.sr)
+        if self.sc_zi.shape != (1, 1, 2):
             self.sc_zi = np.zeros((1, 1, 2), dtype=np.float64)
+        self.sc_sos = new_sc_sos
 
-        self.iso_sos = design_isolate_bandpass_sos(self.freq, self.q, self.sr, cascade_sections=2)
-        iso_shape = (self.channels, self.iso_sos.shape[0], 2)
-        iso_mid_shape = (1, self.iso_sos.shape[0], 2)
+        new_iso_sos = design_isolate_bandpass_sos(self.freq, self.q, self.sr, cascade_sections=2)
+        iso_shape = (self.channels, new_iso_sos.shape[0], 2)
+        iso_mid_shape = (1, new_iso_sos.shape[0], 2)
         if self.iso_zi_A.shape != iso_shape:
             self.iso_zi_A = np.zeros(iso_shape, dtype=np.float64)
         if self.iso_zi_B.shape != iso_shape:
@@ -732,8 +817,28 @@ class EQBand:
             self.iso_zi_mid_B = np.zeros(iso_mid_shape, dtype=np.float64)
         if self.iso_zi_side_B.shape != iso_mid_shape:
             self.iso_zi_side_B = np.zeros(iso_mid_shape, dtype=np.float64)
+        self.iso_sos = new_iso_sos
 
         self._cache_valid = False
+
+    def smoothed_sos(self, k: float = 0.3) -> np.ndarray:
+        """Slews the coefficients actually run by the filter toward `sos_inst` (once per block).
+        Linear interpolation of biquad (a1, a2) between two stable filters stays stable
+        (the stability region is convex), and removes the zipper/click noise of hard
+        coefficient jumps while a node is being dragged."""
+        target = self.sos_inst
+        cur = getattr(self, "_sos_run", None)
+        if cur is target:
+            return cur
+        if cur is None or cur.shape != target.shape:
+            self._sos_run = target.copy()
+            return self._sos_run
+        diff = target - cur
+        if float(np.max(np.abs(diff))) < 1e-7:
+            self._sos_run = target
+            return self._sos_run
+        self._sos_run = cur + k * diff
+        return self._sos_run
 
     def _update_instant_sos(self):
         g_inst = self.gain_db + self.current_dyn_offset_db
@@ -761,6 +866,7 @@ class EQBand:
         self.iso_zi_mid_B.fill(0.0)
         self.iso_zi_side_B.fill(0.0)
         self.sc_zi.fill(0.0)
+        self._sos_run = None
         self.env_db = -90.0
         self.current_dyn_offset_db = 0.0
 
@@ -908,6 +1014,9 @@ class MasterLimiter:
             self.last_gr_linear = 1.0
             return block
 
+        if not block.flags.writeable:
+            block = block.copy()
+
         frames = block.shape[0]
         # Pico absoluto por muestra en canales L y R
         if block.ndim > 1:
@@ -937,20 +1046,23 @@ class MasterLimiter:
             main_len = n_sub * sub_sz
             target_sub = np.min(target_lin[:main_len].reshape(n_sub, sub_sz), axis=1)
 
-            gr_sub = np.empty(n_sub, dtype=np.float32)
             g = self.current_gain_linear
             a_att = self.alpha_att
             a_rel = self.alpha_rel
+            one_m_att = 1.0 - a_att
+            one_m_rel = 1.0 - a_rel
 
-            for k in range(n_sub):
-                tgt = target_sub[k]
+            gr_list = []
+            for tgt in target_sub.tolist():
                 if tgt < g:
-                    g = a_att * g + (1.0 - a_att) * tgt
+                    g = a_att * g + one_m_att * tgt
                 else:
-                    g = a_rel * g + (1.0 - a_rel) * tgt
-                gr_sub[k] = g
+                    g = a_rel * g + one_m_rel * tgt
+                gr_list.append(g)
 
             self.current_gain_linear = g
+            min_g = min(gr_list)
+            gr_sub = np.array(gr_list, dtype=np.float32)
             gr_linear = np.repeat(gr_sub, sub_sz)
             if rem > 0:
                 gr_linear = np.concatenate((gr_linear, np.full(rem, g, dtype=np.float32)))
@@ -958,26 +1070,31 @@ class MasterLimiter:
             dt_s = 1.0 / self.sr
             a_att_s = float(np.exp(-dt_s / max(1e-5, self.attack_ms / 1000.0)))
             a_rel_s = float(np.exp(-dt_s / max(1e-4, self.release_ms / 1000.0)))
-            gr_linear = np.empty(frames, dtype=np.float32)
+            one_m_att_s = 1.0 - a_att_s
+            one_m_rel_s = 1.0 - a_rel_s
+            gr_list = []
             g = self.current_gain_linear
-            for k in range(frames):
-                tgt = target_lin[k]
+            for tgt in target_lin.tolist():
                 if tgt < g:
-                    g = a_att_s * g + (1.0 - a_att_s) * tgt
+                    g = a_att_s * g + one_m_att_s * tgt
                 else:
-                    g = a_rel_s * g + (1.0 - a_rel_s) * tgt
-                gr_linear[k] = g
+                    g = a_rel_s * g + one_m_rel_s * tgt
+                gr_list.append(g)
             self.current_gain_linear = g
+            min_g = min(gr_list)
+            gr_linear = np.array(gr_list, dtype=np.float32)
 
-        out_block = block * gr_linear[:, None] if block.ndim > 1 else block * gr_linear
+        if block.ndim > 1:
+            np.multiply(block, gr_linear[:, None], out=block)
+        else:
+            np.multiply(block, gr_linear, out=block)
         # Garantía absoluta anti-clipping: jamás supera el ceiling configurado
-        np.clip(out_block, -self.ceil_lin, self.ceil_lin, out=out_block)
+        np.clip(block, -self.ceil_lin, self.ceil_lin, out=block)
 
-        min_g = float(np.min(gr_linear))
-        self.last_gr_linear = min_g
+        self.last_gr_linear = float(min_g)
         self.last_gr_db = float(20.0 * np.log10(max(min_g, 1e-6)))
 
-        return out_block
+        return block
 
     def to_dict(self) -> dict:
         return {
@@ -1014,6 +1131,7 @@ class ParametricEQEngine:
         self.output_gain_db = 0.0
         self.isolated_band_index: int | None = None
         self.lock = threading.RLock()
+        self._tls = threading.local()
         self.static_version = 1
         self.bands: list[EQBand] = []
         self.autogain_enabled = False
@@ -1261,182 +1379,286 @@ class ParametricEQEngine:
         - `out_A`: procesado con todas las bandas activas cuyo `target_output` sea "A" o "A+B" (usando `zi_A`).
         - `out_B`: procesado con todas las bandas activas cuyo `target_output` sea "B" o "A+B" (usando `zi_B`).
         Soporta Isolate (`isolated_band_index`) y procesamiento por canal (`LR`, `L`, `R`, `Mid`, `Side`).
+        Lock-free en el hilo de audio con buffers channel-first prealocados y ruta rápida single-pass para A+B.
         """
-        if indata.ndim == 1:
-            stereo_in = np.column_stack((indata, indata))
-        elif indata.shape[1] == 1:
-            stereo_in = np.repeat(indata, 2, axis=1)
-        else:
-            stereo_in = indata[:, 0:2]
+        frames = indata.shape[0] if indata.ndim > 0 else 0
+        if frames == 0:
+            empty = np.zeros((0, 2), dtype=np.float32)
+            return empty, empty.copy()
 
-        if self.bypass:
-            out_f32 = stereo_in.astype(np.float32, copy=True)
-            return out_f32, out_f32.copy()
+        bands = list(self.bands)
+        bypass = self.bypass
+        out_gain_db = self.output_gain_db
+        autogain_en = getattr(self, "autogain_enabled", False)
+        bypass_eq = getattr(self, "bypass_eq", False)
 
-        with self.lock:
-            iso_idx = self._resolve_isolated_band_index()
+        if bypass:
+            if indata.ndim == 1:
+                stereo_in = np.column_stack((indata, indata)).astype(np.float32, copy=False)
+            elif indata.shape[1] == 1:
+                stereo_in = np.repeat(indata, 2, axis=1).astype(np.float32, copy=False)
+            else:
+                stereo_in = indata[:, 0:2].astype(np.float32, copy=True)
+            return stereo_in, stereo_in.copy()
 
-            # --- MODO ISOLATE (SOLO DE FRECUENCIA BAND-PASS) ---
-            if iso_idx is not None:
-                iso_band = self.bands[iso_idx]
-                in_f64 = stereo_in.astype(np.float64, copy=True)
+        iso_idx = self.isolated_band_index
+        if iso_idx is not None:
+            if not (0 <= iso_idx < len(bands) and bands[iso_idx].enabled):
+                iso_idx = None
+        if iso_idx is None:
+            for i, b in enumerate(bands):
+                if b.enabled and b.solo:
+                    iso_idx = i
+                    break
 
-                # Escalar suavemente según la ganancia de monitoreo y de la banda
-                band_boost = min(12.0, max(-12.0, iso_band.gain_db * 0.5)) if iso_band.supports_gain else 0.0
-                mon_gain_db = float(np.clip(band_boost + self.output_gain_db, -24.0, 12.0))
-                gain_scale = 10.0 ** (mon_gain_db / 20.0)
+        # --- MODO ISOLATE (SOLO DE FRECUENCIA BAND-PASS) ---
+        if iso_idx is not None:
+            iso_band = bands[iso_idx]
+            if indata.ndim == 1:
+                in_f64 = np.column_stack((indata, indata)).astype(np.float64, copy=False)
+            elif indata.shape[1] == 1:
+                in_f64 = np.repeat(indata, 2, axis=1).astype(np.float64, copy=False)
+            else:
+                in_f64 = indata[:, 0:2].astype(np.float64, copy=True)
 
-                if iso_band.target_output in ("A", "A+B"):
-                    out_A = _apply_isolate_channel_mode(
-                        iso_band.iso_sos, in_f64, iso_band.iso_zi_A, iso_band.channel_mode,
-                        zi_mid=iso_band.iso_zi_mid_A, zi_side=iso_band.iso_zi_side_A
-                    ) * gain_scale
-                else:
-                    out_A = np.zeros_like(in_f64)
+            band_boost = min(12.0, max(-12.0, iso_band.gain_db * 0.5)) if iso_band.supports_gain else 0.0
+            mon_gain_db = float(np.clip(band_boost + out_gain_db, -24.0, 12.0))
+            gain_scale = 10.0 ** (mon_gain_db / 20.0)
 
-                if iso_band.target_output in ("B", "A+B"):
-                    out_B = _apply_isolate_channel_mode(
-                        iso_band.iso_sos, in_f64, iso_band.iso_zi_B, iso_band.channel_mode,
-                        zi_mid=iso_band.iso_zi_mid_B, zi_side=iso_band.iso_zi_side_B
-                    ) * gain_scale
-                else:
-                    out_B = np.zeros_like(in_f64)
+            if iso_band.target_output in ("A", "A+B"):
+                out_A = _apply_isolate_channel_mode(
+                    iso_band.iso_sos, in_f64, iso_band.iso_zi_A, iso_band.channel_mode,
+                    zi_mid=iso_band.iso_zi_mid_A, zi_side=iso_band.iso_zi_side_A
+                ) * gain_scale
+            else:
+                out_A = np.zeros_like(in_f64)
 
-                if apply_limiter:
-                    out_A = self.limiter_a.process(out_A)
-                    out_B = self.limiter_b.process(out_B)
-                return out_A.astype(np.float32), out_B.astype(np.float32)
-
-            # --- MODO NORMAL DUAL BUS (OUT A + OUT B) ---
-            enabled_bands = [b for b in self.bands if b.enabled]
-            any_filtering = any(
-                b.is_dynamic_active or abs(b.gain_db) > 0.01 or not b.supports_gain
-                for b in enabled_bands
-            )
-            if not any_filtering and abs(self.output_gain_db) < 0.01 and not self.autogain_enabled and abs(self.current_autogain_db) < 0.01:
-                for b in self.bands:
-                    if abs(b.current_dyn_offset_db) > 0.001:
-                        b.current_dyn_offset_db *= 0.85
-                    else:
-                        b.current_dyn_offset_db = 0.0
-                out_A = stereo_in.astype(np.float64, copy=True)
-                out_B = stereo_in.astype(np.float64, copy=True)
-                if apply_limiter:
-                    out_A = self.limiter_a.process(out_A)
-                    out_B = self.limiter_b.process(out_B)
-                return out_A.astype(np.float32), out_B.astype(np.float32)
-
-            out_A = stereo_in.astype(np.float64, copy=True)
-            out_B = stereo_in.astype(np.float64, copy=True)
-            frames = out_A.shape[0]
-            block_duration = frames / self.sr
-
-            mono_in = 0.5 * (stereo_in[:, 0] + stereo_in[:, 1])
-            side_in = 0.5 * (stereo_in[:, 0] - stereo_in[:, 1])
-
-            for band in self.bands:
-                if not band.enabled:
-                    band.current_dyn_offset_db = (
-                        0.0 if abs(band.current_dyn_offset_db) < 0.01 else band.current_dyn_offset_db * 0.85
-                    )
-                    continue
-
-                if band.is_dynamic_active:
-                    if band.channel_mode == "L":
-                        sc_in = stereo_in[:, 0]
-                    elif band.channel_mode == "R":
-                        sc_in = stereo_in[:, 1]
-                    elif band.channel_mode == "Side":
-                        sc_in = side_in
-                    else:
-                        sc_in = mono_in
-
-                    if _c_sosfilt is not None:
-                        sc_arr = np.ascontiguousarray(sc_in, dtype=np.float64)[np.newaxis, :]
-                        if band.sc_zi.ndim == 3 and band.sc_zi.shape[0] == 1:
-                            _c_sosfilt(band.sc_sos, sc_arr, band.sc_zi)
-                        else:
-                            sc_zi_arr = np.ascontiguousarray(band.sc_zi, dtype=np.float64)[np.newaxis, :, :]
-                            _c_sosfilt(band.sc_sos, sc_arr, sc_zi_arr)
-                            band.sc_zi[:] = sc_zi_arr[0]
-                        band_signal = sc_arr[0]
-                    else:
-                        band_signal, band.sc_zi = sosfilt(band.sc_sos, sc_in, zi=band.sc_zi)
-                    rms = np.sqrt(np.mean(band_signal ** 2))
-                    level_db = 20.0 * np.log10(rms + 1e-10)
-
-                    att_sec = max(band.attack_ms / 1000.0, 1e-4)
-                    rel_sec = max(band.release_ms / 1000.0, 1e-4)
-                    alpha_att = np.exp(-block_duration / att_sec)
-                    alpha_rel = np.exp(-block_duration / rel_sec)
-
-                    if level_db > band.env_db:
-                        base_env = max(band.env_db, band.threshold_db - 15.0, -70.0)
-                        band.env_db = alpha_att * base_env + (1.0 - alpha_att) * level_db
-                    else:
-                        band.env_db = max(-90.0, alpha_rel * band.env_db + (1.0 - alpha_rel) * level_db)
-
-                    over_db = band.env_db - band.threshold_db
-                    knee_w = 6.0
-                    if over_db <= -0.5 * knee_w:
-                        eff_over = 0.0
-                    elif over_db < 0.5 * knee_w:
-                        eff_over = ((over_db + 0.5 * knee_w) ** 2) / (2.0 * knee_w)
-                    else:
-                        eff_over = over_db
-
-                    if eff_over > 0.0:
-                        norm_excursion = 1.0 - np.exp(-eff_over / 12.0)
-                        band.current_dyn_offset_db = float(band.dyn_range_db * norm_excursion)
-                    else:
-                        band.current_dyn_offset_db = 0.0
-
-                    band._update_instant_sos()
-                else:
-                    band.current_dyn_offset_db = 0.0
-                    band.sos_inst = band.sos_static
-
-                if band.is_dynamic_active or abs(band.gain_db) > 0.01 or not band.supports_gain:
-                    if band.target_output in ("A", "A+B"):
-                        _apply_sos_channel_mode(
-                            band.sos_inst, out_A, band.zi_A, band.channel_mode,
-                            zi_mid=band.zi_mid_A, zi_side=band.zi_side_A
-                        )
-                    if band.target_output in ("B", "A+B"):
-                        _apply_sos_channel_mode(
-                            band.sos_inst, out_B, band.zi_B, band.channel_mode,
-                            zi_mid=band.zi_mid_B, zi_side=band.zi_side_B
-                        )
-
-            if abs(self.output_gain_db) >= 0.01:
-                gain_lin = 10.0 ** (self.output_gain_db / 20.0)
-                out_A *= gain_lin
-                out_B *= gain_lin
-
-            # --- AUTO-GAIN (Compensación de Loudness Post-EQ / Pre-Limitador) ---
-            if apply_autogain:
-                if getattr(self, "autogain_enabled", False) and not getattr(self, "bypass_eq", False):
-                    peak_a = float(np.max(np.abs(out_A))) if out_A.size else 0.0
-                    peak_b = float(np.max(np.abs(out_B))) if out_B.size else 0.0
-                    target_a = self.target_autogain_a_db if peak_a > 0.001 else 0.0
-                    target_b = self.target_autogain_b_db if peak_b > 0.001 else 0.0
-                else:
-                    target_a = 0.0
-                    target_b = 0.0
-
-                self.current_autogain_a_db += 0.12 * (target_a - self.current_autogain_a_db)
-                self.current_autogain_b_db += 0.12 * (target_b - self.current_autogain_b_db)
-                self.current_autogain_db = self.current_autogain_a_db
-
-                if abs(self.current_autogain_a_db) > 0.02:
-                    out_A *= (10.0 ** (self.current_autogain_a_db / 20.0))
-                if abs(self.current_autogain_b_db) > 0.02:
-                    out_B *= (10.0 ** (self.current_autogain_b_db / 20.0))
+            if iso_band.target_output in ("B", "A+B"):
+                out_B = _apply_isolate_channel_mode(
+                    iso_band.iso_sos, in_f64, iso_band.iso_zi_B, iso_band.channel_mode,
+                    zi_mid=iso_band.iso_zi_mid_B, zi_side=iso_band.iso_zi_side_B
+                ) * gain_scale
+            else:
+                out_B = np.zeros_like(in_f64)
 
             if apply_limiter:
                 out_A = self.limiter_a.process(out_A)
                 out_B = self.limiter_b.process(out_B)
             return out_A.astype(np.float32), out_B.astype(np.float32)
+
+        # --- MODO NORMAL DUAL BUS (OUT A + OUT B) ---
+        any_filtering = False
+        shared_ab = True
+        any_dyn = False
+        for b in bands:
+            if b.enabled:
+                if b.target_output != "A+B":
+                    shared_ab = False
+                if b.is_dynamic_active:
+                    any_dyn = True
+                    any_filtering = True
+                elif abs(b.gain_db) > 0.01 or not b.supports_gain:
+                    any_filtering = True
+
+        if not any_filtering and abs(out_gain_db) < 0.01 and not autogain_en and abs(self.current_autogain_db) < 0.01:
+            for b in bands:
+                if abs(b.current_dyn_offset_db) > 0.001:
+                    b.current_dyn_offset_db *= 0.85
+                else:
+                    b.current_dyn_offset_db = 0.0
+            if indata.ndim == 1:
+                out_A = np.column_stack((indata, indata)).astype(np.float32, copy=False)
+            elif indata.shape[1] == 1:
+                out_A = np.repeat(indata, 2, axis=1).astype(np.float32, copy=False)
+            else:
+                out_A = indata[:, 0:2].astype(np.float32, copy=True)
+            out_B = out_A.copy()
+            if apply_limiter:
+                out_A = self.limiter_a.process(out_A)
+                out_B = self.limiter_b.process(out_B)
+            return out_A, out_B
+
+        tls = self._tls
+        if getattr(tls, "work_frames", -1) != frames:
+            tls.work_frames = frames
+            tls.work_a = np.empty((2, frames), dtype=np.float64)
+            tls.work_b = np.empty((2, frames), dtype=np.float64)
+            tls.ms_scratch = np.empty((2, frames), dtype=np.float64)
+            tls.dyn_scratch = np.empty((2, frames), dtype=np.float64)
+            tls.sc_work = np.empty((1, frames), dtype=np.float64)
+
+        work_a = tls.work_a
+        work_b = tls.work_b
+        ms_scratch = tls.ms_scratch
+        dyn_scratch = tls.dyn_scratch
+
+        if indata.ndim == 1:
+            work_a[0] = indata
+            work_a[1] = indata
+            in_ch0 = indata
+            in_ch1 = indata
+        elif indata.shape[1] == 1:
+            col = indata[:, 0]
+            work_a[0] = col
+            work_a[1] = col
+            in_ch0 = col
+            in_ch1 = col
+        else:
+            in_ch0 = indata[:, 0]
+            in_ch1 = indata[:, 1]
+            work_a[0] = in_ch0
+            work_a[1] = in_ch1
+
+        if not shared_ab:
+            np.copyto(work_b, work_a)
+
+        block_duration = frames / self.sr
+        if any_dyn:
+            mono_in = dyn_scratch[0]
+            side_in = dyn_scratch[1]
+            np.add(work_a[0], work_a[1], out=mono_in)
+            mono_in *= 0.5
+            np.subtract(work_a[0], work_a[1], out=side_in)
+            side_in *= 0.5
+
+        for band in bands:
+            if not band.enabled:
+                band.current_dyn_offset_db = (
+                    0.0 if abs(band.current_dyn_offset_db) < 0.01 else band.current_dyn_offset_db * 0.85
+                )
+                continue
+
+            if band.is_dynamic_active:
+                sc_work = tls.sc_work
+                if band.channel_mode == "L":
+                    sc_work[0] = in_ch0
+                elif band.channel_mode == "R":
+                    sc_work[0] = in_ch1
+                elif band.channel_mode == "Side":
+                    np.copyto(sc_work[0], side_in)
+                else:
+                    np.copyto(sc_work[0], mono_in)
+
+                if _c_sosfilt is not None:
+                    sc_zi = band.sc_zi
+                    if sc_zi.ndim == 3 and sc_zi.shape == (1, 1, 2):
+                        _c_sosfilt(band.sc_sos, sc_work, sc_zi)
+                    else:
+                        sc_zi_arr = np.zeros((1, 1, 2), dtype=np.float64)
+                        _c_sosfilt(band.sc_sos, sc_work, sc_zi_arr)
+                    band_signal = sc_work[0]
+                else:
+                    band_signal, band.sc_zi = sosfilt(band.sc_sos, sc_work[0], zi=band.sc_zi)
+
+                rms = math.sqrt(float(np.dot(band_signal, band_signal)) / frames)
+                level_db = 20.0 * math.log10(rms + 1e-10)
+
+                att_sec = max(band.attack_ms * 0.001, 1e-4)
+                rel_sec = max(band.release_ms * 0.001, 1e-4)
+                alpha_att = math.exp(-block_duration / att_sec)
+                alpha_rel = math.exp(-block_duration / rel_sec)
+
+                if level_db > band.env_db:
+                    base_env = max(band.env_db, band.threshold_db - 15.0, -70.0)
+                    band.env_db = alpha_att * base_env + (1.0 - alpha_att) * level_db
+                else:
+                    band.env_db = max(-90.0, alpha_rel * band.env_db + (1.0 - alpha_rel) * level_db)
+
+                over_db = band.env_db - band.threshold_db
+                knee_w = 6.0
+                if over_db <= -0.5 * knee_w:
+                    eff_over = 0.0
+                elif over_db < 0.5 * knee_w:
+                    eff_over = ((over_db + 0.5 * knee_w) ** 2) / (2.0 * knee_w)
+                else:
+                    eff_over = over_db
+
+                prev_offset = band.current_dyn_offset_db
+                if eff_over > 0.0:
+                    norm_excursion = 1.0 - math.exp(-eff_over / 12.0)
+                    new_offset = float(band.dyn_range_db * norm_excursion)
+                else:
+                    new_offset = 0.0
+
+                band.current_dyn_offset_db = new_offset
+                if new_offset == 0.0 and prev_offset == 0.0 and band.sos_inst is band.sos_static:
+                    pass
+                elif abs(new_offset - prev_offset) > 1e-4 or band.sos_inst is band.sos_static:
+                    if new_offset == 0.0:
+                        band.sos_inst = band.sos_static
+                    else:
+                        band._update_instant_sos()
+            else:
+                band.current_dyn_offset_db = 0.0
+                band.sos_inst = band.sos_static
+
+            if band.is_dynamic_active or abs(band.gain_db) > 0.01 or not band.supports_gain:
+                sos_run = band.smoothed_sos()
+                if shared_ab:
+                    _apply_sos_channel_first_inplace(
+                        sos_run, work_a, band.zi_A, band.channel_mode,
+                        zi_mid=band.zi_mid_A, zi_side=band.zi_side_A,
+                        scratch_2xN=ms_scratch,
+                    )
+                    if band.zi_B.shape == band.zi_A.shape:
+                        np.copyto(band.zi_B, band.zi_A)
+                    if band.zi_mid_B.shape == band.zi_mid_A.shape:
+                        np.copyto(band.zi_mid_B, band.zi_mid_A)
+                    if band.zi_side_B.shape == band.zi_side_A.shape:
+                        np.copyto(band.zi_side_B, band.zi_side_A)
+                else:
+                    if band.target_output in ("A", "A+B"):
+                        _apply_sos_channel_first_inplace(
+                            sos_run, work_a, band.zi_A, band.channel_mode,
+                            zi_mid=band.zi_mid_A, zi_side=band.zi_side_A,
+                            scratch_2xN=ms_scratch,
+                        )
+                    if band.target_output in ("B", "A+B"):
+                        _apply_sos_channel_first_inplace(
+                            sos_run, work_b, band.zi_B, band.channel_mode,
+                            zi_mid=band.zi_mid_B, zi_side=band.zi_side_B,
+                            scratch_2xN=ms_scratch,
+                        )
+
+        if shared_ab:
+            np.copyto(work_b, work_a)
+
+        if abs(out_gain_db) >= 0.01:
+            gain_lin = 10.0 ** (out_gain_db / 20.0)
+            work_a *= gain_lin
+            work_b *= gain_lin
+
+        # --- AUTO-GAIN (Compensación de Loudness Post-EQ / Pre-Limitador) ---
+        if apply_autogain:
+            if autogain_en and not bypass_eq:
+                peak_a = float(np.max(np.abs(work_a))) if work_a.size else 0.0
+                peak_b = float(np.max(np.abs(work_b))) if work_b.size else 0.0
+                target_a = self.target_autogain_a_db if peak_a > 0.001 else 0.0
+                target_b = self.target_autogain_b_db if peak_b > 0.001 else 0.0
+            else:
+                target_a = 0.0
+                target_b = 0.0
+
+            self.current_autogain_a_db += 0.12 * (target_a - self.current_autogain_a_db)
+            self.current_autogain_b_db += 0.12 * (target_b - self.current_autogain_b_db)
+            self.current_autogain_db = self.current_autogain_a_db
+
+            if abs(self.current_autogain_a_db) > 0.02:
+                work_a *= (10.0 ** (self.current_autogain_a_db / 20.0))
+            if abs(self.current_autogain_b_db) > 0.02:
+                work_b *= (10.0 ** (self.current_autogain_b_db / 20.0))
+
+        out_A = np.empty((frames, 2), dtype=np.float32)
+        out_A[:, 0] = work_a[0]
+        out_A[:, 1] = work_a[1]
+        out_B = np.empty((frames, 2), dtype=np.float32)
+        out_B[:, 0] = work_b[0]
+        out_B[:, 1] = work_b[1]
+
+        if apply_limiter:
+            out_A = self.limiter_a.process(out_A)
+            out_B = self.limiter_b.process(out_B)
+        return out_A, out_B
 
     def process_block(self, indata: np.ndarray) -> np.ndarray:
         """Procesa un bloque devolviendo la salida principal `out_A` (compatible con llamadas de 1 bus)."""
@@ -1453,39 +1675,55 @@ class ParametricEQEngine:
         z2: np.ndarray,
         target_bus: str | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
-        with self.lock:
-            n = len(z1)
-            total_static = np.zeros(n, dtype=np.float64)
-            total_dyn = np.zeros(n, dtype=np.float64)
+        n = len(z1)
+        total_static = np.zeros(n, dtype=np.float64)
+        total_dyn = np.zeros(n, dtype=np.float64)
 
-            if self.bypass:
-                return total_static, total_dyn
-
-            iso_idx = self._resolve_isolated_band_index()
-            if iso_idx is not None:
-                iso_b = self.bands[iso_idx]
-                if target_bus == "A" and iso_b.target_output not in ("A", "A+B"):
-                    return np.full(n, -120.0, dtype=np.float64), np.full(n, -120.0, dtype=np.float64)
-                if target_bus == "B" and iso_b.target_output not in ("B", "A+B"):
-                    return np.full(n, -120.0, dtype=np.float64), np.full(n, -120.0, dtype=np.float64)
-                iso_resp = iso_b.get_isolate_freq_response_db(z1, z2) + self.output_gain_db
-                return iso_resp, iso_resp.copy()
-
-            active_bands = self.get_active_bands(target_bus=target_bus)
-            for band in active_bands:
-                static_db = band.get_static_freq_response_db(z1, z2)
-                total_static += static_db
-                if band.is_dynamic_active and abs(band.current_dyn_offset_db) > 0.02:
-                    dyn_db = band.get_dynamic_freq_response_db(z1, z2)
-                    total_dyn += dyn_db
-                else:
-                    total_dyn += static_db
-
-            if abs(self.output_gain_db) >= 0.01:
-                total_static += self.output_gain_db
-                total_dyn += self.output_gain_db
-
+        if self.bypass:
             return total_static, total_dyn
+
+        bands = list(self.bands)
+        iso_idx = self.isolated_band_index
+        if iso_idx is not None:
+            if not (0 <= iso_idx < len(bands) and bands[iso_idx].enabled):
+                iso_idx = None
+        if iso_idx is None:
+            for i, b in enumerate(bands):
+                if b.enabled and b.solo:
+                    iso_idx = i
+                    break
+
+        if iso_idx is not None:
+            iso_b = bands[iso_idx]
+            if target_bus == "A" and iso_b.target_output not in ("A", "A+B"):
+                return np.full(n, -120.0, dtype=np.float64), np.full(n, -120.0, dtype=np.float64)
+            if target_bus == "B" and iso_b.target_output not in ("B", "A+B"):
+                return np.full(n, -120.0, dtype=np.float64), np.full(n, -120.0, dtype=np.float64)
+            iso_resp = iso_b.get_isolate_freq_response_db(z1, z2) + self.output_gain_db
+            return iso_resp, iso_resp.copy()
+
+        if target_bus == "A":
+            active_bands = [b for b in bands if b.enabled and b.target_output in ("A", "A+B")]
+        elif target_bus == "B":
+            active_bands = [b for b in bands if b.enabled and b.target_output in ("B", "A+B")]
+        else:
+            active_bands = [b for b in bands if b.enabled]
+
+        for band in active_bands:
+            static_db = band.get_static_freq_response_db(z1, z2)
+            total_static += static_db
+            if band.is_dynamic_active and abs(band.current_dyn_offset_db) > 0.02:
+                dyn_db = band.get_dynamic_freq_response_db(z1, z2)
+                total_dyn += dyn_db
+            else:
+                total_dyn += static_db
+
+        out_gain = self.output_gain_db
+        if abs(out_gain) >= 0.01:
+            total_static += out_gain
+            total_dyn += out_gain
+
+        return total_static, total_dyn
 
 
 class DualOutputCrossover:
@@ -1646,66 +1884,15 @@ class DualOutputCrossover:
             return np.zeros_like(freqs_hz, dtype=float), db_lp
 
 
-class AsyncInputRingBuffer:
+class AsyncInputRingBuffer(_AdaptiveResamplingRingBuffer):
     """
-    Ring Buffer Lock-Free SPSC para Input 2 (Aux / Mic) con corrección de clock drift
-    automática sin bloqueo del hilo de audio ni asignaciones dinámicas.
+    Ring buffer para Input 2 (Aux / Mic, otro reloj de hardware) con remuestreo adaptativo
+    continuo (ASRC): la deriva de reloj se absorbe con correcciones de ppm inaudibles en lugar
+    de descartar bloques (saltos) o insertar silencios. Ver audio_sync.py.
     """
 
     def __init__(self, capacity_frames: int = 32768, channels: int = 2):
-        self.capacity = int(capacity_frames)
-        self.channels = int(channels)
-        self.buffer = np.zeros((self.capacity, self.channels), dtype=np.float32)
-        self.write_ptr = 0
-        self.read_ptr = 0
-        self.available = 0
-        self.target_fill = 2048
-        self._lock = threading.Lock()
-
-    def reset(self, target_fill: int = 2048):
-        with self._lock:
-            self.buffer.fill(0.0)
-            self.target_fill = int(target_fill)
-            self.write_ptr = self.target_fill
-            self.read_ptr = 0
-            self.available = self.target_fill
-
-    def write(self, data: np.ndarray):
-        n = data.shape[0]
-        if n <= 0:
-            return
-        if data.ndim == 1:
-            frames = np.column_stack((data, data))
-        elif data.shape[1] == 1:
-            frames = np.repeat(data, 2, axis=1)
-        else:
-            frames = data[:, :2]
-
-        with self._lock:
-            # Prevención de overflow (corrección de clock drift positivo)
-            max_allowed = self.capacity - n
-            if self.available > max_allowed:
-                drop = self.available - self.target_fill
-                self.read_ptr = (self.read_ptr + drop) % self.capacity
-                self.available = self.target_fill
-
-            idx = (self.write_ptr + np.arange(n)) % self.capacity
-            self.buffer[idx] = frames
-            self.write_ptr = (self.write_ptr + n) % self.capacity
-            self.available += n
-
-    def read_into(self, out_array: np.ndarray) -> bool:
-        n = out_array.shape[0]
-        with self._lock:
-            if self.available < n:
-                # Corrección de underrun (clock drift negativo) sin bloquear el callback maestro
-                out_array.fill(0.0)
-                return False
-            idx = (self.read_ptr + np.arange(n)) % self.capacity
-            np.copyto(out_array, self.buffer[idx])
-            self.read_ptr = (self.read_ptr + n) % self.capacity
-            self.available -= n
-            return True
+        super().__init__(capacity_frames=capacity_frames, channels=channels, target_fill=256)
 
 
 def smooth_spectrum_12th_octave(freqs_hz: np.ndarray, mag_db: np.ndarray) -> np.ndarray:

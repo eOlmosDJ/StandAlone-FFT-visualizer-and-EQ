@@ -1,6 +1,12 @@
 import sys
 import os
 
+# Reducir el intervalo de cambio de contexto del GIL (0.5 ms) para priorizar hilos de audio en baja latencia
+try:
+    sys.setswitchinterval(0.0005)
+except Exception:
+    pass
+
 # En Windows, fijar explícitamente el AppUserModelID al inicio absoluto ANTES de importar
 # cualquier subsistema GUI (PyQt6 / OpenGL) o multimedia para que Windows Explorer y
 # la barra de tareas asocien siempre el icono personalizado al proceso de la aplicación.
@@ -15,9 +21,135 @@ if sys.platform == "win32":
 import json
 import math
 import queue
+import collections
 import threading
 import numpy as np
 import sounddevice as sd
+from audio_sync import AdaptiveResamplingRingBuffer
+
+_audio_tls = threading.local()
+_win_avrt = None
+_win_kernel32 = None
+if sys.platform == "win32":
+    try:
+        import ctypes as _ctypes
+        _win_avrt = _ctypes.windll.avrt
+        _win_avrt.AvSetMmThreadCharacteristicsW.argtypes = [_ctypes.c_wchar_p, _ctypes.POINTER(_ctypes.c_ulong)]
+        _win_avrt.AvSetMmThreadCharacteristicsW.restype = _ctypes.c_void_p
+        _win_kernel32 = _ctypes.windll.kernel32
+        _win_kernel32.GetCurrentThread.restype = _ctypes.c_void_p
+        _win_kernel32.SetThreadPriority.argtypes = [_ctypes.c_void_p, _ctypes.c_int]
+        _win_kernel32.SetThreadPriority.restype = _ctypes.c_int
+    except Exception:
+        _win_avrt = None
+        _win_kernel32 = None
+
+
+class _PowerThrottlingState(_ctypes.Structure if sys.platform == "win32" else object):
+    # PROCESS_POWER_THROTTLING_STATE / THREAD_POWER_THROTTLING_STATE (misma disposición)
+    if sys.platform == "win32":
+        _fields_ = [
+            ("Version", _ctypes.c_ulong),
+            ("ControlMask", _ctypes.c_ulong),
+            ("StateMask", _ctypes.c_ulong),
+        ]
+
+
+def _configure_process_priority():
+    """
+    Prioridad de proceso para audio en vivo en Windows:
+    1. HIGH_PRIORITY_CLASS: TODOS los hilos Python (GUI, FFT, audio) quedan por encima de los
+       programas normales. Es clave por el GIL: si el hilo que tiene el GIL es desalojado por
+       otro programa, el hilo de audio espera aunque tenga prioridad máxima (inversión de prioridad).
+    2. Desactiva EcoQoS / Power Throttling (Windows 11): sin esto Windows reduce la frecuencia
+       y manda el proceso a E-cores cuando la ventana está minimizada, tapada o sin foco.
+    3. Ignora el recorte de resolución de timer (Windows 11 ignora timeBeginPeriod(1) en
+       ventanas minimizadas/ocultas salvo que se pida explícitamente).
+    """
+    if sys.platform != "win32" or _win_kernel32 is None:
+        return
+    try:
+        k32 = _win_kernel32
+        k32.GetCurrentProcess.restype = _ctypes.c_void_p
+        k32.SetPriorityClass.argtypes = [_ctypes.c_void_p, _ctypes.c_ulong]
+        k32.SetPriorityClass.restype = _ctypes.c_int
+        h_proc = k32.GetCurrentProcess()
+
+        HIGH_PRIORITY_CLASS = 0x00000080
+        ABOVE_NORMAL_PRIORITY_CLASS = 0x00008000
+        if not k32.SetPriorityClass(h_proc, HIGH_PRIORITY_CLASS):
+            k32.SetPriorityClass(h_proc, ABOVE_NORMAL_PRIORITY_CLASS)
+
+        try:
+            ProcessPowerThrottling = 4
+            PROCESS_POWER_THROTTLING_EXECUTION_SPEED = 0x1
+            PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION = 0x4
+            st = _PowerThrottlingState()
+            st.Version = 1
+            st.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION
+            st.StateMask = 0  # 0 = forzar OFF (alto rendimiento / timer de 1 ms siempre)
+            k32.SetProcessInformation.argtypes = [_ctypes.c_void_p, _ctypes.c_int, _ctypes.c_void_p, _ctypes.c_ulong]
+            k32.SetProcessInformation.restype = _ctypes.c_int
+            if not k32.SetProcessInformation(h_proc, ProcessPowerThrottling, _ctypes.byref(st), _ctypes.sizeof(st)):
+                # Windows 10 antiguos no soportan IGNORE_TIMER_RESOLUTION: reintentar sólo con EXECUTION_SPEED
+                st.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+                k32.SetProcessInformation(h_proc, ProcessPowerThrottling, _ctypes.byref(st), _ctypes.sizeof(st))
+        except Exception:
+            pass
+
+        # Impide que Windows desactive el "priority boost" dinámico del proceso
+        try:
+            k32.SetProcessPriorityBoost.argtypes = [_ctypes.c_void_p, _ctypes.c_int]
+            k32.SetProcessPriorityBoost(h_proc, 0)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def _disable_current_thread_power_throttling():
+    if sys.platform != "win32" or _win_kernel32 is None:
+        return
+    try:
+        ThreadPowerThrottling = 3
+        st = _PowerThrottlingState()
+        st.Version = 1
+        st.ControlMask = 0x1  # THREAD_POWER_THROTTLING_EXECUTION_SPEED
+        st.StateMask = 0
+        k32 = _win_kernel32
+        k32.SetThreadInformation.argtypes = [_ctypes.c_void_p, _ctypes.c_int, _ctypes.c_void_p, _ctypes.c_ulong]
+        k32.SetThreadInformation.restype = _ctypes.c_int
+        k32.SetThreadInformation(k32.GetCurrentThread(), ThreadPowerThrottling, _ctypes.byref(st), _ctypes.sizeof(st))
+    except Exception:
+        pass
+
+
+_configure_process_priority()
+
+
+def _boost_audio_thread_priority():
+    if getattr(_audio_tls, "boosted", False):
+        return
+    _audio_tls.boosted = True
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        if _win_avrt is not None:
+            task_idx = ctypes.c_ulong(0)
+            _audio_tls.avrt_handle = _win_avrt.AvSetMmThreadCharacteristicsW("Pro Audio", ctypes.byref(task_idx))
+            try:
+                # AVRT_PRIORITY_CRITICAL = 2 (máxima prioridad dentro de la tarea MMCSS "Pro Audio")
+                if _audio_tls.avrt_handle:
+                    _win_avrt.AvSetMmThreadPriority.argtypes = [ctypes.c_void_p, ctypes.c_int]
+                    _win_avrt.AvSetMmThreadPriority(_audio_tls.avrt_handle, 2)
+            except Exception:
+                pass
+        if _win_kernel32 is not None:
+            _win_kernel32.SetThreadPriority(_win_kernel32.GetCurrentThread(), 15)
+        _disable_current_thread_power_throttling()
+    except Exception:
+        pass
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QComboBox, QLabel, QGroupBox, QMessageBox,
@@ -44,14 +176,14 @@ except Exception:
 
 from eq_ui import (
     ProQ4Overlay, FloatingBandHUD, LiquidGlassButton, style_dark_combobox,
-    style_hud_spinbox, HUDPopupDialog, HUDPopupMenu,
+    style_hud_spinbox, HUDPopupDialog, HUDPopupMenu, HUDOpenGLBackgroundItem,
     LimiterControlPopup, LimiterGRMiniWidget, MiniOscilloscopeWidget, CompactScopeGLWidget,
     AutoGainMiniBar, CrossoverMenuWidget, EditInputSelector, CrossoverLineItem
 )
 from fft_analyzer import FFTSpectrumAnalyzer, FFTComputationWorker
 from eq_dsp import (
     ParametricEQEngine, DualOutputCrossover, AsyncInputRingBuffer,
-    smooth_spectrum_12th_octave, detect_resonances
+    smooth_spectrum_12th_octave, detect_resonances, eval_sos_mag_db_fast
 )
 
 
@@ -618,149 +750,41 @@ class StereoDelayLine:
             return out
 
 
-class SecondaryOutputRingBuffer:
+class SecondaryOutputRingBuffer(AdaptiveResamplingRingBuffer):
     """
-    Ring buffer continuo thread-safe con colchón anti-jitter y compensación suave de reloj
-    (drift correction) para sincronizar un segundo dispositivo de salida de audio en Windows.
+    Puente entre el reloj del stream principal y el de la Salida Secundaria (Bus B).
+    Usa remuestreo adaptativo continuo (ASRC): la deriva entre placas se corrige con ajustes
+    de ppm inaudibles. Antes se comprimía el audio un 1.5-3 % de golpe cuando el colchón se
+    llenaba (efecto "se acelera") y se estiraba/silenciaba al vaciarse ("paquete perdido").
     """
 
-    def __init__(self, block_size: int = 512, channels: int = 2):
-        self.block_size = max(64, int(block_size))
-        self.channels = max(1, int(channels))
-        self.capacity_frames = self.block_size * 16
-        self.target_fill = self.block_size * 2
-        self.buffer = np.zeros((self.capacity_frames, self.channels), dtype=np.float32)
-        self.write_ptr = 0
-        self.read_ptr = 0
-        self.available_frames = 0
-        self.is_prebuffering = True
-        self.last_frame = np.zeros((1, self.channels), dtype=np.float32)
-        self.lock = threading.Lock()
+    def __init__(self, block_size: int = 512, channels: int = 2, sample_rate: float = 48000.0):
+        self.block_size = max(32, int(block_size))
+        super().__init__(
+            capacity_frames=max(16384, self.block_size * 64),
+            channels=channels,
+            target_fill=self._default_target(self.block_size),
+            max_target_fill=max(4096, self.block_size * 16),
+            sample_rate=sample_rate,
+        )
 
-    def reset(self, block_size: int | None = None):
-        with self.lock:
-            if block_size is not None and block_size > 0:
-                self.block_size = int(block_size)
-                self.capacity_frames = self.block_size * 16
-                self.target_fill = self.block_size * 2
-                self.buffer = np.zeros((self.capacity_frames, self.channels), dtype=np.float32)
-            else:
-                self.buffer.fill(0.0)
-            self.write_ptr = 0
-            self.read_ptr = 0
-            self.available_frames = 0
-            self.is_prebuffering = True
-            self.last_frame.fill(0.0)
+    @staticmethod
+    def _default_target(block_size: int) -> int:
+        # >= 2 bloques y nunca menos de ~5 ms: los dos callbacks no están en fase
+        return max(2 * int(block_size), 256)
 
-    def write(self, data: np.ndarray) -> None:
-        """Escribe un bloque de audio estéreo (N, channels) en el ring buffer."""
-        n_frames = data.shape[0]
-        if n_frames == 0:
-            return
-
-        with self.lock:
-            # Si el búfer está lleno (overrun severo), descartar las muestras más viejas
-            if self.available_frames + n_frames > self.capacity_frames:
-                excess = (self.available_frames + n_frames) - self.capacity_frames
-                self.read_ptr = (self.read_ptr + excess) % self.capacity_frames
-                self.available_frames -= excess
-
-            ch = min(self.channels, data.shape[1])
-            first_chunk = min(n_frames, self.capacity_frames - self.write_ptr)
-            second_chunk = n_frames - first_chunk
-
-            self.buffer[self.write_ptr : self.write_ptr + first_chunk, :ch] = data[:first_chunk, :ch]
-            if ch < self.channels:
-                self.buffer[self.write_ptr : self.write_ptr + first_chunk, ch:] = 0.0
-
-            if second_chunk > 0:
-                self.buffer[:second_chunk, :ch] = data[first_chunk:, :ch]
-                if ch < self.channels:
-                    self.buffer[:second_chunk, ch:] = 0.0
-
-            self.write_ptr = (self.write_ptr + n_frames) % self.capacity_frames
-            self.available_frames += n_frames
-
-            # Al acumular el colchón inicial de target_fill, desactivar pre-buffering
-            if self.is_prebuffering and self.available_frames >= self.target_fill:
-                self.is_prebuffering = False
-
-    def _read_raw(self, count: int) -> np.ndarray:
-        """Lee `count` muestras del buffer circular (debe llamarse dentro de self.lock)."""
-        chunk = np.empty((count, self.channels), dtype=np.float32)
-        first = min(count, self.capacity_frames - self.read_ptr)
-        second = count - first
-
-        chunk[:first] = self.buffer[self.read_ptr : self.read_ptr + first]
-        if second > 0:
-            chunk[first:] = self.buffer[:second]
-
-        self.read_ptr = (self.read_ptr + count) % self.capacity_frames
-        self.available_frames -= count
-        return chunk
+    def reset(self, block_size: int | None = None, sample_rate: float | None = None):
+        if block_size is not None and block_size > 0:
+            self.block_size = int(block_size)
+            self.max_target_fill = max(4096, self.block_size * 16)
+        super().reset(
+            target_fill=self._default_target(self.block_size),
+            capacity_frames=max(16384, self.block_size * 64),
+            sample_rate=sample_rate,
+        )
 
     def read(self, outdata: np.ndarray, frames: int) -> None:
-        """Lee y entrega `frames` muestras a `outdata`, aplicando compensación suave de deriva de reloj."""
-        with self.lock:
-            # 1. Fase de Pre-buffering: silenciar mientras se llena el colchón inicial anti-jitter
-            if self.is_prebuffering:
-                outdata.fill(0.0)
-                return
-
-            # 2. Compensación por Exceso de Reloj (available_frames > block_size * 8):
-            #    Leemos frames + 2 muestras y las comprimimos suavemente a `frames` sin cortes ni saltos
-            if self.available_frames >= frames + 2 and self.available_frames > self.block_size * 8:
-                n_read = frames + 2
-                raw = self._read_raw(n_read)
-                x_src = np.linspace(0.0, 1.0, n_read, endpoint=True)
-                x_dst = np.linspace(0.0, 1.0, frames, endpoint=True)
-                ch = min(self.channels, outdata.shape[1])
-                for c in range(ch):
-                    outdata[:, c] = np.interp(x_dst, x_src, raw[:, c])
-                if outdata.shape[1] > ch:
-                    outdata[:, ch:] = 0.0
-                self.last_frame[:] = outdata[-1:, :self.channels]
-                return
-
-            # 3. Lectura Normal (available_frames >= frames)
-            if self.available_frames >= frames:
-                raw = self._read_raw(frames)
-                ch = min(self.channels, outdata.shape[1])
-                outdata[:, :ch] = raw[:, :ch]
-                if outdata.shape[1] > ch:
-                    outdata[:, ch:] = 0.0
-                self.last_frame[:] = outdata[-1:, :self.channels]
-                return
-
-            # 4. Compensación por Defecto de Reloj / Underrun (available_frames < frames):
-            #    NUNCA silenciar con escalón brusco; estirar muestras o atenuar suavemente
-            avail = self.available_frames
-            if avail > 1:
-                raw = self._read_raw(avail)
-                x_src = np.linspace(0.0, 1.0, avail, endpoint=True)
-                x_dst = np.linspace(0.0, 1.0, frames, endpoint=True)
-                ch = min(self.channels, outdata.shape[1])
-                for c in range(ch):
-                    outdata[:, c] = np.interp(x_dst, x_src, raw[:, c])
-                if outdata.shape[1] > ch:
-                    outdata[:, ch:] = 0.0
-                self.last_frame[:] = outdata[-1:, :self.channels]
-            elif avail == 1:
-                raw = self._read_raw(1)
-                fade = np.linspace(1.0, 0.0, frames, endpoint=True)[:, None]
-                ch = min(self.channels, outdata.shape[1])
-                outdata[:, :ch] = raw * fade
-                if outdata.shape[1] > ch:
-                    outdata[:, ch:] = 0.0
-                self.last_frame.fill(0.0)
-            else:
-                fade = np.linspace(0.8, 0.0, frames, endpoint=True)[:, None]
-                ch = min(self.channels, outdata.shape[1])
-                outdata[:, :ch] = self.last_frame * fade
-                if outdata.shape[1] > ch:
-                    outdata[:, ch:] = 0.0
-                self.last_frame.fill(0.0)
-                self.is_prebuffering = True
+        self.read_into(outdata[:frames])
 
 
 # Compatibilidad hacia atrás
@@ -2260,57 +2284,19 @@ class AudioAnalyzerApp(QMainWindow):
                 color: #D8DEE9;
                 font-family: "Segoe UI", sans-serif;
             }
-            QWidget {
-                color: #D8DEE9;
-                font-family: "Segoe UI", sans-serif;
-            }
-            QLabel {
-                background: transparent;
-                border: none;
-            }
-            QComboBox, QSpinBox {
-                background-color: #242424;
-                color: #ECEFF4;
-                border: 1px solid #383838;
-                border-radius: 4px;
-                padding: 3px 8px;
-                font-size: 11px;
-                font-weight: bold;
-            }
-            QComboBox:hover, QSpinBox:hover {
-                border-color: #525252;
-            }
-            QPushButton {
-                background-color: #242424;
-                color: #D8DEE9;
-                border: 1px solid #363636;
-                border-radius: 4px;
-                padding: 4px 10px;
-                font-size: 11px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #303030;
-                color: #FFFFFF;
-            }
-            QCheckBox {
-                background: transparent;
-                border: none;
-                color: #CBD5E1;
-                font-size: 11px;
-                spacing: 6px;
-            }
         """)
 
         self.sample_rates = [44100, 48000, 88200, 96000, 176400, 192000]
         self.current_sr = 48000
-        self.buffer_sizes = [64, 128, 256, 512, 1024]
+        self.buffer_sizes = [32, 48, 64, 128, 256, 512, 1024]
         self.audio_block_size = 128
         self.fft_sizes = [512, 1024, 2048, 4096, 8192, 16384]
         self.fft_size = 4096
         self.channels = 2
 
-        self.audio_queue = queue.Queue(maxsize=128)
+        # deque con maxlen: append()/popleft() son atómicos bajo el GIL y NO usan mutex/Condition
+        # (queue.Queue sí), así el hilo de audio nunca se bloquea esperando al hilo GUI.
+        self.audio_queue = collections.deque(maxlen=128)
         self.fft_accum_buf = np.zeros((4096, 2), dtype=np.float32)
         self.ring_buffer_out_b = SecondaryOutputRingBuffer(block_size=self.audio_block_size, channels=2)
         self.stream = None
@@ -2505,7 +2491,7 @@ class AudioAnalyzerApp(QMainWindow):
         c_in = QColor(self.theme.get("curve_in", "#9E9E9E"))
         self.fft_curve_in = self.plot_widget.plot(
             pen=pg.mkPen(color=c_in, width=1.1),
-            fillLevel=float(self.db_min - 12.0)
+            fillLevel=float(self.db_min - 60.0)
         )
         self.fft_curve_in.setZValue(-20)
         self.pre_curve = self.fft_curve_in  # compat alias
@@ -2514,7 +2500,7 @@ class AudioAnalyzerApp(QMainWindow):
         c_in2 = QColor(self.theme.get("curve_in2", "#BA68C8"))
         self.fft_curve_in2 = self.plot_widget.plot(
             pen=pg.mkPen(color=c_in2, width=1.1, style=Qt.PenStyle.DashLine),
-            fillLevel=float(self.db_min - 12.0)
+            fillLevel=float(self.db_min - 60.0)
         )
         self.fft_curve_in2.setZValue(-18)
         self.fft_curve_in2.setVisible(False)
@@ -2523,7 +2509,7 @@ class AudioAnalyzerApp(QMainWindow):
         c_out2 = QColor(self.theme.get("curve_out2", "#00E676"))
         self.fft_curve_out2 = self.plot_widget.plot(
             pen=pg.mkPen(color=c_out2, width=float(self.theme.get("curve_width", 16)) / 10.0),
-            fillLevel=float(self.db_min - 12.0)
+            fillLevel=float(self.db_min - 60.0)
         )
         self.fft_curve_out2.setZValue(-15)
 
@@ -2531,7 +2517,7 @@ class AudioAnalyzerApp(QMainWindow):
         c_out1 = QColor(self.theme.get("curve_out1", self.theme.get("curve", "#00E5FF")))
         self.fft_curve_out1 = self.plot_widget.plot(
             pen=pg.mkPen(color=c_out1, width=float(self.theme.get("curve_width", 16)) / 10.0),
-            fillLevel=float(self.db_min - 12.0)
+            fillLevel=float(self.db_min - 60.0)
         )
         self.fft_curve_out1.setZValue(-10)
         self.curve = self.fft_curve_out1  # compat alias
@@ -2974,7 +2960,7 @@ class AudioAnalyzerApp(QMainWindow):
         grid.addWidget(QLabel("Buffer / Latencia:"), 9, 0)
         self.buffer_size_combo = QComboBox()
         style_dark_combobox(self.buffer_size_combo)
-        self.buffer_sizes = [64, 128, 256, 512, 1024]
+        self.buffer_sizes = [32, 48, 64, 128, 256, 512, 1024]
         for sz in self.buffer_sizes:
             self.buffer_size_combo.addItem(f"{sz} muestras", sz)
         self.buffer_size_combo.setCurrentIndex(self.buffer_size_combo.findData(128))
@@ -3166,7 +3152,11 @@ class AudioAnalyzerApp(QMainWindow):
                 return
 
             ring = getattr(self, "ring_buffer_out_b", None)
-            target_fill = float(ring.target_fill) if ring is not None else 2.0 * self.audio_block_size
+            if ring is not None and hasattr(ring, "latency_frames"):
+                target_fill = float(ring.latency_frames)
+                self._last_synced_ring_target = ring.target_fill
+            else:
+                target_fill = float(ring.target_fill) if ring is not None else 2.0 * self.audio_block_size
             ring_delay_ms = (target_fill / float(self.current_sr)) * 1000.0
 
             def _out_lat(stream) -> float:
@@ -3561,16 +3551,24 @@ class AudioAnalyzerApp(QMainWindow):
                 self.eq_proc_in2.target_autogain_db = 0.0
             return
 
-        freqs = np.geomspace(60.0, 12000.0, 32)
-        db_curve_a = np.zeros_like(freqs, dtype=float)
-        db_curve_b = np.zeros_like(freqs, dtype=float)
+        sr = float(getattr(self, "current_sr", 48000.0))
+        if getattr(self, "_ag_cached_sr", None) != sr:
+            self._ag_cached_sr = sr
+            freqs = np.geomspace(60.0, 12000.0, 32)
+            w = 2.0 * np.pi * freqs / sr
+            self._ag_z1 = np.exp(-1j * w)
+            self._ag_z2 = self._ag_z1 * self._ag_z1
+        z1 = self._ag_z1
+        z2 = self._ag_z2
+        db_curve_a = np.zeros(32, dtype=float)
+        db_curve_b = np.zeros(32, dtype=float)
 
         # Recorre las bandas activas de las entradas que van a cada bus
         for b in getattr(self, "bands", []):
             if not getattr(b, "enabled", True):
                 continue
             bus = str(getattr(b, "output_bus", getattr(b, "target_output", "A+B"))).upper()
-            band_resp_db = self.compute_single_band_db_at_freqs(b, freqs)
+            band_resp_db = eval_sos_mag_db_fast(b.sos_static, z1, z2)
             if "A" in bus:
                 db_curve_a += band_resp_db
             if "B" in bus:
@@ -4332,7 +4330,7 @@ class AudioAnalyzerApp(QMainWindow):
 
             # 2. Buffer Size / Latency
             buf_sz = audio_cfg.get("buffer_size", audio_cfg.get("audio_block_size"))
-            if buf_sz in getattr(self, "buffer_sizes", [64, 128, 256, 512, 1024]):
+            if buf_sz in getattr(self, "buffer_sizes", [32, 48, 64, 128, 256, 512, 1024]):
                 self.audio_block_size = int(buf_sz)
                 if hasattr(self, "buffer_size_combo"):
                     self.buffer_size_combo.blockSignals(True)
@@ -4769,7 +4767,8 @@ class AudioAnalyzerApp(QMainWindow):
         try:
             dev_info = sd.query_devices(dev_idx)
             ch = min(2, int(dev_info["max_input_channels"]))
-            self.in2_ring_buffer.reset(target_fill=self.audio_block_size * 2)
+            self.in2_ring_buffer.set_nominal_ratio(1.0)
+            self.in2_ring_buffer.reset(target_fill=max(256, self.audio_block_size * 2), sample_rate=self.current_sr)
 
             in2_wasapi = None
             try:
@@ -4838,6 +4837,8 @@ class AudioAnalyzerApp(QMainWindow):
                     last_err = e3
 
             if opened:
+                # El ring buffer ASRC remuestrea de forma continua si Input 2 corre a otro SR
+                self.in2_ring_buffer.set_nominal_ratio(float(self.in2_stream_sr) / float(self.current_sr))
                 if hasattr(self, "lbl_in2_status"):
                     self.lbl_in2_status.setText(f"● Conectado ({int(self.in2_stream_sr)} Hz)")
                     self.lbl_in2_status.setStyleSheet("color: #00E676; font-size: 10px; font-weight: bold;")
@@ -4852,6 +4853,7 @@ class AudioAnalyzerApp(QMainWindow):
             print(f"[WARN] Excepción inesperada en Input 2 ({dev_idx}): {e}")
 
     def audio_callback_in2(self, indata, frames, time_info, status):
+        _boost_audio_thread_priority()
         if indata.size == 0:
             return
 
@@ -4863,16 +4865,8 @@ class AudioAnalyzerApp(QMainWindow):
         else:
             stereo = indata[:, 0:2].astype(np.float32, copy=False)
 
-        # 2. Remuestreo dinámico si el sample rate del stream difiere del motor DSP
-        in2_sr = getattr(self, "in2_stream_sr", self.current_sr)
-        if in2_sr != self.current_sr and frames > 1:
-            target_frames = int(round(frames * self.current_sr / float(in2_sr)))
-            x_orig = np.linspace(0.0, 1.0, frames, endpoint=False)
-            x_target = np.linspace(0.0, 1.0, target_frames, endpoint=False)
-            resampled = np.empty((target_frames, 2), dtype=np.float32)
-            resampled[:, 0] = np.interp(x_target, x_orig, stereo[:, 0])
-            resampled[:, 1] = np.interp(x_target, x_orig, stereo[:, 1])
-            stereo = resampled
+        # 2. El remuestreo (si Input 2 corre a otro SR) lo hace el ring buffer ASRC de forma
+        #    continua entre bloques; aquí se escribe el audio a su SR nativo.
 
         # 3. DC Blocker continuo a 15 Hz sin artefactos de bloque ni saltos
         if not hasattr(self, "_in2_dc_zi"):
@@ -4883,9 +4877,9 @@ class AudioAnalyzerApp(QMainWindow):
         try:
             from scipy.signal import lfilter
             clean_in, self._in2_dc_zi = lfilter(self._in2_dc_b, self._in2_dc_a, stereo, axis=0, zi=self._in2_dc_zi)
-            self.in2_ring_buffer.write(clean_in.astype(np.float32))
+            self.in2_ring_buffer.write(clean_in.astype(np.float32, copy=False))
         except Exception:
-            self.in2_ring_buffer.write(stereo.astype(np.float32))
+            self.in2_ring_buffer.write(stereo.astype(np.float32, copy=False))
 
     def _on_routing_changed(self):
         self.route_in1_to_a = bool(self.chk_route_in1_a.isChecked())
@@ -5017,14 +5011,17 @@ class AudioAnalyzerApp(QMainWindow):
             else:
                 y_ceil = float(self.db_max + 12.0)
 
+            y_inf_floor = float(self.db_min - 60.0)
             self.plot_widget.setYRange(y_floor, y_ceil, padding=0.0)
-            self.fft_curve_in.setFillLevel(y_floor)
-            self.fft_curve_out1.setFillLevel(y_floor)
-            self.fft_curve_out2.setFillLevel(y_floor)
+            self.fft_curve_in.setFillLevel(y_inf_floor)
+            self.fft_curve_in2.setFillLevel(y_inf_floor)
+            self.fft_curve_out1.setFillLevel(y_inf_floor)
+            self.fft_curve_out2.setFillLevel(y_inf_floor)
             self.eq_overlay.update_y_range(y_floor, y_ceil)
         else:
             self.plot_widget.setYRange(0.0, 1.08, padding=0.0)
             self.fft_curve_in.setFillLevel(0.0)
+            self.fft_curve_in2.setFillLevel(0.0)
             self.fft_curve_out1.setFillLevel(0.0)
             self.fft_curve_out2.setFillLevel(0.0)
             self.eq_overlay.update_y_range(-132.0, 12.0)
@@ -5039,30 +5036,48 @@ class AudioAnalyzerApp(QMainWindow):
         self.schedule_config_save()
 
     def audio_callback(self, indata, outdata, frames, time_info, status):
+        _boost_audio_thread_priority()
         # 1. Procesamiento independiente de Input 1
-        in1_a, in1_b = self.eq_proc_in1.process_dual_block(indata, apply_limiter=False, apply_autogain=False)
+        if self.route_in1_to_a or self.route_in1_to_b:
+            in1_a, in1_b = self.eq_proc_in1.process_dual_block(indata, apply_limiter=False, apply_autogain=False)
+        else:
+            in1_a = in1_b = None
 
         # 2. Lectura y procesamiento independiente de Input 2 (Aux / Mic) desde el ring buffer lock-free
         if not hasattr(self, "in2_block") or self.in2_block.shape[0] != frames:
             self.in2_block = np.zeros((frames, 2), dtype=np.float32)
         if self.stream_in2 is not None:
             self.in2_ring_buffer.read_into(self.in2_block)
-            in2_a, in2_b = self.eq_proc_in2.process_dual_block(self.in2_block, apply_limiter=False, apply_autogain=False)
+            if self.route_in2_to_a or self.route_in2_to_b:
+                in2_a, in2_b = self.eq_proc_in2.process_dual_block(self.in2_block, apply_limiter=False, apply_autogain=False)
+            else:
+                in2_a = in2_b = None
         else:
             self.in2_block.fill(0.0)
             in2_a = in2_b = None
 
         # 3. Matriz de ruteo libre de acoples hacia Out A y Out B
-        out_A = np.zeros_like(in1_a)
-        out_B = np.zeros_like(in1_b)
-        if self.route_in1_to_a:
-            out_A += in1_a
-        if self.route_in1_to_b:
-            out_B += in1_b
-        if self.route_in2_to_a and in2_a is not None:
-            out_A += in2_a
-        if self.route_in2_to_b and in2_b is not None:
-            out_B += in2_b
+        if self.route_in1_to_a and in1_a is not None and not (self.route_in2_to_a and in2_a is not None):
+            out_A = in1_a
+        elif not self.route_in1_to_a and (self.route_in2_to_a and in2_a is not None):
+            out_A = in2_a
+        else:
+            out_A = np.zeros((frames, 2), dtype=np.float32)
+            if self.route_in1_to_a and in1_a is not None:
+                out_A += in1_a
+            if self.route_in2_to_a and in2_a is not None:
+                out_A += in2_a
+
+        if self.route_in1_to_b and in1_b is not None and not (self.route_in2_to_b and in2_b is not None):
+            out_B = in1_b
+        elif not self.route_in1_to_b and (self.route_in2_to_b and in2_b is not None):
+            out_B = in2_b
+        else:
+            out_B = np.zeros((frames, 2), dtype=np.float32)
+            if self.route_in1_to_b and in1_b is not None:
+                out_B += in1_b
+            if self.route_in2_to_b and in2_b is not None:
+                out_B += in2_b
 
         # 4. Inyección del Generador de Ruido Blanco RTA con rampa suave (50 ms fade-in / fade-out)
         if getattr(self, "rta_measuring", False):
@@ -5121,21 +5136,40 @@ class AudioAnalyzerApp(QMainWindow):
             out_B = out_B * (10.0 ** (self.current_autogain_b_db / 20.0))
 
         # 6. Crossover Digital de Salidas (Out A / Out B)
-        if hasattr(self, "crossover") and self.crossover.enabled:
+        xover_on = hasattr(self, "crossover") and self.crossover.enabled
+        if xover_on:
             # Si Out B no tiene ruteo independiente configurado pero el Crossover está activo,
             # alimenta Out B con el master de Out A para que el Sub reciba la señal de bajas frecuencias
             if not self.route_in1_to_b and not self.route_in2_to_b:
                 out_B = out_A.copy()
             out_A, out_B = self.crossover.process_outputs(out_A, out_B)
 
-        # 7. Limitador Master (compartido unificado)
-        out_A = self.eq_proc_in1.limiter_a.process(out_A)
-        out_B = self.eq_proc_in1.limiter_b.process(out_B)
+        # 7. Limitador Master (compartido unificado, deduplicado si Bus A == Bus B)
+        lim_a = self.eq_proc_in1.limiter_a
+        lim_b = self.eq_proc_in1.limiter_b
+        if (
+            not xover_on
+            and np.array_equal(out_A, out_B)
+            and lim_a.enabled == lim_b.enabled
+            and lim_a.threshold_db == lim_b.threshold_db
+            and lim_a.ceiling_db == lim_b.ceiling_db
+        ):
+            out_A = lim_a.process(out_A)
+            out_B = out_A.copy()
+            lim_b.current_gain_linear = lim_a.current_gain_linear
+            lim_b.last_gr_db = lim_a.last_gr_db
+            lim_b.last_gr_linear = lim_a.last_gr_linear
+        else:
+            out_A = lim_a.process(out_A)
+            out_B = lim_b.process(out_B)
 
         # 8. Mute y Líneas de Retardo Estéreo Fraccionarias
         if self.is_muted:
             outdata.fill(0.0)
-            blk_b = np.zeros_like(out_B)
+            if self.stream_out_b is not None:
+                if not hasattr(self, "_mute_zero_blk") or self._mute_zero_blk.shape[0] != frames:
+                    self._mute_zero_blk = np.zeros((frames, 2), dtype=np.float32)
+                self.ring_buffer_out_b.write(self._mute_zero_blk)
         else:
             out_A_delayed = self.delay_bus_a.process(out_A)
             out_B_delayed = self.delay_bus_b.process(out_B)
@@ -5151,10 +5185,8 @@ class AudioAnalyzerApp(QMainWindow):
             elif n_out_ch == 1:
                 outdata[:, 0] = 0.5 * (out_A_delayed[:, 0] + out_A_delayed[:, 1])
 
-            blk_b = out_B_delayed.copy()
-
-        if self.stream_out_b is not None:
-            self.ring_buffer_out_b.write(blk_b)
+            if self.stream_out_b is not None:
+                self.ring_buffer_out_b.write(out_B_delayed)
 
         # 9. Cola de renderizado visual a la UI (In 1, In 2, Out A, Out B)
         # Prealocación de buffers contiguos de acumulación hasta >=512 muestras para 0% garbage collection
@@ -5178,7 +5210,7 @@ class AudioAnalyzerApp(QMainWindow):
             self._vis_accum_ptr += frames
             if self._vis_accum_ptr >= self._vis_accum_cap:
                 try:
-                    self.audio_queue.put_nowait((
+                    self.audio_queue.append((
                         self._vis_in1_arr.copy(),
                         self._vis_in2_arr.copy(),
                         self._vis_outA_arr.copy(),
@@ -5189,7 +5221,7 @@ class AudioAnalyzerApp(QMainWindow):
                 self._vis_accum_ptr = 0
         else:
             try:
-                self.audio_queue.put_nowait((
+                self.audio_queue.append((
                     indata.copy(),
                     self.in2_block.copy() if self.stream_in2 is not None else np.zeros((frames, 2), dtype=np.float32),
                     out_A.copy(),
@@ -5199,6 +5231,7 @@ class AudioAnalyzerApp(QMainWindow):
                 pass
 
     def audio_callback_out_b(self, outdata, frames, time_info, status):
+        _boost_audio_thread_priority()
         if self.is_muted:
             outdata.fill(0.0)
             return
@@ -5225,9 +5258,9 @@ class AudioAnalyzerApp(QMainWindow):
         if hasattr(self, "buffer_size_combo") and self.buffer_size_combo.currentData() is not None:
             self.audio_block_size = int(self.buffer_size_combo.currentData())
 
-        self.ring_buffer_out_b.reset(block_size=self.audio_block_size)
+        self.ring_buffer_out_b.reset(block_size=self.audio_block_size, sample_rate=self.current_sr)
         if hasattr(self, "in2_ring_buffer"):
-            self.in2_ring_buffer.reset(target_fill=self.audio_block_size * 2)
+            self.in2_ring_buffer.reset(target_fill=max(256, self.audio_block_size * 2), sample_rate=self.current_sr)
         self.in2_block = np.zeros((self.audio_block_size, 2), dtype=np.float32)
         self.scope_buffer.sample_rate = self.current_sr
         self.scope_buffer.block_size = self.audio_block_size
@@ -5266,84 +5299,99 @@ class AudioAnalyzerApp(QMainWindow):
 
         primary_opened = False
         if out_max_ch >= 4:
-            try:
-                stream_kwargs = {
-                    "samplerate": self.current_sr,
-                    "blocksize": self.audio_block_size,
-                    "latency": "low",
-                    "device": (in_dev, out_dev),
-                    "channels": (self.channels, 4),
-                    "dtype": "float32",
-                    "callback": self.audio_callback,
-                }
-                if wasapi_extra is not None:
-                    stream_kwargs["extra_settings"] = wasapi_extra
-                self.stream = sd.Stream(**stream_kwargs)
-                self.stream.start()
-                primary_opened = True
-            except Exception:
-                self.stream = None
-                primary_opened = False
+            for blk_try in (self.audio_block_size, 0):
+                try:
+                    stream_kwargs = {
+                        "samplerate": self.current_sr,
+                        "blocksize": blk_try,
+                        "latency": "low",
+                        "device": (in_dev, out_dev),
+                        "channels": (self.channels, 4),
+                        "dtype": "float32",
+                        "callback": self.audio_callback,
+                    }
+                    if wasapi_extra is not None:
+                        stream_kwargs["extra_settings"] = wasapi_extra
+                    self.stream = sd.Stream(**stream_kwargs)
+                    self.stream.start()
+                    primary_opened = True
+                    break
+                except Exception:
+                    self.stream = None
+                    primary_opened = False
 
         if not primary_opened:
-            try:
-                stream_kwargs = {
-                    "samplerate": self.current_sr,
-                    "blocksize": self.audio_block_size,
-                    "latency": "low",
-                    "device": (in_dev, out_dev),
-                    "channels": self.channels,
-                    "dtype": "float32",
-                    "callback": self.audio_callback,
-                }
-                if wasapi_extra is not None:
-                    stream_kwargs["extra_settings"] = wasapi_extra
-                self.stream = sd.Stream(**stream_kwargs)
-                self.stream.start()
-            except Exception as e:
-                self.stream = None
-                print(f"[WARN] Error al iniciar stream principal: {e}")
+            last_stream_err = None
+            for blk_try in (self.audio_block_size, 0):
+                try:
+                    stream_kwargs = {
+                        "samplerate": self.current_sr,
+                        "blocksize": blk_try,
+                        "latency": "low",
+                        "device": (in_dev, out_dev),
+                        "channels": self.channels,
+                        "dtype": "float32",
+                        "callback": self.audio_callback,
+                    }
+                    if wasapi_extra is not None:
+                        stream_kwargs["extra_settings"] = wasapi_extra
+                    self.stream = sd.Stream(**stream_kwargs)
+                    self.stream.start()
+                    primary_opened = True
+                    break
+                except Exception as e:
+                    self.stream = None
+                    last_stream_err = e
+            if not primary_opened:
+                print(f"[WARN] Error al iniciar stream principal: {last_stream_err}")
                 if getattr(self, "_startup_completed", False):
                     QMessageBox.warning(
                         self,
                         "Error de Audio",
-                        f"No se pudo iniciar el stream con los dispositivos/Sample Rate elegidos:\n{e}",
+                        f"No se pudo iniciar el stream con los dispositivos/Sample Rate elegidos:\n{last_stream_err}",
                     )
                 return
 
         # Si el usuario seleccionó una Salida Secundaria (Bus B - 3,4), abrir OutputStream secundario no bloqueante
         if out_b_dev is not None and out_b_dev != out_dev:
+            out_b_wasapi = None
             try:
+                d_info = sd.query_devices(out_b_dev)
+                api_info = sd.query_hostapis(d_info["hostapi"])
+                if "WASAPI" in str(api_info.get("name", "")).upper():
+                    out_b_wasapi = sd.WasapiSettings(auto_convert=True)
+            except Exception:
                 out_b_wasapi = None
-                try:
-                    d_info = sd.query_devices(out_b_dev)
-                    api_info = sd.query_hostapis(d_info["hostapi"])
-                    if "WASAPI" in str(api_info.get("name", "")).upper():
-                        out_b_wasapi = sd.WasapiSettings(auto_convert=True)
-                except Exception:
-                    out_b_wasapi = None
 
-                out_b_kwargs = {
-                    "samplerate": self.current_sr,
-                    "blocksize": self.audio_block_size,
-                    "latency": "low",
-                    "device": out_b_dev,
-                    "channels": 2,
-                    "dtype": "float32",
-                    "callback": self.audio_callback_out_b,
-                }
-                if out_b_wasapi is not None:
-                    out_b_kwargs["extra_settings"] = out_b_wasapi
-                self.stream_out_b = sd.OutputStream(**out_b_kwargs)
-                self.stream_out_b.start()
-            except Exception as e:
-                self.stream_out_b = None
-                print(f"[WARN] Error al iniciar Salida Secundaria (Bus B): {e}")
+            out_b_opened = False
+            out_b_err = None
+            for blk_try in (self.audio_block_size, 0):
+                try:
+                    out_b_kwargs = {
+                        "samplerate": self.current_sr,
+                        "blocksize": blk_try,
+                        "latency": "low",
+                        "device": out_b_dev,
+                        "channels": 2,
+                        "dtype": "float32",
+                        "callback": self.audio_callback_out_b,
+                    }
+                    if out_b_wasapi is not None:
+                        out_b_kwargs["extra_settings"] = out_b_wasapi
+                    self.stream_out_b = sd.OutputStream(**out_b_kwargs)
+                    self.stream_out_b.start()
+                    out_b_opened = True
+                    break
+                except Exception as e:
+                    self.stream_out_b = None
+                    out_b_err = e
+            if not out_b_opened:
+                print(f"[WARN] Error al iniciar Salida Secundaria (Bus B): {out_b_err}")
                 if getattr(self, "_startup_completed", False):
                     QMessageBox.warning(
                         self,
                         "Aviso de Salida Secundaria (Bus B)",
-                        f"No se pudo iniciar la Salida Secundaria (Bus B) en el dispositivo seleccionado:\n{e}",
+                        f"No se pudo iniciar la Salida Secundaria (Bus B) en el dispositivo seleccionado:\n{out_b_err}",
                     )
 
         # Actualizar frecuencia de muestreo de las líneas de retardo estéreo
@@ -5369,13 +5417,20 @@ class AudioAnalyzerApp(QMainWindow):
         self._restart_in2_stream()
 
     def update_visuals(self):
+        # Ventana minimizada: no se dibuja nada (0 % CPU de render). Sólo se vacía la cola
+        # para no retener memoria; si hay una medición RTA en curso se sigue el camino normal.
+        if self.isMinimized() and not getattr(self, "rta_measuring", False):
+            self.audio_queue.clear()
+            return
+
         pre_blocks = []
         in2_blocks = []
         post_blocks = []
         post2_blocks = []
-        while not self.audio_queue.empty():
+        aq = self.audio_queue
+        while aq:
             try:
-                item = self.audio_queue.get_nowait()
+                item = aq.popleft()
                 if len(item) == 4:
                     in1_blk, in2_blk, post_blk, post2_blk = item
                     pre_blocks.append(in1_blk)
@@ -5391,13 +5446,19 @@ class AudioAnalyzerApp(QMainWindow):
                     pre_blk, post_blk = item
                     pre_blocks.append(pre_blk)
                     post_blocks.append(post_blk)
-            except queue.Empty:
+            except IndexError:
                 break
 
         # Actualiza curvas EQ (en IDLE retorna en 0 ms gracias a dirty-check)
         self.eq_overlay.update_eq_curves(force=False)
         self.eq_overlay.update_ghost_tick()
         self.eq_panel.update_live_Readouts()
+
+        # Si el jitter buffer adaptativo de Bus B creció tras un underrun, re-sincronizar el delay de Bus A
+        if self.stream_out_b is not None and not getattr(self, "_delay_manually_adjusted", False):
+            ring = getattr(self, "ring_buffer_out_b", None)
+            if ring is not None and ring.target_fill != getattr(self, "_last_synced_ring_target", None):
+                self.recalculate_auto_sync_delay()
 
         # Actualiza estado y medición de Auto-Gain
         ag_en = getattr(self, "autogain_enabled", False)
@@ -5464,8 +5525,13 @@ class AudioAnalyzerApp(QMainWindow):
                         self.rta_ring_buffer[:-n] = self.rta_ring_buffer[n:]
                         self.rta_ring_buffer[-n:] = mono
 
-                win = np.hanning(self.fft_size).astype(np.float32)
-                win_scale = float(2.0 / np.sum(win))
+                win_key = int(self.fft_size)
+                if getattr(self, "_rta_win_key", None) != win_key:
+                    self._rta_win_key = win_key
+                    self._rta_win = np.hanning(win_key).astype(np.float32)
+                    self._rta_win_scale = float(2.0 / np.sum(self._rta_win))
+                win = self._rta_win
+                win_scale = self._rta_win_scale
                 fft_val = np.fft.rfft(self.rta_ring_buffer * win) * win_scale
                 power_spec = (np.abs(fft_val) ** 2).astype(np.float64)
 
@@ -5488,14 +5554,15 @@ class AudioAnalyzerApp(QMainWindow):
         show_rta = self.show_rta_chk.isChecked() if hasattr(self, "show_rta_chk") else False
         if show_rta and getattr(self, "rta_smoothed_db", None) is not None:
             freqs = np.fft.rfftfreq(self.fft_size, 1.0 / self.current_sr)
-            valid_m = freqs >= 20.0
+            valid_m = freqs > 0.0
             f_eval = freqs[valid_m]
             y_eval = self.rta_smoothed_db[valid_m]
             if len(f_eval) > 0:
-                y_floor = float(self.db_min - 12.0)
+                y_inf_floor = float(self.db_min - 60.0)
                 first_y = float(y_eval[0])
-                f_anchors = np.array([10.0, 15.0, 18.0], dtype=np.float64)
-                y_anchors = np.array([y_floor, y_floor + 0.35 * (first_y - y_floor), y_floor + 0.70 * (first_y - y_floor)], dtype=np.float64)
+                f0 = float(f_eval[0])
+                f_anchors = np.array([min(4.0, f0 * 0.35), min(7.5, f0 * 0.68)], dtype=np.float64)
+                y_anchors = np.array([y_inf_floor, y_inf_floor + 0.25 * (first_y - y_inf_floor)], dtype=np.float64)
                 f_plot = np.concatenate([f_anchors, f_eval])
                 y_plot = np.concatenate([y_anchors, y_eval])
                 self.rta_curve_item.setData(f_plot, y_plot)
@@ -5554,14 +5621,21 @@ class AudioAnalyzerApp(QMainWindow):
                 peak_in2 = float(np.max(np.abs(self.in2_block))) if hasattr(self, "in2_block") else 0.0
                 if peak_in2 > 0.0002:
                     db_in2 = float(20.0 * np.log10(peak_in2 + eps))
-                    self.lbl_in2_status.setText(f"● Activo ({db_in2:+.1f} dB)")
-                    self.lbl_in2_status.setStyleSheet("color: #00E676; font-size: 10px; font-weight: bold;")
+                    new_txt = f"● Activo ({db_in2:+.1f} dB)"
+                    new_col = "#00E676"
                 else:
-                    self.lbl_in2_status.setText("● Conectado (Silencio)")
-                    self.lbl_in2_status.setStyleSheet("color: #BA68C8; font-size: 10px; font-weight: bold;")
+                    new_txt = "● Conectado (Silencio)"
+                    new_col = "#BA68C8"
             else:
-                self.lbl_in2_status.setText("● Desactivado")
-                self.lbl_in2_status.setStyleSheet("color: #8C96A5; font-size: 10px; font-weight: bold;")
+                new_txt = "● Desactivado"
+                new_col = "#8C96A5"
+
+            if getattr(self, "_last_in2_status_txt", None) != new_txt:
+                self._last_in2_status_txt = new_txt
+                self.lbl_in2_status.setText(new_txt)
+            if getattr(self, "_last_in2_status_col", None) != new_col:
+                self._last_in2_status_col = new_col
+                self.lbl_in2_status.setStyleSheet(f"color: {new_col}; font-size: 10px; font-weight: bold;")
 
         show_in = self.show_in_chk.isChecked()
         show_in2 = self.show_in2_chk.isChecked() if hasattr(self, "show_in2_chk") else False
@@ -5628,6 +5702,19 @@ class AudioAnalyzerApp(QMainWindow):
                 self.fft_curve_out2.setData(snap.x_out2, snap.y_out2)
                 self._out2_was_shown = True
 
+        # Actualiza el buffer compartido de Gaussian Blur a 60 FPS para HUD, callouts y popups abiertos
+        HUDOpenGLBackgroundItem.invalidate_scene_blur_cache(self.eq_overlay, self.plot_widget)
+
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        try:
+            from PyQt6.QtCore import QEvent
+            if event.type() == QEvent.Type.WindowStateChange and hasattr(self, "timer"):
+                # Minimizado: tick de 10 Hz (sólo vacía la cola). Restaurado: 60 FPS.
+                self.timer.setInterval(100 if self.isMinimized() else 16)
+        except Exception:
+            pass
 
     def closeEvent(self, event):
         if hasattr(self, "fft_worker") and self.fft_worker is not None:
@@ -5760,11 +5847,11 @@ if __name__ == "__main__":
         border-left: none;
     }
     QComboBox QAbstractItemView {
-        background-color: #181A20;
+        background-color: transparent;
         color: #F0F2F5;
         selection-background-color: #2B303C;
         selection-color: #00E5FF;
-        border: 1px solid #3A3F4B;
+        border: none;
         border-radius: 6px;
         padding: 4px;
         outline: none;

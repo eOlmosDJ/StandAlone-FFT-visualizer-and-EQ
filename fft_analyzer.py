@@ -89,7 +89,7 @@ class FFTSpectrumAnalyzer:
         self._last_post_silent = True
         self._last_post2_silent = True
 
-        self.num_points = 360
+        self.num_points = 420
         self.spline_log = None
         self.spline_lin = None
         self._rebuild_window_and_freqs()
@@ -99,17 +99,23 @@ class FFTSpectrumAnalyzer:
         self.window_scale = float(2.0 / np.sum(self.window))
         self.freqs = np.fft.rfftfreq(self.fft_size, 1.0 / self.sample_rate)
 
-        self.valid_mask = self.freqs >= 25.0
+        self.valid_mask = self.freqs > 0.0
         self.f_real = self.freqs[self.valid_mask]
 
-        if len(self.f_real) > 4:
+        if len(self.f_real) > 2:
             # Precalcular vectores de interpolación logarítmica y lineal una sola vez
-            self.f_full_log = np.concatenate([np.array([10.0, 15.0]), self.f_real])
+            # Anclas sub-audibles por debajo de 10 Hz para caída natural hacia -infinito
+            f0 = float(self.f_real[0])
+            f_sub1 = min(4.0, f0 * 0.35)
+            f_sub2 = min(7.5, f0 * 0.68)
+            self.f_full_log = np.concatenate([np.array([f_sub1, f_sub2], dtype=np.float64), self.f_real])
             self.log_f_full = np.log10(self.f_full_log)
             self.log_f_smooth = np.linspace(self.log_f_full[0], self.log_f_full[-1], self.num_points)
             self.x_smooth_log = 10.0 ** self.log_f_smooth
 
-            self.f_full_lin = np.concatenate([np.array([0.0, 12.0]), self.f_real])
+            lin_sub1 = min(-20.0, f0 * 0.25 - 25.0)
+            lin_sub2 = min(-5.0, f0 * 0.60 - 10.0)
+            self.f_full_lin = np.concatenate([np.array([lin_sub1, lin_sub2], dtype=np.float64), self.f_real])
             self.x_smooth_lin = np.linspace(0.0, self.f_full_lin[-1], self.num_points)
 
             # Precalcular interpoladores Spline Cúbicos rápidos (0% CPU en tiempo real)
@@ -323,23 +329,26 @@ class FFTSpectrumAnalyzer:
         if held is None:
             return np.array([]), np.array([])
 
-        y_floor = float(db_min) if is_y_log else 0.0
+        y_inf_floor = (float(db_min) - 60.0) if is_y_log else 0.0
         y_ceil = float(db_max) if is_y_log else 1.0
 
-        if len(self.f_real) > 4:
+        if len(self.f_real) > 2:
             x_smooth = self.x_smooth_log if is_x_log else self.x_smooth_lin
             if at_rest:
-                return x_smooth, np.full_like(x_smooth, y_floor)
+                return x_smooth, np.full_like(x_smooth, y_inf_floor)
 
             eps = 1e-10
             mag_real = held[self.valid_mask]
             if is_y_log:
-                y_real = np.clip(20.0 * np.log10(mag_real + eps), y_floor, y_ceil)
+                y_real = np.clip(20.0 * np.log10(mag_real + eps), y_inf_floor, y_ceil)
             else:
-                y_real = np.clip(mag_real, y_floor, y_ceil)
+                y_real = np.clip(mag_real, y_inf_floor, y_ceil)
 
-            first_y = y_real[0]
-            anchor_y = np.array([y_floor, y_floor + 0.35 * (first_y - y_floor)], dtype=np.float32)
+            first_y = float(y_real[0])
+            anchor_y = np.array(
+                [y_inf_floor, y_inf_floor + 0.25 * (first_y - y_inf_floor)],
+                dtype=np.float32,
+            )
             y_full = np.concatenate([anchor_y, y_real]).astype(np.float32)
 
             if is_x_log:
@@ -353,9 +362,9 @@ class FFTSpectrumAnalyzer:
                 else:
                     y_smooth = np.interp(x_smooth, self.f_full_lin, y_full)
 
-            return x_smooth, np.clip(y_smooth, y_floor, y_ceil)
+            return x_smooth, np.clip(y_smooth, y_inf_floor, y_ceil)
 
-        return self.f_real, np.full_like(self.f_real, y_floor)
+        return self.f_real, np.full_like(self.f_real, y_inf_floor)
 
 
 class FFTWorkerSnapshot:

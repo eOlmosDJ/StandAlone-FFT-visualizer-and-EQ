@@ -59,9 +59,12 @@ def _resolve_app_and_plot(widget: QWidget | None):
 
 class _HUDPopupGLHelper:
     """
-    Sincroniza un HUDOpenGLBackgroundItem dentro de la escena OpenGL de la FFT bajo cualquier
-    menú o popup desplegable y provee pintado HUD con Gaussian Blur para el widget.
+    Provee pintado HUD Apple Liquid Glass con Gaussian Blur compartido a 60 FPS,
+    refracción óptica en bordes y halo difuso coloreado para menús y popups desplegables,
+    manteniendo registro activo para repintado animado en tiempo real sin crear ítems OpenGL redundantes.
     """
+
+    _active_helpers: set["_HUDPopupGLHelper"] = set()
 
     def __init__(self, widget: QWidget, accent_color: str = "#00E5FF", corner_radius: float = 10.0):
         self.widget = widget
@@ -69,6 +72,8 @@ class _HUDPopupGLHelper:
         self.corner_radius = float(corner_radius)
         self._bg_gl_item = None
         self._blur_pixmap = None
+        self._blur_frame_id = -1
+        self._blur_geom_key = None
         self._last_blur_time = 0.0
 
     def set_accent_color(self, hex_or_color):
@@ -76,81 +81,128 @@ class _HUDPopupGLHelper:
         if c.isValid() and c != self.accent_color:
             self.accent_color = c
             self.sync_gl_item()
-            self.widget.update()
+            if self.widget is not None:
+                self.widget.update()
 
     def build_rounded_path(self, w: float, h: float) -> QPainterPath:
-        pad = 1.5
+        pad = 2.5
         path = QPainterPath()
-        path.addRoundedRect(QRectF(pad, pad, max(2.0, w - 2.0 * pad), max(2.0, h - 2.0 * pad)), self.corner_radius, self.corner_radius)
+        path.addRoundedRect(
+            QRectF(pad, pad, max(2.0, w - 2.0 * pad), max(2.0, h - 2.0 * pad)),
+            self.corner_radius,
+            self.corner_radius,
+        )
         return path
 
     def sync_gl_item(self):
-        _, pw, ov = _resolve_app_and_plot(self.widget)
-        if pw is None or ov is None:
-            return
-        if self._bg_gl_item is None:
-            self._bg_gl_item = HUDOpenGLBackgroundItem(overlay=ov, plot_widget=pw)
-            self._bg_gl_item.setZValue(28)
-            pw.plotItem.vb.scene().addItem(self._bg_gl_item)
-        if not self.widget.isVisible():
+        if self._bg_gl_item is not None:
             self._bg_gl_item.hide()
-            return
-        global_tl = self.widget.mapToGlobal(QPoint(0, 0))
-        local_in_pw = pw.mapFromGlobal(global_tl)
-        scene_pt = pw.mapToScene(local_in_pw)
-        w = float(self.widget.width())
-        h = float(self.widget.height())
-        self._bg_gl_item.set_custom_shape(scene_pt, w, h, self.build_rounded_path(w, h), self.accent_color)
-        if not self._bg_gl_item.isVisible():
-            self._bg_gl_item.show()
+        if self.widget is not None:
+            try:
+                vis = self.widget.isVisible()
+            except RuntimeError:
+                _HUDPopupGLHelper._active_helpers.discard(self)
+                return
+            if vis:
+                _HUDPopupGLHelper._active_helpers.add(self)
+                self.widget.update()
+            else:
+                _HUDPopupGLHelper._active_helpers.discard(self)
+        else:
+            _HUDPopupGLHelper._active_helpers.discard(self)
 
     def hide_gl_item(self):
+        _HUDPopupGLHelper._active_helpers.discard(self)
         if self._bg_gl_item is not None:
             self._bg_gl_item.hide()
 
+    @classmethod
+    def repaint_active_popups(cls):
+        updated_widgets = set()
+        for h in list(cls._active_helpers):
+            w = h.widget
+            if w is None:
+                cls._active_helpers.discard(h)
+                continue
+            try:
+                if not w.isVisible():
+                    cls._active_helpers.discard(h)
+                    continue
+                updated_widgets.add(id(w))
+                w.update()
+                for lv in w.findChildren(QListView):
+                    vp = lv.viewport()
+                    if vp is not None:
+                        vp.update()
+            except RuntimeError:
+                cls._active_helpers.discard(h)
+
+        active_pop = QApplication.activePopupWidget()
+        if active_pop is not None and id(active_pop) not in updated_widgets:
+            try:
+                if active_pop.isVisible():
+                    active_pop.update()
+                    for lv in active_pop.findChildren(QListView):
+                        vp = lv.viewport()
+                        if vp is not None:
+                            vp.update()
+            except RuntimeError:
+                pass
+
     def paint_hud_background(self, painter: QPainter):
+        if self.widget is not None:
+            try:
+                if self.widget.isVisible():
+                    _HUDPopupGLHelper._active_helpers.add(self)
+            except RuntimeError:
+                return
+
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
         w = float(self.widget.width())
         h = float(self.widget.height())
         path = self.build_rounded_path(w, h)
 
-        now = time.perf_counter()
         _, pw, ov = _resolve_app_and_plot(self.widget)
-        if (self._blur_pixmap is None or (now - self._last_blur_time) >= 0.080) and pw is not None and ov is not None:
-            self._last_blur_time = now
+        if pw is not None and ov is not None:
             global_tl = self.widget.mapToGlobal(QPoint(0, 0))
             local_in_pw = pw.mapFromGlobal(global_tl)
             scene_pt = pw.mapToScene(local_in_pw)
-            self._blur_pixmap = HUDOpenGLBackgroundItem.render_scene_blur_pixmap(
-                ov, pw, float(scene_pt.x()), float(scene_pt.y()), w, h, self.accent_color
-            )
+            sx = float(scene_pt.x())
+            sy = float(scene_pt.y())
+            now = time.perf_counter()
+            cur_fid = HUDOpenGLBackgroundItem._scene_blur_frame_id
+            geom_key = (int(round(sx)), int(round(sy)), int(round(w)), int(round(h)), round(self.corner_radius, 1))
+            if (
+                self._blur_pixmap is None
+                or self._blur_frame_id != cur_fid
+                or self._blur_geom_key != geom_key
+                or (now - HUDOpenGLBackgroundItem._scene_blur_last_time) >= 0.014
+            ):
+                pix = HUDOpenGLBackgroundItem.render_scene_blur_pixmap(
+                    ov, pw, sx, sy, w, h, self.accent_color, corner_radius=self.corner_radius
+                )
+                if pix is not None:
+                    self._blur_pixmap = pix
+                    self._blur_frame_id = HUDOpenGLBackgroundItem._scene_blur_frame_id
+                    self._blur_geom_key = geom_key
 
         if self._blur_pixmap is not None and not self._blur_pixmap.isNull():
             painter.save()
             painter.setClipPath(path)
             painter.drawPixmap(self.widget.rect(), self._blur_pixmap)
-            painter.fillRect(self.widget.rect(), QColor(14, 16, 22, 138))
+            painter.fillRect(self.widget.rect(), QColor(10, 12, 18, 96))
             tint = QColor(self.accent_color)
-            tint.setAlpha(16)
+            tint.setAlpha(12)
             painter.fillRect(self.widget.rect(), tint)
             painter.restore()
         else:
-            painter.fillPath(path, QBrush(QColor(14, 16, 22, 145)))
+            painter.fillPath(path, QBrush(QColor(10, 12, 18, 180)))
             tint = QColor(self.accent_color)
-            tint.setAlpha(18)
+            tint.setAlpha(14)
             painter.fillPath(path, QBrush(tint))
 
-        glow = QColor(self.accent_color)
-        glow.setAlpha(40)
-        painter.setPen(QPen(glow, 2.8))
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawPath(path)
-
-        border = _brighten_color(self.accent_color, 0.12)
-        border.setAlpha(195)
-        painter.setPen(QPen(border, 1.25))
-        painter.drawPath(path)
+        draw_liquid_glass_border_glow(painter, path, QRectF(0.0, 0.0, w, h), self.accent_color)
 
 
 class HUDPopupDialog(QDialog):
@@ -173,6 +225,7 @@ class HUDPopupDialog(QDialog):
     def showEvent(self, event):
         super().showEvent(event)
         self._hud_gl._last_blur_time = 0.0
+        self._hud_gl._blur_geom_key = None
         self._hud_gl.sync_gl_item()
 
     def moveEvent(self, event):
@@ -182,6 +235,7 @@ class HUDPopupDialog(QDialog):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._hud_gl._last_blur_time = 0.0
+        self._hud_gl._blur_geom_key = None
         self._hud_gl.sync_gl_item()
 
     def hideEvent(self, event):
@@ -259,6 +313,7 @@ class HUDPopupMenu(QMenu):
     def showEvent(self, event):
         super().showEvent(event)
         self._hud_gl._last_blur_time = 0.0
+        self._hud_gl._blur_geom_key = None
         self._hud_gl.sync_gl_item()
 
     def moveEvent(self, event):
@@ -268,6 +323,7 @@ class HUDPopupMenu(QMenu):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._hud_gl._last_blur_time = 0.0
+        self._hud_gl._blur_geom_key = None
         self._hud_gl.sync_gl_item()
 
     def hideEvent(self, event):
@@ -282,7 +338,7 @@ class HUDPopupMenu(QMenu):
 
 
 class _ComboPopupFilter(QObject):
-    """Sincroniza y pinta el contenedor desplegable de cualquier QComboBox con diseño HUD + OpenGL."""
+    """Sincroniza y pinta el contenedor desplegable de cualquier QComboBox con diseño HUD + Liquid Glass."""
 
     def __init__(self, combo: QComboBox, accent_color: str = "#00E5FF"):
         super().__init__(combo)
@@ -296,7 +352,7 @@ class _ComboPopupFilter(QObject):
             if self._helper is None:
                 self._helper = _HUDPopupGLHelper(obj, accent_color=self.accent_color, corner_radius=7.0)
             if etype in (QEvent.Type.Show, QEvent.Type.Resize):
-                self._helper._last_blur_time = 0.0
+                self._helper._blur_geom_key = None
             self._helper.sync_gl_item()
         elif etype == QEvent.Type.Hide:
             if self._helper is not None:
@@ -312,22 +368,27 @@ class _ComboPopupFilter(QObject):
 
 
 def style_dark_combobox(combo: QComboBox, accent_color: str = "#00E5FF"):
-    """Estiliza la lista desplegable de un QComboBox con el diseño del HUD y renderizado OpenGL."""
+    """Estiliza la lista desplegable de un QComboBox con el diseño Liquid Glass HUD en tiempo real."""
     c = QColor(accent_color) if accent_color else QColor("#00E5FF")
     r, g, b = c.red(), c.green(), c.blue()
     bright_hex = _brighten_color(c, 0.35).name()
     list_view = QListView(combo)
     list_view.setUniformItemSizes(True)
     list_view.setSpacing(2)
+    list_view.setFrameShape(QFrame.Shape.NoFrame)
+    list_view.setAutoFillBackground(False)
     list_view.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-    list_view.viewport().setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+    vp = list_view.viewport()
+    if vp is not None:
+        vp.setAutoFillBackground(False)
+        vp.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
     list_view.setStyleSheet(f"""
         QListView {{
-            background-color: rgba(14, 16, 22, 138);
+            background-color: transparent;
             color: #F0F2F5;
-            border: 1.25px solid rgba({r}, {g}, {b}, 190);
+            border: none;
             border-radius: 7px;
-            padding: 4px;
+            padding: 5px;
             outline: none;
         }}
         QListView::item {{
@@ -355,6 +416,10 @@ def style_dark_combobox(combo: QComboBox, accent_color: str = "#00E5FF"):
             Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint | Qt.WindowType.NoDropShadowWindowHint
         )
         popup_win.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        popup_win.setAutoFillBackground(False)
+        if hasattr(popup_win, "setFrameShape"):
+            popup_win.setFrameShape(QFrame.Shape.NoFrame)
+        popup_win.setStyleSheet("QFrame { background: transparent; border: none; }")
         flt = _ComboPopupFilter(combo, accent_color=accent_color)
         combo._hud_popup_filter = flt
         popup_win.installEventFilter(flt)
@@ -535,6 +600,50 @@ def _brighten_color(hex_or_qcolor, ratio: float = 0.25) -> QColor:
     g = min(255, int(round(c.green() * (1.0 - ratio) + 255 * ratio)))
     b = min(255, int(round(c.blue() * (1.0 - ratio) + 255 * ratio)))
     return QColor(r, g, b)
+
+
+def draw_liquid_glass_border_glow(painter: QPainter, path: QPainterPath, rect: QRectF, accent_color: QColor):
+    """Dibuja brillo interior difuso (inward bleed), halo exterior suave y bisel especular direccional."""
+    c = QColor(accent_color) if (accent_color is not None and QColor(accent_color).isValid()) else QColor("#00E5FF")
+    r, g, b = c.red(), c.green(), c.blue()
+
+    # 1. Sangrado interior suave hacia el vidrio esmerilado y brillo especular superior
+    painter.save()
+    painter.setClipPath(path)
+
+    sheen_h = min(22.0, rect.height() * 0.35)
+    sheen_grad = QLinearGradient(0.0, rect.top(), 0.0, rect.top() + sheen_h)
+    sheen_grad.setColorAt(0.0, QColor(255, 255, 255, 16))
+    sheen_grad.setColorAt(1.0, QColor(255, 255, 255, 0))
+    painter.fillRect(QRectF(rect.left(), rect.top(), rect.width(), sheen_h), sheen_grad)
+
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    for alpha, width in ((15, 12.0), (28, 6.0), (48, 2.8)):
+        painter.setPen(QPen(QColor(r, g, b, alpha), width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+        painter.drawPath(path)
+    painter.restore()
+
+    # 2. Halo exterior difuso
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    for alpha, width in ((18, 5.6), (38, 3.0)):
+        painter.setPen(QPen(QColor(r, g, b, alpha), width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+        painter.drawPath(path)
+
+    # 3. Bisel especular direccional + borde nítido (1.25 px)
+    rim_grad = QLinearGradient(rect.left(), rect.top(), rect.left() + rect.width() * 0.45, rect.bottom())
+    c0 = _brighten_color(c, 0.45)
+    c0.setAlpha(230)
+    c1 = _brighten_color(c, 0.12)
+    c1.setAlpha(200)
+    c2 = QColor(r, g, b, 165)
+    c3 = _brighten_color(c, 0.20)
+    c3.setAlpha(195)
+    rim_grad.setColorAt(0.0, c0)
+    rim_grad.setColorAt(0.35, c1)
+    rim_grad.setColorAt(0.75, c2)
+    rim_grad.setColorAt(1.0, c3)
+    painter.setPen(QPen(QBrush(rim_grad), 1.25, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+    painter.drawPath(path)
 
 
 def _make_color_icon(hex_color: str, size: int = 12) -> QIcon:
@@ -894,15 +1003,21 @@ class ProQKnob(QWidget):
         self._refresh_labels()
 
     def _refresh_labels(self):
-        val_c = "#ECEFF4" if self.isEnabled() else "#686C75"
-        tit_c = "#8E95A4" if self.isEnabled() else "#555962"
-        self.val_label.setText(self.fmt_func(self._value))
-        self.val_label.setStyleSheet(
-            f"QLabel {{ color: {val_c}; font-family: 'Segoe UI'; font-size: 10px; font-weight: 700; background: transparent; }}"
-        )
-        self.title_label.setStyleSheet(
-            f"QLabel {{ color: {tit_c}; font-family: 'Segoe UI'; font-size: 9px; font-weight: 600; background: transparent; }}"
-        )
+        enabled = self.isEnabled()
+        val_c = "#ECEFF4" if enabled else "#686C75"
+        tit_c = "#8E95A4" if enabled else "#555962"
+        txt = self.fmt_func(self._value)
+        if getattr(self, "_last_val_txt", None) != txt:
+            self._last_val_txt = txt
+            self.val_label.setText(txt)
+        if getattr(self, "_last_lbl_colors", None) != (val_c, tit_c):
+            self._last_lbl_colors = (val_c, tit_c)
+            self.val_label.setStyleSheet(
+                f"QLabel {{ color: {val_c}; font-family: 'Segoe UI'; font-size: 10px; font-weight: 700; background: transparent; }}"
+            )
+            self.title_label.setStyleSheet(
+                f"QLabel {{ color: {tit_c}; font-family: 'Segoe UI'; font-size: 9px; font-weight: 600; background: transparent; }}"
+            )
 
     def changeEvent(self, event):
         super().changeEvent(event)
@@ -920,8 +1035,6 @@ class ProQKnob(QWidget):
             self.update()
             if emit_signal:
                 self.valueChanged.emit(self._value)
-        else:
-            self._refresh_labels()
 
     def setAccentColor(self, color_str: str):
         c = QColor(color_str)
@@ -985,9 +1098,35 @@ class ProQKnob(QWidget):
         event.accept()
 
     def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        w = int(self.width())
+        h = int(self.height())
+        if w <= 0 or h <= 0:
+            return
+        dpr = float(self.devicePixelRatioF()) if hasattr(self, "devicePixelRatioF") else 1.0
+        cache_key = (
+            w, h, dpr,
+            round(self._value, 4),
+            self.isEnabled(),
+            self.accent_color.rgba(),
+            self.bipolar,
+            self.log_scale,
+        )
+        if getattr(self, "_knob_cache_key", None) != cache_key or getattr(self, "_knob_cache_pix", None) is None:
+            self._knob_cache_key = cache_key
+            pw = max(1, int(round(w * dpr)))
+            ph = max(1, int(round(h * dpr)))
+            pix = QPixmap(pw, ph)
+            pix.setDevicePixelRatio(dpr)
+            pix.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(pix)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            self._paint_knob_to(painter)
+            painter.end()
+            self._knob_cache_pix = pix
+        p = QPainter(self)
+        p.drawPixmap(0, 0, self._knob_cache_pix)
 
+    def _paint_knob_to(self, painter: QPainter):
         w = float(self.width())
         d = float(self.diameter)
         is_compact = d <= 46.0
@@ -1123,10 +1262,14 @@ class GainDynProQKnob(ProQKnob):
         else:
             dyn_c = "#747B8A"
             dyn_txt = "DYN: 0.0 dB"
-        self.dyn_label.setText(dyn_txt)
-        self.dyn_label.setStyleSheet(
-            f"QLabel {{ color: {dyn_c}; font-family: 'Segoe UI'; font-size: 10px; font-weight: 700; background: transparent; }}"
-        )
+        if getattr(self, "_last_dyn_txt", None) != dyn_txt:
+            self._last_dyn_txt = dyn_txt
+            self.dyn_label.setText(dyn_txt)
+        if getattr(self, "_last_dyn_c", None) != dyn_c:
+            self._last_dyn_c = dyn_c
+            self.dyn_label.setStyleSheet(
+                f"QLabel {{ color: {dyn_c}; font-family: 'Segoe UI'; font-size: 10px; font-weight: 700; background: transparent; }}"
+            )
 
     def setAccentColor(self, color_str: str):
         super().setAccentColor(color_str)
@@ -1143,8 +1286,6 @@ class GainDynProQKnob(ProQKnob):
             self.update()
             if emit_signal:
                 self.dynRangeChanged.emit(self._dyn_range_db)
-        else:
-            self._refresh_labels()
 
     def setDynEnabled(self, enabled: bool):
         if bool(enabled) != self._dyn_enabled:
@@ -1283,9 +1424,38 @@ class GainDynProQKnob(ProQKnob):
         super().wheelEvent(event)
 
     def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        w = int(self.width())
+        h = int(self.height())
+        if w <= 0 or h <= 0:
+            return
+        dpr = float(self.devicePixelRatioF()) if hasattr(self, "devicePixelRatioF") else 1.0
+        cache_key = (
+            w, h, dpr,
+            round(self._value, 4),
+            round(self._dyn_range_db, 4),
+            round(self._dyn_offset_db, 2),
+            self._dyn_enabled,
+            self._hover_outer,
+            self._dragging_outer,
+            self.isEnabled(),
+            self.accent_color.rgba(),
+        )
+        if getattr(self, "_dyn_knob_cache_key", None) != cache_key or getattr(self, "_dyn_knob_cache_pix", None) is None:
+            self._dyn_knob_cache_key = cache_key
+            pw = max(1, int(round(w * dpr)))
+            ph = max(1, int(round(h * dpr)))
+            pix = QPixmap(pw, ph)
+            pix.setDevicePixelRatio(dpr)
+            pix.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(pix)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            self._paint_dyn_knob_to(painter)
+            painter.end()
+            self._dyn_knob_cache_pix = pix
+        p = QPainter(self)
+        p.drawPixmap(0, 0, self._dyn_knob_cache_pix)
 
+    def _paint_dyn_knob_to(self, painter: QPainter):
         cx, cy, outer_r, outer_w, track_r, track_w, cap_r = self._geometry_radii()
 
         outer_rect = QRectF(cx - outer_r, cy - outer_r, 2.0 * outer_r, 2.0 * outer_r)
@@ -1464,9 +1634,34 @@ class DynThresholdMeter(QWidget):
         self.setThresholdValue(self._y_to_db(y, top_y, bar_h), emit_signal=True)
 
     def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        w = int(self.width())
+        h = int(self.height())
+        if w <= 0 or h <= 0:
+            return
+        dpr = float(self.devicePixelRatioF()) if hasattr(self, "devicePixelRatioF") else 1.0
+        cache_key = (
+            w, h, dpr,
+            round(self._threshold_db, 2),
+            round(self._level_db, 2),
+            self.isEnabled(),
+            self._accent_color.rgba(),
+        )
+        if getattr(self, "_thr_cache_key", None) != cache_key or getattr(self, "_thr_cache_pix", None) is None:
+            self._thr_cache_key = cache_key
+            pw = max(1, int(round(w * dpr)))
+            ph = max(1, int(round(h * dpr)))
+            pix = QPixmap(pw, ph)
+            pix.setDevicePixelRatio(dpr)
+            pix.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(pix)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            self._paint_thr_to(painter)
+            painter.end()
+            self._thr_cache_pix = pix
+        p = QPainter(self)
+        p.drawPixmap(0, 0, self._thr_cache_pix)
 
+    def _paint_thr_to(self, painter: QPainter):
         w = float(self.width())
         top_y = 3.0
         bar_h = 66.0
@@ -1693,6 +1888,7 @@ class BandNodeCallout(QWidget):
 
         self._opacity_effect = QGraphicsOpacityEffect(self)
         self._opacity_effect.setOpacity(1.0)
+        self._opacity_effect.setEnabled(False)
         self.setGraphicsEffect(self._opacity_effect)
         self._current_opacity = 1.0
 
@@ -1799,42 +1995,44 @@ class BandNodeCallout(QWidget):
         full_path = self._build_callout_path(w)
 
         pw = getattr(self.overlay, "plot_widget", None)
-        now = time.perf_counter()
-        if (getattr(self, "_blur_pixmap", None) is None or (now - getattr(self, "_last_blur_time", 0.0)) >= 0.080) and pw is not None:
-            self._last_blur_time = now
+        if pw is not None:
             scene_pt = pw.mapToScene(self.pos())
-            self._blur_pixmap = HUDOpenGLBackgroundItem.render_scene_blur_pixmap(
-                self.overlay, pw, float(scene_pt.x()), float(scene_pt.y()), w, h, QColor(self._band_color)
-            )
+            sx = float(scene_pt.x())
+            sy = float(scene_pt.y())
+            now = time.perf_counter()
+            cur_fid = HUDOpenGLBackgroundItem._scene_blur_frame_id
+            geom_key = (int(round(sx)), int(round(sy)), int(round(w)), int(round(h)))
+            if (
+                getattr(self, "_blur_pixmap", None) is None
+                or getattr(self, "_blur_frame_id", -1) != cur_fid
+                or getattr(self, "_blur_geom_key", None) != geom_key
+                or (now - HUDOpenGLBackgroundItem._scene_blur_last_time) >= 0.014
+            ):
+                pix = HUDOpenGLBackgroundItem.render_scene_blur_pixmap(
+                    self.overlay, pw, sx, sy, w, h, QColor(self._band_color), corner_radius=8.0
+                )
+                if pix is not None:
+                    self._blur_pixmap = pix
+                    self._blur_frame_id = HUDOpenGLBackgroundItem._scene_blur_frame_id
+                    self._blur_geom_key = geom_key
         blur_pix = getattr(self, "_blur_pixmap", None)
 
         if blur_pix is not None and not blur_pix.isNull():
             painter.save()
             painter.setClipPath(full_path)
             painter.drawPixmap(self.rect(), blur_pix)
-            painter.fillRect(self.rect(), QColor(14, 16, 22, 136))
+            painter.fillRect(self.rect(), QColor(10, 12, 18, 96))
             tint = QColor(self._band_color)
-            tint.setAlpha(14)
+            tint.setAlpha(12)
             painter.fillRect(self.rect(), tint)
             painter.restore()
         else:
-            painter.fillPath(full_path, QBrush(QColor(14, 16, 22, 138)))
+            painter.fillPath(full_path, QBrush(QColor(10, 12, 18, 180)))
             tint = QColor(self._band_color)
-            tint.setAlpha(16)
+            tint.setAlpha(14)
             painter.fillPath(full_path, QBrush(tint))
 
-        # Resplandor exterior sutil del color de la banda estilo HUD
-        glow_c = QColor(self._band_color)
-        glow_c.setAlpha(38)
-        painter.setPen(QPen(glow_c, 2.8))
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawPath(full_path)
-
-        # Borde redondeado coloreado nítido estilo HUD
-        border_c = QColor(self._band_color)
-        border_c.setAlpha(190)
-        painter.setPen(QPen(border_c, 1.25))
-        painter.drawPath(full_path)
+        draw_liquid_glass_border_glow(painter, full_path, QRectF(0.0, 0.0, w, h), QColor(self._band_color))
 
     @staticmethod
     def _build_callout_path(w: float) -> QPainterPath:
@@ -1881,22 +2079,21 @@ class BandNodeCallout(QWidget):
         if self._building:
             return
         idx = self.overlay.selected_band_idx
-        with self.overlay.eq_engine.lock:
-            bands = self.overlay.eq_engine.bands
-            if not (0 <= idx < len(bands)):
-                self.hide()
-                return
-            b = bands[idx]
-            freq = b.freq
-            gain = b.gain_db
-            q = b.q
-            enabled = b.enabled
-            color = b.color
-            ftype = b.filter_type
-            cm = b.channel_mode
-            to_val = b.target_output
-            supports_gain = b.supports_gain
-            is_iso = bool(b.solo or self.overlay.eq_engine.isolated_band_index == idx)
+        bands = list(self.overlay.eq_engine.bands)
+        if not (0 <= idx < len(bands)):
+            self.hide()
+            return
+        b = bands[idx]
+        freq = b.freq
+        gain = b.gain_db
+        q = b.q
+        enabled = b.enabled
+        color = b.color
+        ftype = b.filter_type
+        cm = b.channel_mode
+        to_val = b.target_output
+        supports_gain = b.supports_gain
+        is_iso = bool(b.solo or self.overlay.eq_engine.isolated_band_index == idx)
 
         self._band_color = color
 
@@ -1933,34 +2130,39 @@ class BandNodeCallout(QWidget):
         self.menu_btn.setColor("#8E95A5")
 
         self.reposition()
-        self.show()
-        self.raise_()
-        self._sync_gl_bg()
-        self.update()
+        if not self.isVisible():
+            self.show()
+            self.raise_()
 
     def set_callout_opacity(self, op: float):
         self._current_opacity = float(np.clip(op, 0.0, 1.0))
         if hasattr(self, "_opacity_effect"):
-            self._opacity_effect.setOpacity(self._current_opacity)
+            if self._current_opacity >= 0.999:
+                if self._opacity_effect.isEnabled():
+                    self._opacity_effect.setEnabled(False)
+            else:
+                if not self._opacity_effect.isEnabled():
+                    self._opacity_effect.setEnabled(True)
+                self._opacity_effect.setOpacity(self._current_opacity)
         self._sync_gl_bg()
 
     def show_callout(self):
         self.set_callout_opacity(1.0)
         self.update_callout()
-        self.show()
+        if not self.isVisible():
+            self.show()
         self.raise_()
         self._sync_gl_bg()
 
     def reposition(self):
         idx = self.overlay.selected_band_idx
-        with self.overlay.eq_engine.lock:
-            bands = self.overlay.eq_engine.bands
-            if not (0 <= idx < len(bands)):
-                self.hide()
-                return
-            b = bands[idx]
-            vx = self.overlay.freq_to_x(b.freq)
-            vy = self.overlay._band_node_y(b)
+        bands = list(self.overlay.eq_engine.bands)
+        if not (0 <= idx < len(bands)):
+            self.hide()
+            return
+        b = bands[idx]
+        vx = self.overlay.freq_to_x(b.freq)
+        vy = self.overlay._band_node_y(b)
 
         scene_pt = self.overlay.eq_vb.mapViewToScene(QPointF(vx, vy))
         view_pt = self.overlay.plot_widget.mapFromScene(scene_pt)
@@ -1981,7 +2183,8 @@ class BandNodeCallout(QWidget):
         if target_y < min_y:
             target_y = int(view_pt.y() + 18)
 
-        self.move(clamped_x, target_y)
+        if self.x() != clamped_x or self.y() != target_y:
+            self.move(clamped_x, target_y)
         self._sync_gl_bg()
 
 
@@ -2201,6 +2404,8 @@ class FFTInspectorItem(QGraphicsItem):
         self._w = 120.0
         self._h = 22.0
         self._blur_pixmap = None
+        self._blur_frame_id = -1
+        self._blur_geom_key = None
         self._last_blur_time = 0.0
 
     def set_content(self, line1: str, line2: str = "", line2_color: QColor | None = None):
@@ -2224,7 +2429,7 @@ class FFTInspectorItem(QGraphicsItem):
         return self._w, self._h
 
     def boundingRect(self):
-        return QRectF(-3.0, -3.0, self._w + 6.0, self._h + 6.0)
+        return QRectF(-8.0, -8.0, self._w + 16.0, self._h + 16.0)
 
     def paint(self, painter, option, widget=None):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
@@ -2235,39 +2440,43 @@ class FFTInspectorItem(QGraphicsItem):
 
         accent = QColor(self._line2_color) if (self._line2_color and self._line2_color.isValid()) else QColor("#00E5FF")
 
-        now = time.perf_counter()
-        if (self._blur_pixmap is None or (now - self._last_blur_time) >= 0.032) and self.overlay is not None and self.plot_widget is not None:
-            self._last_blur_time = now
+        if self.overlay is not None and self.plot_widget is not None:
             pos = self.pos()
-            self._blur_pixmap = HUDOpenGLBackgroundItem.render_scene_blur_pixmap(
-                self.overlay, self.plot_widget, float(pos.x()), float(pos.y()), float(self._w), float(self._h), accent
-            )
+            px = float(pos.x())
+            py = float(pos.y())
+            now = time.perf_counter()
+            cur_fid = HUDOpenGLBackgroundItem._scene_blur_frame_id
+            geom_key = (int(round(px)), int(round(py)), int(round(self._w)), int(round(self._h)))
+            if (
+                self._blur_pixmap is None
+                or self._blur_frame_id != cur_fid
+                or self._blur_geom_key != geom_key
+                or (now - HUDOpenGLBackgroundItem._scene_blur_last_time) >= 0.014
+            ):
+                pix = HUDOpenGLBackgroundItem.render_scene_blur_pixmap(
+                    self.overlay, self.plot_widget, px, py, float(self._w), float(self._h), accent, corner_radius=7.0
+                )
+                if pix is not None:
+                    self._blur_pixmap = pix
+                    self._blur_frame_id = HUDOpenGLBackgroundItem._scene_blur_frame_id
+                    self._blur_geom_key = geom_key
 
         if self._blur_pixmap is not None and not self._blur_pixmap.isNull():
             painter.save()
             painter.setClipPath(clip)
             painter.drawPixmap(QRectF(0.0, 0.0, self._w, self._h).toRect(), self._blur_pixmap)
-            painter.fillRect(r, QColor(14, 16, 22, 134))
+            painter.fillRect(r, QColor(10, 12, 18, 96))
             tint = QColor(accent)
-            tint.setAlpha(18 if self._line2 else 14)
+            tint.setAlpha(14 if self._line2 else 12)
             painter.fillRect(r, tint)
             painter.restore()
         else:
-            painter.fillPath(clip, QBrush(QColor(14, 16, 22, 138)))
+            painter.fillPath(clip, QBrush(QColor(10, 12, 18, 180)))
             tint = QColor(accent)
-            tint.setAlpha(18 if self._line2 else 14)
+            tint.setAlpha(16 if self._line2 else 14)
             painter.fillPath(clip, QBrush(tint))
 
-        glow = QColor(accent)
-        glow.setAlpha(38)
-        painter.setPen(QPen(glow, 2.4))
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawPath(clip)
-
-        border = _brighten_color(accent, 0.12)
-        border.setAlpha(195)
-        painter.setPen(QPen(border, 1.25))
-        painter.drawPath(clip)
+        draw_liquid_glass_border_glow(painter, clip, QRectF(0.0, 0.0, self._w, self._h), accent)
 
         painter.setFont(self._font)
         from PyQt6.QtGui import QFontMetricsF
@@ -2308,6 +2517,7 @@ class ProQ4Overlay(QWidget):
         self.dragging_band_idx = -1
         self._drag_start_q = 1.0
         self._drag_start_scene_y = 0.0
+        self._last_drag_ui_time = 0.0
 
         self._last_rendered_version = -1
         self._was_dyn_moving = False
@@ -2618,8 +2828,7 @@ class ProQ4Overlay(QWidget):
                 g_type = "Notch" if g_db < -10.0 else "Bell"
 
             from eq_dsp import BAND_COLORS
-            with self.eq_engine.lock:
-                nb = len(self.eq_engine.bands)
+            nb = len(self.eq_engine.bands)
             col = QColor(BAND_COLORS[nb % len(BAND_COLORS)])
 
             if abs(g_db) < 0.05:
@@ -2650,15 +2859,14 @@ class ProQ4Overlay(QWidget):
         # --- 1. ZONA SEGURA AMPLIA PARA EL MENÚ DE NODO (Nodo + Callout + Margen 45px) ---
         if hasattr(self, "node_callout") and self.node_callout.isVisible():
             node_pt = None
-            with self.eq_engine.lock:
-                bands = self.eq_engine.bands
-                idx = self.selected_band_idx
-                if 0 <= idx < len(bands):
-                    b = bands[idx]
-                    vx = self.freq_to_x(b.freq)
-                    vy = self._band_node_y(b)
-                    scene_pt = self.eq_vb.mapViewToScene(QPointF(vx, vy))
-                    node_pt = self.plot_widget.mapFromScene(scene_pt)
+            bands = list(self.eq_engine.bands)
+            idx = self.selected_band_idx
+            if 0 <= idx < len(bands):
+                b = bands[idx]
+                vx = self.freq_to_x(b.freq)
+                vy = self._band_node_y(b)
+                scene_pt = self.eq_vb.mapViewToScene(QPointF(vx, vy))
+                node_pt = self.plot_widget.mapFromScene(scene_pt)
 
             if node_pt is not None:
                 # Unión Geométrica: círculo del nodo (radio 35px) + rectángulo del callout + margen 45px
@@ -2916,15 +3124,14 @@ class ProQ4Overlay(QWidget):
     def _find_band_near_scene_pos(self, scene_pos: QPointF, max_dist_px: float = 18.0) -> int:
         best_idx = -1
         best_dist = max_dist_px
-        with self.eq_engine.lock:
-            for idx, band in enumerate(self.eq_engine.bands):
-                vx = self.freq_to_x(band.freq)
-                vy = self._band_node_y(band)
-                node_scene = self.eq_vb.mapViewToScene(QPointF(vx, vy))
-                dist = float(np.hypot(node_scene.x() - scene_pos.x(), node_scene.y() - scene_pos.y()))
-                if dist < best_dist:
-                    best_dist = dist
-                    best_idx = idx
+        for idx, band in enumerate(list(self.eq_engine.bands)):
+            vx = self.freq_to_x(band.freq)
+            vy = self._band_node_y(band)
+            node_scene = self.eq_vb.mapViewToScene(QPointF(vx, vy))
+            dist = float(np.hypot(node_scene.x() - scene_pos.x(), node_scene.y() - scene_pos.y()))
+            if dist < best_dist:
+                best_dist = dist
+                best_idx = idx
         return best_idx
 
     def eventFilter(self, obj, event):
@@ -3050,10 +3257,13 @@ class ProQ4Overlay(QWidget):
                         band.update_coefficients()
                         self.eq_engine.mark_dirty()
 
-                self.band_modified.emit()
-                self.update_eq_curves(force=True)
-                if hasattr(self, "node_callout"):
-                    self.node_callout.reposition()
+                now = time.perf_counter()
+                if (now - self._last_drag_ui_time) >= 0.011:
+                    self._last_drag_ui_time = now
+                    self.band_modified.emit()
+                    self.update_eq_curves(force=True)
+                    if hasattr(self, "node_callout"):
+                        self.node_callout.reposition()
                 return True
             else:
                 hit_idx = self._find_band_near_scene_pos(scene_pos)
@@ -3085,8 +3295,10 @@ class ProQ4Overlay(QWidget):
                 if self._alt_isolate_dragging:
                     self._alt_isolate_dragging = False
                     self.eq_engine.set_isolated_band(None)
-                    self.band_modified.emit()
+                self.band_modified.emit()
                 self.update_eq_curves(force=True)
+                if hasattr(self, "node_callout") and self.node_callout.isVisible():
+                    self.node_callout.update_callout()
                 return True
 
         elif etype == QEvent.Type.Wheel:
@@ -3297,224 +3509,212 @@ class ProQ4Overlay(QWidget):
         Actualiza las curvas estáticas y dinámicas por banda permitiendo que las curvas de corte
         (Low Cut / High Cut) caigan hasta el fondo real del ViewBox (-infty) sin cortes abruptos.
         """
-        with self.eq_engine.lock:
-            bands = list(self.eq_engine.bands)
-            cur_version = self.eq_engine.static_version
-            any_dyn_moving = any(
-                b.enabled and b.is_dynamic_active and abs(b.current_dyn_offset_db) > 0.02
-                for b in bands
-            )
+        bands = list(self.eq_engine.bands)
+        cur_version = self.eq_engine.static_version
+        bypass = self.eq_engine.bypass
+        out_gain = self.eq_engine.output_gain_db
+        any_dyn_moving = any(
+            b.enabled and b.is_dynamic_active and abs(b.current_dyn_offset_db) > 0.02
+            for b in bands
+        )
 
-            if not force and cur_version == self._last_rendered_version and not any_dyn_moving and not self._was_dyn_moving:
-                return
+        if not force and cur_version == self._last_rendered_version and not any_dyn_moving and not self._was_dyn_moving:
+            return
 
-            self._last_rendered_version = cur_version
-            self._was_dyn_moving = any_dyn_moving
+        self._last_rendered_version = cur_version
+        self._was_dyn_moving = any_dyn_moving
 
-            x = self.eval_x
-            z1 = self.eval_z1
-            z2 = self.eval_z2
-            clip_lim = max(36.0, self._effective_eq_vb_limit() * 1.15)
+        x = self.eval_x
+        z1 = self.eval_z1
+        z2 = self.eval_z2
+        clip_lim = max(36.0, self._effective_eq_vb_limit() * 1.15)
 
+        if getattr(self, "_zero_line_bounds", None) != (float(x[0]), float(x[-1])):
+            self._zero_line_bounds = (float(x[0]), float(x[-1]))
             self.zero_line.setData([x[0], x[-1]], [0.0, 0.0])
 
-            total_static_db, _ = self.eq_engine.get_combined_responses_db(z1, z2)
+        while len(self.band_fill_curves) < len(bands):
+            st_item = pg.PlotDataItem(fillLevel=0.0)
+            st_item.setZValue(10)
+            self.eq_vb.addItem(st_item)
+            self.band_fill_curves.append(st_item)
 
-            while len(self.band_fill_curves) < len(bands):
-                st_item = pg.PlotDataItem(fillLevel=0.0)
-                st_item.setZValue(10)
-                self.eq_vb.addItem(st_item)
-                self.band_fill_curves.append(st_item)
+            dyn_item = pg.PlotDataItem()
+            dyn_item.setZValue(22)
+            self.eq_vb.addItem(dyn_item)
+            self.band_dyn_curves.append(dyn_item)
 
-                dyn_item = pg.PlotDataItem()
-                dyn_item.setZValue(22)
-                self.eq_vb.addItem(dyn_item)
-                self.band_dyn_curves.append(dyn_item)
+            fill_between = pg.FillBetweenItem(st_item, dyn_item, brush=pg.mkBrush(0, 0, 0, 0))
+            fill_between.setZValue(19)
+            self.eq_vb.addItem(fill_between)
+            self.band_dyn_fills.append(fill_between)
 
-                fill_between = pg.FillBetweenItem(st_item, dyn_item, brush=pg.mkBrush(0, 0, 0, 0))
-                fill_between.setZValue(19)
-                self.eq_vb.addItem(fill_between)
-                self.band_dyn_fills.append(fill_between)
+        while len(self.band_fill_curves) > len(bands):
+            fill_b = self.band_dyn_fills.pop()
+            self.eq_vb.removeItem(fill_b)
+            dyn_c = self.band_dyn_curves.pop()
+            self.eq_vb.removeItem(dyn_c)
+            st_c = self.band_fill_curves.pop()
+            self.eq_vb.removeItem(st_c)
 
-            while len(self.band_fill_curves) > len(bands):
-                fill_b = self.band_dyn_fills.pop()
-                self.eq_vb.removeItem(fill_b)
-                dyn_c = self.band_dyn_curves.pop()
-                self.eq_vb.removeItem(dyn_c)
-                st_c = self.band_fill_curves.pop()
-                self.eq_vb.removeItem(st_c)
+        for idx, b in enumerate(bands):
+            st_curve = self.band_fill_curves[idx]
+            dyn_curve = self.band_dyn_curves[idx]
+            dyn_fill = self.band_dyn_fills[idx]
 
-            for idx, b in enumerate(bands):
-                st_curve = self.band_fill_curves[idx]
-                dyn_curve = self.band_dyn_curves[idx]
-                dyn_fill = self.band_dyn_fills[idx]
+            is_sel = (idx == self.selected_band_idx)
+            if not b.enabled and not is_sel:
+                st_curve.setData([], [])
+                dyn_curve.setData([], [])
+                dyn_fill.setBrush(pg.mkBrush(0, 0, 0, 0))
+                continue
 
-                is_sel = (idx == self.selected_band_idx)
-                if not b.enabled and not is_sel:
-                    st_curve.setData([], [])
-                    dyn_curve.setData([], [])
-                    dyn_fill.setBrush(pg.mkBrush(0, 0, 0, 0))
-                    continue
+            resp_static = np.clip(b.get_static_freq_response_db(z1, z2), -clip_lim, clip_lim)
+            c = QColor(b.color)
 
-                resp_static = np.clip(b.get_static_freq_response_db(z1, z2), -clip_lim, clip_lim)
-                c = QColor(b.color)
+            is_active = is_sel or abs(b.gain_db) > 0.05 or not b.supports_gain or b.is_dynamic_active
 
-                is_active = is_sel or abs(b.gain_db) > 0.05 or not b.supports_gain or b.is_dynamic_active
+            if is_active:
+                pen_alpha = 220 if is_sel else (140 if b.enabled else 60)
+                fill_alpha = 48 if is_sel else (24 if b.enabled else 10)
+                pen_w = 2.0 if is_sel else 1.4
+                st_curve.setPen(pg.mkPen(color=(c.red(), c.green(), c.blue(), pen_alpha), width=pen_w))
+                st_curve.setBrush(pg.mkBrush(c.red(), c.green(), c.blue(), fill_alpha))
+            else:
+                # Inactiva (0 dB): trazo muy delgado (1.0px) y opacidad extremadamente baja (alpha=40)
+                pen_alpha = 40 if b.enabled else 20
+                st_curve.setPen(pg.mkPen(color=(c.red(), c.green(), c.blue(), pen_alpha), width=1.0))
+                st_curve.setBrush(pg.mkBrush(0, 0, 0, 0))
 
-                if is_active:
-                    pen_alpha = 220 if is_sel else (140 if b.enabled else 60)
-                    fill_alpha = 48 if is_sel else (24 if b.enabled else 10)
-                    pen_w = 2.0 if is_sel else 1.4
-                    st_curve.setPen(pg.mkPen(color=(c.red(), c.green(), c.blue(), pen_alpha), width=pen_w))
-                    st_curve.setBrush(pg.mkBrush(c.red(), c.green(), c.blue(), fill_alpha))
-                else:
-                    # Inactiva (0 dB): trazo muy delgado (1.0px) y opacidad extremadamente baja (alpha=40)
-                    pen_alpha = 40 if b.enabled else 20
-                    st_curve.setPen(pg.mkPen(color=(c.red(), c.green(), c.blue(), pen_alpha), width=1.0))
-                    st_curve.setBrush(pg.mkBrush(0, 0, 0, 0))
+            # Curva 100% continua de punta a punta (sin recortes ni np.nan)
+            st_curve.setData(x, resp_static)
 
-                # Curva 100% continua de punta a punta (sin recortes ni np.nan)
-                st_curve.setData(x, resp_static)
+            if b.enabled and b.is_dynamic_active and abs(b.current_dyn_offset_db) > 0.02 and not bypass:
+                resp_dyn = np.clip(b.get_dynamic_freq_response_db(z1, z2), -clip_lim, clip_lim)
+                bright_c = _brighten_color(c, 0.25)
+                dyn_curve.setPen(pg.mkPen(color=bright_c, width=2.0))
+                dyn_curve.setData(x, resp_dyn)
+                dyn_fill.setBrush(pg.mkBrush(c.red(), c.green(), c.blue(), 75))
+            else:
+                dyn_curve.setData([], [])
+                dyn_fill.setBrush(pg.mkBrush(0, 0, 0, 0))
 
-                if b.enabled and b.is_dynamic_active and abs(b.current_dyn_offset_db) > 0.02 and not self.eq_engine.bypass:
-                    resp_dyn = np.clip(b.get_dynamic_freq_response_db(z1, z2), -clip_lim, clip_lim)
-                    bright_c = _brighten_color(c, 0.25)
-                    dyn_curve.setPen(pg.mkPen(color=bright_c, width=2.0))
-                    dyn_curve.setData(x, resp_dyn)
-                    dyn_fill.setBrush(pg.mkBrush(c.red(), c.green(), c.blue(), 75))
-                else:
-                    dyn_curve.setData([], [])
-                    dyn_fill.setBrush(pg.mkBrush(0, 0, 0, 0))
-
-            if 0 <= self.selected_band_idx < len(bands):
-                sel_band = bands[self.selected_band_idx]
-                if sel_band.is_dynamic_active:
-                    sel_c = _brighten_color(sel_band.color, 0.15)
-                    sel_c.setAlpha(185)
-                    self.dyn_limit_curve.setPen(pg.mkPen(color=sel_c, width=1.4, style=Qt.PenStyle.DotLine))
-                    max_dyn_resp = np.clip(sel_band.get_max_dynamic_freq_response_db(z1, z2), -clip_lim, clip_lim)
-                    self.dyn_limit_curve.setData(x, max_dyn_resp)
-                else:
-                    self.dyn_limit_curve.setData([], [])
+        if 0 <= self.selected_band_idx < len(bands):
+            sel_band = bands[self.selected_band_idx]
+            if sel_band.is_dynamic_active:
+                sel_c = _brighten_color(sel_band.color, 0.15)
+                sel_c.setAlpha(185)
+                self.dyn_limit_curve.setPen(pg.mkPen(color=sel_c, width=1.4, style=Qt.PenStyle.DotLine))
+                max_dyn_resp = np.clip(sel_band.get_max_dynamic_freq_response_db(z1, z2), -clip_lim, clip_lim)
+                self.dyn_limit_curve.setData(x, max_dyn_resp)
             else:
                 self.dyn_limit_curve.setData([], [])
+        else:
+            self.dyn_limit_curve.setData([], [])
 
-            static_a_db, _ = self.eq_engine.get_combined_responses_db(z1, z2, target_bus="A")
-            static_b_db, _ = self.eq_engine.get_combined_responses_db(z1, z2, target_bus="B")
+        static_a_db, _ = self.eq_engine.get_combined_responses_db(z1, z2, target_bus="A")
+        static_b_db, _ = self.eq_engine.get_combined_responses_db(z1, z2, target_bus="B")
 
-            # Independencia absoluta de la perilla OUT:
-            # Nunca se suma al cálculo de los dB visuales en el gráfico.
-            # Las curvas pasan exactamente por el centro físico de cada nodo y se anclan en 0.0 dB.
-            if not self.eq_engine.bypass:
-                out_gain = self.eq_engine.output_gain_db
-                static_a_db = static_a_db - out_gain
-                static_b_db = static_b_db - out_gain
+        # Independencia absoluta de la perilla OUT:
+        # Nunca se suma al cálculo de los dB visuales en el gráfico.
+        # Las curvas pasan exactamente por el centro físico de cada nodo y se anclan en 0.0 dB.
+        if not bypass:
+            static_a_db = static_a_db - out_gain
+            static_b_db = static_b_db - out_gain
 
-            static_clipped_a = np.clip(static_a_db, -clip_lim, clip_lim)
-            static_clipped_b = np.clip(static_b_db, -clip_lim, clip_lim)
+        static_clipped_a = np.clip(static_a_db, -clip_lim, clip_lim)
+        static_clipped_b = np.clip(static_b_db, -clip_lim, clip_lim)
 
-            # Curva Maestra Bus A (Amarilla): 100% continua de punta a punta, sin np.nan
-            self.static_master_curve.setData(x, static_clipped_a)
+        # Curva Maestra Bus A (Amarilla): 100% continua de punta a punta, sin np.nan
+        self.static_master_curve.setData(x, static_clipped_a)
 
-            # Curva Maestra Bus B (Cian): continua de punta a punta si difiere de Bus A o si hay bandas asignadas a Bus B
-            b_differs = np.any(np.abs(static_clipped_b - static_clipped_a) > 0.02)
-            has_b_routed = any(getattr(b, 'target_output', 'A') in ('B', 'A+B') for b in bands)
-            if b_differs or has_b_routed:
-                self.static_bus_b_curve.setData(x, static_clipped_b)
-            else:
-                self.static_bus_b_curve.setData([], [])
+        # Curva Maestra Bus B (Cian): continua de punta a punta si difiere de Bus A o si hay bandas asignadas a Bus B
+        b_differs = np.any(np.abs(static_clipped_b - static_clipped_a) > 0.02)
+        has_b_routed = any(getattr(b, 'target_output', 'A') in ('B', 'A+B') for b in bands)
+        if b_differs or has_b_routed:
+            self.static_bus_b_curve.setData(x, static_clipped_b)
+        else:
+            self.static_bus_b_curve.setData([], [])
 
-            node_spots = []
-            dyn_spots = []
+        node_spots = []
+        dyn_spots = []
 
-            while len(self.node_labels) < len(bands):
-                lbl = pg.TextItem(anchor=(0.5, 0.5), color="#0B0D12")
-                font = QFont("Segoe UI", 8, QFont.Weight.Bold)
-                lbl.setFont(font)
-                lbl.setZValue(50)
-                self.eq_vb.addItem(lbl)
-                self.node_labels.append(lbl)
-            while len(self.node_labels) > len(bands):
-                lbl = self.node_labels.pop()
-                self.eq_vb.removeItem(lbl)
+        while len(self.node_labels) < len(bands):
+            lbl = pg.TextItem(anchor=(0.5, 0.5), color="#0B0D12")
+            font = QFont("Segoe UI", 8, QFont.Weight.Bold)
+            lbl.setFont(font)
+            lbl.setZValue(50)
+            self.eq_vb.addItem(lbl)
+            self.node_labels.append(lbl)
+        while len(self.node_labels) > len(bands):
+            lbl = self.node_labels.pop()
+            self.eq_vb.removeItem(lbl)
 
-            for idx, band in enumerate(bands):
-                nx = self.freq_to_x(band.freq)
-                ny = self._band_node_y(band)
-                c = QColor(band.color)
-                if not band.enabled:
-                    c = QColor("#555D6E")
+        for idx, band in enumerate(bands):
+            nx = self.freq_to_x(band.freq)
+            ny = self._band_node_y(band)
+            c = QColor(band.color)
+            if not band.enabled:
+                c = QColor("#555D6E")
 
-                is_sel = (idx == self.selected_band_idx)
-                is_hov = (idx == self.hovered_band_idx)
-                size = 20 if (is_sel or is_hov) else 16
-                border_pen = pg.mkPen("#FFFFFF", width=2.2) if is_sel else pg.mkPen("#12141C", width=1.3)
+            is_sel = (idx == self.selected_band_idx)
+            is_hov = (idx == self.hovered_band_idx)
+            size = 20 if (is_sel or is_hov) else 16
+            border_pen = pg.mkPen("#FFFFFF", width=2.2) if is_sel else pg.mkPen("#12141C", width=1.3)
 
-                node_spots.append({
-                    "pos": (nx, ny),
-                    "size": size,
-                    "pen": border_pen,
-                    "brush": pg.mkBrush(c),
-                })
+            node_spots.append({
+                "pos": (nx, ny),
+                "size": size,
+                "pen": border_pen,
+                "brush": pg.mkBrush(c),
+            })
 
-                lbl = self.node_labels[idx]
-                lbl.setText(str(idx + 1))
-                lbl.setPos(nx, ny)
+            lbl = self.node_labels[idx]
+            lbl_txt = str(idx + 1)
+            if getattr(lbl, "_last_txt", None) != lbl_txt:
+                lbl._last_txt = lbl_txt
+                lbl.setText(lbl_txt)
+            lbl.setPos(nx, ny)
+            if not lbl.isVisible():
                 lbl.show()
 
-                if band.is_dynamic_active and band.enabled:
-                    dyn_y = float(np.clip(ny + band.current_dyn_offset_db, -self.eq_range_db, self.eq_range_db))
-                    ring_c = _brighten_color(band.color, 0.25)
-                    dyn_spots.append({
-                        "pos": (nx, dyn_y),
-                        "size": size + 8,
-                        "pen": pg.mkPen(color=ring_c, width=2.0),
-                        "brush": pg.mkBrush(0, 0, 0, 0),
-                    })
+            if band.is_dynamic_active and band.enabled:
+                dyn_y = float(np.clip(ny + band.current_dyn_offset_db, -self.eq_range_db, self.eq_range_db))
+                ring_c = _brighten_color(band.color, 0.25)
+                dyn_spots.append({
+                    "pos": (nx, dyn_y),
+                    "size": size + 8,
+                    "pen": pg.mkPen(color=ring_c, width=2.0),
+                    "brush": pg.mkBrush(0, 0, 0, 0),
+                })
 
-            self.nodes_scatter.setData(node_spots)
-            self.dyn_nodes_scatter.setData(dyn_spots)
+        self.nodes_scatter.setData(node_spots)
+        self.dyn_nodes_scatter.setData(dyn_spots)
+        self.floating_tooltip.hide()
 
-            active_idx = self.dragging_band_idx if self.dragging_band_idx >= 0 else self.hovered_band_idx
-            if 0 <= active_idx < len(bands):
-                b = bands[active_idx]
-                nx = self.freq_to_x(b.freq)
-                ny = self._band_node_y(b)
-                freq_str = f"{b.freq / 1000.0:.2f} kHz" if b.freq >= 1000.0 else f"{b.freq:.0f} Hz"
-                dyn_str = f" | ΔG: {b.current_dyn_offset_db:+.1f} dB" if b.is_dynamic_active else ""
-                ch_str = f" &bull; [{b.channel_mode}]" if b.channel_mode != "LR" else ""
-                bus_str = f" &bull; [Out {b.target_output}]" if b.target_output != "A+B" else ""
-                iso_str = " &bull; ISOLATE" if (b.solo or self.eq_engine.isolated_band_index == active_idx) else ""
-                html = (
-                    f"<div style='background-color: rgba(24, 24, 28, 235); "
-                    f"border: 1px solid {b.color}; border-radius: 5px; padding: 2px 7px; "
-                    f"font-family: Segoe UI, sans-serif; font-size: 10px; color: #ECEFF4;'>"
-                    f"<b style='color:{b.color};'>Band {active_idx + 1}</b> "
-                    f"{freq_str} &bull; {b.gain_db:+.1f} dB &bull; Q {b.q:.2f}{ch_str}{bus_str}{dyn_str}{iso_str}</div>"
-                )
-                self.floating_tooltip.hide()
+        if hasattr(self, "node_callout"):
+            if 0 <= self.selected_band_idx < len(bands):
+                if force or self.node_callout.isVisible():
+                    self.node_callout.update_callout()
             else:
-                self.floating_tooltip.hide()
-
-            if hasattr(self, "node_callout"):
-                if 0 <= self.selected_band_idx < len(bands):
-                    if force or self.node_callout.isVisible():
-                        self.node_callout.update_callout()
-                else:
-                    self.node_callout.hide()
+                self.node_callout.hide()
 
 
 class HUDOpenGLBackgroundItem(QGraphicsItem):
     """
-    Fondo translúcido del HUD con Gaussian Blur en tiempo real (1/8-scale separable blur)
-    renderizado en la escena OpenGL de la FFT sin bloqueos glReadPixels:
-    - Rasteriza la región bajo el HUD en un mini-buffer (1/8 resolución) y aplica un kernel
-      Gaussiano 1D separable en NumPy (< 0.05 ms).
-    - Superpone el vidrio oscuro translúcido rgba(14, 16, 22, 138) y el borde/resplandor
-      coloreado de la banda activa.
+    Fondo translúcido Apple Liquid Glass con Gaussian Blur compartido a 60 FPS (1/8-scale separable blur)
+    y halo difuso coloreado:
+    - Rasteriza el lienzo completo una sola vez por fotograma (60 FPS) en un buffer compartido
+      (0 bucles Python QPointF usando pg.arrayToQPath) y todos los widgets/popups muestrean de él.
+    - Superpone vidrio oscuro esmerilado preservando contraste y colores saturados del fondo.
     """
 
     _GAUSS_KERNEL = np.array([0.0545, 0.2442, 0.4026, 0.2442, 0.0545], dtype=np.float32)
+    _scene_blur_frame_id: int = 0
+    _scene_blur_last_time: float = 0.0
+    _scene_blur_cache_key = None
+    _scene_blur_arr: np.ndarray | None = None
+    _scene_blur_dims: tuple[float, float, float, float, int, int] = (0.0, 0.0, 1.0, 1.0, 1, 1)
 
     def __init__(self, overlay=None, plot_widget=None):
         super().__init__()
@@ -3529,11 +3729,13 @@ class HUDOpenGLBackgroundItem(QGraphicsItem):
         self._custom_path = None
         self._cached_path = QPainterPath()
         self._blur_pixmap = None
+        self._blur_frame_id = -1
+        self._blur_geom_key = None
         self._last_blur_time = 0.0
         self._rebuild_path()
 
     def boundingRect(self) -> QRectF:
-        return self._rect.adjusted(-6.0, -6.0, 6.0, 6.0)
+        return self._rect.adjusted(-10.0, -10.0, 10.0, 10.0)
 
     def set_custom_shape(self, scene_pos: QPointF, width: float, height: float, custom_path: QPainterPath, active_color: QColor):
         pos_changed = (self.pos() - scene_pos).manhattanLength() > 0.5
@@ -3551,11 +3753,10 @@ class HUDOpenGLBackgroundItem(QGraphicsItem):
             self._cached_path = QPainterPath(custom_path)
             self._active_color = c
             self._last_blur_time = 0.0
+            self._blur_geom_key = None
             self.update()
         elif self._active_color != c or pos_changed:
             self._active_color = c
-            if pos_changed:
-                self._last_blur_time = 0.0
             self.update()
 
     def set_state(self, scene_pos: QPointF, width: float, height: float, is_minimized: bool, active_color: QColor, gain_cx: float):
@@ -3578,11 +3779,10 @@ class HUDOpenGLBackgroundItem(QGraphicsItem):
             self._active_color = c
             self._rebuild_path()
             self._last_blur_time = 0.0
+            self._blur_geom_key = None
             self.update()
         elif self._active_color != c or pos_changed:
             self._active_color = c
-            if pos_changed:
-                self._last_blur_time = 0.0
             self.update()
 
     def _rebuild_path(self):
@@ -3662,12 +3862,79 @@ class HUDOpenGLBackgroundItem(QGraphicsItem):
         return arr
 
     @classmethod
-    def render_scene_blur_pixmap(cls, overlay, plot_widget, hx: float, hy: float, w: float, h: float, fallback_color: QColor | None = None) -> QPixmap | None:
-        if w <= 4.0 or h <= 4.0 or overlay is None or plot_widget is None:
+    def invalidate_scene_blur_cache(cls, overlay=None, plot_widget=None):
+        cls._scene_blur_frame_id += 1
+        cls._scene_blur_cache_key = None
+        _HUDPopupGLHelper.repaint_active_popups()
+        if overlay is not None:
+            insp = getattr(overlay, "fft_inspector", None)
+            if insp is not None and insp.isVisible():
+                insp.update()
+            nc = getattr(overlay, "node_callout", None)
+            if nc is not None and nc.isVisible():
+                nc_bg = getattr(nc, "_bg_gl_item", None)
+                if nc_bg is not None and nc_bg.isVisible():
+                    nc_bg.update()
+                else:
+                    nc.update()
+            hud_c = getattr(overlay, "hud_container", None)
+            hud = getattr(hud_c, "floating_hud", None) if hud_c is not None else None
+            if hud is not None and hud.isVisible():
+                hud_bg = getattr(hud, "_bg_gl_item", None)
+                if hud_bg is not None and hud_bg.isVisible():
+                    hud_bg.update()
+                else:
+                    hud.update()
+
+    @staticmethod
+    def _fast_fill_and_stroke_paths(bx_arr: np.ndarray, by_arr: np.ndarray, y_base: float | None = None):
+        bx = np.asarray(bx_arr, dtype=np.float64)
+        by = np.asarray(by_arr, dtype=np.float64)
+        if not (np.all(np.isfinite(bx)) and np.all(np.isfinite(by))):
+            m = np.isfinite(bx) & np.isfinite(by)
+            bx = bx[m]
+            by = by[m]
+        if len(bx) < 2:
+            return None, None
+        stroke_path = pg.arrayToQPath(bx, by, connect="all", finiteCheck=False)
+        if y_base is None:
+            return stroke_path, None
+        n = len(bx)
+        x_fill = np.empty(n + 2, dtype=np.float64)
+        y_fill = np.empty(n + 2, dtype=np.float64)
+        x_fill[0] = bx[0]
+        x_fill[1:-1] = bx
+        x_fill[-1] = bx[-1]
+        y_fill[0] = float(y_base)
+        y_fill[1:-1] = by
+        y_fill[-1] = float(y_base)
+        fill_path = pg.arrayToQPath(x_fill, y_fill, connect="all", finiteCheck=False)
+        fill_path.closeSubpath()
+        return stroke_path, fill_path
+
+    @classmethod
+    def _ensure_scene_blur_buffer(cls, overlay, plot_widget):
+        if overlay is None or plot_widget is None:
             return None
 
-        bw = max(16, int(round(w / 8.0)))
-        bh = max(6, int(round(h / 8.0)))
+        vb = plot_widget.plotItem.vb
+        vb_rect = vb.sceneBoundingRect()
+        vx = float(vb_rect.left())
+        vy = float(vb_rect.top())
+        vw = max(1.0, float(vb_rect.width()))
+        vh = max(1.0, float(vb_rect.height()))
+
+        now = time.perf_counter()
+        if cls._scene_blur_cache_key is not None and (now - cls._scene_blur_last_time) >= 0.014:
+            cls._scene_blur_frame_id += 1
+            cls._scene_blur_cache_key = None
+
+        cache_key = (cls._scene_blur_frame_id, id(plot_widget), round(vw, 1), round(vh, 1))
+        if cls._scene_blur_cache_key == cache_key and cls._scene_blur_arr is not None:
+            return cls._scene_blur_arr, cls._scene_blur_dims
+
+        full_bw = max(32, int(round(vw / 8.0)))
+        full_bh = max(16, int(round(vh / 8.0)))
 
         app_win = plot_widget.window() if plot_widget is not None else None
         bg_hex = "#141414"
@@ -3676,47 +3943,49 @@ class HUDOpenGLBackgroundItem(QGraphicsItem):
         bg_base = QColor(bg_hex)
         if not bg_base.isValid():
             bg_base = QColor(14, 16, 22, 255)
+        bg_dark = QColor(
+            int(round(bg_base.red() * 0.90)),
+            int(round(bg_base.green() * 0.90)),
+            int(round(bg_base.blue() * 0.90)),
+            255,
+        )
 
-        img = QImage(bw, bh, QImage.Format.Format_ARGB32_Premultiplied)
-        img.fill(bg_base)
+        img = QImage(full_bw, full_bh, QImage.Format.Format_ARGB32_Premultiplied)
+        img.fill(bg_dark)
 
         ip = QPainter(img)
         ip.setRenderHint(QPainter.RenderHint.Antialiasing, True)
 
-        sx = float(bw) / w
-        sy = float(bh) / h
-        active_col = fallback_color if fallback_color is not None else QColor("#00E5FF")
+        fbw = float(full_bw)
+        fbh = float(full_bh)
 
         try:
-            vb = plot_widget.plotItem.vb
-            vb_rect = vb.sceneBoundingRect()
-            vx = float(vb_rect.left())
-            vy = float(vb_rect.top())
-            vw = max(1.0, float(vb_rect.width()))
-            vh = max(1.0, float(vb_rect.height()))
             view_range = vb.viewRange()
             xmin, xmax = float(view_range[0][0]), float(view_range[0][1])
             ymin, ymax = float(view_range[1][0]), float(view_range[1][1])
             dx = max(1e-6, xmax - xmin)
             dy = max(1e-6, ymax - ymin)
 
-            # 1. Líneas de grilla bajo la transparencia
-            grid_pen = QPen(QColor(55, 62, 78, 120), 1.0)
-            ip.setPen(grid_pen)
+            # 1. Líneas de grilla sutiles bajo el vidrio
+            ip.setPen(QPen(QColor(60, 66, 82, 50), 0.55))
             for db_grid in (-18.0, -36.0, -54.0, -72.0, -90.0, -108.0):
                 if ymin <= db_grid <= ymax:
-                    gy_scene = vy + (ymax - db_grid) / dy * vh
-                    ly = (gy_scene - hy) * sy
-                    if 0.0 <= ly <= bh:
-                        ip.drawLine(QPointF(0.0, ly), QPointF(float(bw), ly))
+                    ly = (ymax - db_grid) / dy * fbh
+                    if 0.0 <= ly <= fbh:
+                        ip.drawLine(QPointF(0.0, ly), QPointF(fbw, ly))
 
-            # 2. Curvas FFT activas (incluyendo curvas dinámicas del analizador: In 1, In 2, Out 1, Out 2 y RTA)
+            # 2. Curvas FFT activas (In 1, In 2, Out 1, Out 2 y RTA) sin sobreiluminación ni bloat
             fft_list = list(getattr(overlay, "fft_curves", []))
             if app_win is not None:
                 for attr_name in ("fft_curve_in", "fft_curve_in2", "fft_curve_out2", "fft_curve_out1", "rta_curve_item"):
                     c_obj = getattr(app_win, attr_name, None)
                     if c_obj is not None and c_obj not in fft_list:
                         fft_list.append(c_obj)
+
+            c_in_item = getattr(app_win, "fft_curve_in", None) if app_win is not None else None
+            c_in2_item = getattr(app_win, "fft_curve_in2", None) if app_win is not None else None
+            c_out2_item = getattr(app_win, "fft_curve_out2", None) if app_win is not None else None
+            c_rta_item = getattr(app_win, "rta_curve_item", None) if app_win is not None else None
 
             for entry in fft_list:
                 if isinstance(entry, dict):
@@ -3739,25 +4008,39 @@ class HUDOpenGLBackgroundItem(QGraphicsItem):
                 step = max(1, len(xd) // 72)
                 xs = xd[::step]
                 ys = yd[::step]
-                bx_arr = ((vx + (xs - xmin) / dx * vw) - hx) * sx
-                by_arr = ((vy + (ymax - ys) / dy * vh) - hy) * sy
+                bx_arr = ((xs - xmin) / dx) * fbw
+                by_arr = ((ymax - ys) / dy) * fbh
                 c_fft = QColor(c_hex) if isinstance(c_hex, str) else QColor(c_hex)
                 if not c_fft.isValid():
                     c_fft = QColor("#00E5FF")
 
-                poly = QPolygonF()
-                poly.append(QPointF(float(bx_arr[0]), float(bh + 4)))
-                for px_v, py_v in zip(bx_arr, by_arr):
-                    poly.append(QPointF(float(px_v), float(py_v)))
-                poly.append(QPointF(float(bx_arr[-1]), float(bh + 4)))
+                if curve_item is c_rta_item:
+                    fill_alpha = 0
+                elif curve_item is c_in_item:
+                    fill_alpha = 38
+                elif curve_item is c_in2_item or curve_item is c_out2_item:
+                    fill_alpha = 68
+                else:
+                    fill_alpha = 82
 
-                fill_c = QColor(c_fft)
-                fill_c.setAlpha(105)
-                stroke_c = _brighten_color(c_fft, 0.28)
-                stroke_c.setAlpha(245)
-                ip.setBrush(QBrush(fill_c))
-                ip.setPen(QPen(stroke_c, 2.2))
-                ip.drawPolygon(poly)
+                stroke_path, fill_path = cls._fast_fill_and_stroke_paths(
+                    bx_arr, by_arr, y_base=(fbh + 4.0) if fill_alpha > 0 else None
+                )
+                if stroke_path is None:
+                    continue
+
+                if fill_path is not None and fill_alpha > 0:
+                    fill_c = QColor(c_fft)
+                    fill_c.setAlpha(fill_alpha)
+                    ip.setPen(Qt.PenStyle.NoPen)
+                    ip.setBrush(QBrush(fill_c))
+                    ip.drawPath(fill_path)
+
+                stroke_c = QColor(c_fft)
+                stroke_c.setAlpha(230)
+                ip.setBrush(Qt.BrushStyle.NoBrush)
+                ip.setPen(QPen(stroke_c, 1.35))
+                ip.drawPath(stroke_path)
 
             # 3. Curvas EQ estáticas y dinámicas bajo la transparencia
             eq_vb = getattr(overlay, "eq_vb", None)
@@ -3765,40 +4048,52 @@ class HUDOpenGLBackgroundItem(QGraphicsItem):
                 eq_range = eq_vb.viewRange()
                 eymin, eymax = float(eq_range[1][0]), float(eq_range[1][1])
                 edy = max(1e-6, eymax - eymin)
-                y0_local = ((vy + (eymax - 0.0) / edy * vh) - hy) * sy
+                y0_local = ((eymax - 0.0) / edy) * fbh
 
                 band_fill_list = getattr(overlay, "band_fill_curves", [])
                 band_dyn_list = getattr(overlay, "band_dyn_curves", [])
 
+                bands_list = getattr(overlay.eq_engine, "bands", ())
+                sel_b_idx = getattr(overlay, "selected_band_idx", -1)
                 for b_idx, st_c in enumerate(band_fill_list):
                     if not st_c.isVisible():
                         continue
+                    if b_idx < len(bands_list):
+                        b_obj = bands_list[b_idx]
+                        if not b_obj.enabled or (
+                            b_idx != sel_b_idx
+                            and abs(b_obj.gain_db) <= 0.05
+                            and b_obj.supports_gain
+                            and not b_obj.is_dynamic_active
+                        ):
+                            continue
                     xd, yd = st_c.getData()
                     if xd is None or yd is None or len(xd) < 4:
                         continue
                     step = max(1, len(xd) // 64)
                     xs = xd[::step]
                     ys = yd[::step]
-                    bx_arr = ((vx + (xs - xmin) / dx * vw) - hx) * sx
-                    by_arr = ((vy + (eymax - ys) / edy * vh) - hy) * sy
+                    bx_arr = ((xs - xmin) / dx) * fbw
+                    by_arr = ((eymax - ys) / edy) * fbh
 
-                    b_col = QColor(active_col)
-                    if b_idx < len(overlay.eq_engine.bands):
-                        b_col = QColor(overlay.eq_engine.bands[b_idx].color)
+                    b_col = QColor("#00E5FF")
+                    if b_idx < len(bands_list):
+                        b_col = QColor(bands_list[b_idx].color)
 
-                    poly = QPolygonF()
-                    poly.append(QPointF(float(bx_arr[0]), float(y0_local)))
-                    for px_v, py_v in zip(bx_arr, by_arr):
-                        poly.append(QPointF(float(px_v), float(py_v)))
-                    poly.append(QPointF(float(bx_arr[-1]), float(y0_local)))
+                    stroke_path, fill_path = cls._fast_fill_and_stroke_paths(bx_arr, by_arr, y_base=y0_local)
+                    if stroke_path is not None:
+                        if fill_path is not None:
+                            fc = QColor(b_col)
+                            fc.setAlpha(62 if b_idx == sel_b_idx else 36)
+                            ip.setPen(Qt.PenStyle.NoPen)
+                            ip.setBrush(QBrush(fc))
+                            ip.drawPath(fill_path)
 
-                    fc = QColor(b_col)
-                    fc.setAlpha(95)
-                    sc = QColor(b_col)
-                    sc.setAlpha(225)
-                    ip.setBrush(QBrush(fc))
-                    ip.setPen(QPen(sc, 1.8))
-                    ip.drawPolygon(poly)
+                        sc = QColor(b_col)
+                        sc.setAlpha(215)
+                        ip.setBrush(Qt.BrushStyle.NoBrush)
+                        ip.setPen(QPen(sc, 1.15))
+                        ip.drawPath(stroke_path)
 
                     # Curva Dynamic EQ en vivo y sombreado entre curva estática y dinámica
                     if b_idx < len(band_dyn_list):
@@ -3809,22 +4104,35 @@ class HUDOpenGLBackgroundItem(QGraphicsItem):
                                 dstep = max(1, len(dxd) // 64)
                                 dxs = dxd[::dstep]
                                 dys = dyd[::dstep]
-                                dbx_arr = ((vx + (dxs - xmin) / dx * vw) - hx) * sx
-                                dby_arr = ((vy + (eymax - dys) / edy * vh) - hy) * sy
+                                dbx_arr = ((dxs - xmin) / dx) * fbw
+                                dby_arr = ((eymax - dys) / edy) * fbh
+                                bx_f64 = np.asarray(bx_arr, dtype=np.float64)
+                                by_f64 = np.asarray(by_arr, dtype=np.float64)
+                                dbx_f64 = np.asarray(dbx_arr, dtype=np.float64)
+                                dby_f64 = np.asarray(dby_arr, dtype=np.float64)
+                                if (
+                                    np.all(np.isfinite(bx_f64))
+                                    and np.all(np.isfinite(by_f64))
+                                    and np.all(np.isfinite(dbx_f64))
+                                    and np.all(np.isfinite(dby_f64))
+                                ):
+                                    x_dyn = np.concatenate([bx_f64, dbx_f64[::-1]])
+                                    y_dyn = np.concatenate([by_f64, dby_f64[::-1]])
+                                    dyn_fill_path = pg.arrayToQPath(x_dyn, y_dyn, connect="all", finiteCheck=False)
+                                    dyn_fill_path.closeSubpath()
+                                    dyn_stroke_path = pg.arrayToQPath(dbx_f64, dby_f64, connect="all", finiteCheck=False)
 
-                                dyn_poly = QPolygonF()
-                                for px_v, py_v in zip(bx_arr, by_arr):
-                                    dyn_poly.append(QPointF(float(px_v), float(py_v)))
-                                for rpx_v, rpy_v in zip(reversed(dbx_arr), reversed(dby_arr)):
-                                    dyn_poly.append(QPointF(float(rpx_v), float(rpy_v)))
+                                    dfc = QColor(b_col)
+                                    dfc.setAlpha(88)
+                                    ip.setPen(Qt.PenStyle.NoPen)
+                                    ip.setBrush(QBrush(dfc))
+                                    ip.drawPath(dyn_fill_path)
 
-                                dfc = _brighten_color(b_col, 0.20)
-                                dfc.setAlpha(135)
-                                dsc = _brighten_color(b_col, 0.35)
-                                dsc.setAlpha(250)
-                                ip.setBrush(QBrush(dfc))
-                                ip.setPen(QPen(dsc, 2.2))
-                                ip.drawPolygon(dyn_poly)
+                                    dsc = QColor(b_col)
+                                    dsc.setAlpha(235)
+                                    ip.setBrush(Qt.BrushStyle.NoBrush)
+                                    ip.setPen(QPen(dsc, 1.25))
+                                    ip.drawPath(dyn_stroke_path)
 
                 # Curva de límite máximo de rango dinámico (dyn_limit_curve)
                 lim_c = getattr(overlay, "dyn_limit_curve", None)
@@ -3834,22 +4142,21 @@ class HUDOpenGLBackgroundItem(QGraphicsItem):
                         lstep = max(1, len(lxd) // 64)
                         lxs = lxd[::lstep]
                         lys = lyd[::lstep]
-                        lbx = ((vx + (lxs - xmin) / dx * vw) - hx) * sx
-                        lby = ((vy + (eymax - lys) / edy * vh) - hy) * sy
-                        lpoly = QPolygonF([QPointF(float(px_v), float(py_v)) for px_v, py_v in zip(lbx, lby)])
-                        lcol = _brighten_color(active_col, 0.25)
-                        lcol.setAlpha(215)
-                        ip.setBrush(Qt.BrushStyle.NoBrush)
-                        ip.setPen(QPen(lcol, 1.6, Qt.PenStyle.DotLine))
-                        ip.drawPolyline(lpoly)
+                        lbx = ((lxs - xmin) / dx) * fbw
+                        lby = ((eymax - lys) / edy) * fbh
+                        lpath, _ = cls._fast_fill_and_stroke_paths(lbx, lby, y_base=None)
+                        if lpath is not None:
+                            lcol = QColor("#00E5FF")
+                            if 0 <= sel_b_idx < len(bands_list):
+                                lcol = QColor(bands_list[sel_b_idx].color)
+                            lcol.setAlpha(190)
+                            ip.setBrush(Qt.BrushStyle.NoBrush)
+                            ip.setPen(QPen(lcol, 0.95, Qt.PenStyle.DotLine))
+                            ip.drawPath(lpath)
 
                 # Curva Fantasma sugerida (ghost_curve)
                 ghost_c = getattr(overlay, "ghost_curve", None)
                 if ghost_c is not None and ghost_c.isVisible() and not ghost_c.path.isEmpty():
-                    g_col = QColor(245, 195, 85, 185)
-                    ip.setBrush(Qt.BrushStyle.NoBrush)
-                    ip.setPen(QPen(g_col, 1.8))
-                    # Muestreo ligero de la curva fantasma
                     ex = getattr(overlay, "eval_x", None)
                     if ex is not None and len(ex) >= 4 and getattr(overlay, "_proposed_band", None) is not None:
                         try:
@@ -3859,10 +4166,13 @@ class HUDOpenGLBackgroundItem(QGraphicsItem):
                             gstep = max(1, len(ex) // 48)
                             gxs = ex[::gstep]
                             gys = gy[::gstep]
-                            gbx = ((vx + (gxs - xmin) / dx * vw) - hx) * sx
-                            gby = ((vy + (eymax - gys) / edy * vh) - hy) * sy
-                            gpoly = QPolygonF([QPointF(float(px_v), float(py_v)) for px_v, py_v in zip(gbx, gby)])
-                            ip.drawPolyline(gpoly)
+                            gbx = ((gxs - xmin) / dx) * fbw
+                            gby = ((eymax - gys) / edy) * fbh
+                            gpath, _ = cls._fast_fill_and_stroke_paths(gbx, gby, y_base=None)
+                            if gpath is not None:
+                                ip.setBrush(Qt.BrushStyle.NoBrush)
+                                ip.setPen(QPen(QColor(245, 195, 85, 180), 1.05))
+                                ip.drawPath(gpath)
                         except Exception:
                             pass
 
@@ -3878,14 +4188,15 @@ class HUDOpenGLBackgroundItem(QGraphicsItem):
                     step = max(1, len(xd) // 64)
                     xs = xd[::step]
                     ys = yd[::step]
-                    bx_arr = ((vx + (xs - xmin) / dx * vw) - hx) * sx
-                    by_arr = ((vy + (eymax - ys) / edy * vh) - hy) * sy
-                    poly = QPolygonF([QPointF(float(px_v), float(py_v)) for px_v, py_v in zip(bx_arr, by_arr)])
-                    pen_c = QColor(m_col_fb)
-                    pen_c.setAlpha(245)
-                    ip.setBrush(Qt.BrushStyle.NoBrush)
-                    ip.setPen(QPen(pen_c, 2.2))
-                    ip.drawPolyline(poly)
+                    bx_arr = ((xs - xmin) / dx) * fbw
+                    by_arr = ((eymax - ys) / edy) * fbh
+                    mpath, _ = cls._fast_fill_and_stroke_paths(bx_arr, by_arr, y_base=None)
+                    if mpath is not None:
+                        pen_c = QColor(m_col_fb)
+                        pen_c.setAlpha(235)
+                        ip.setBrush(Qt.BrushStyle.NoBrush)
+                        ip.setPen(QPen(pen_c, 1.35))
+                        ip.drawPath(mpath)
 
                 # 4. Curvas Crossover bajo la transparencia
                 for x_curve, x_col_fb in (
@@ -3900,48 +4211,118 @@ class HUDOpenGLBackgroundItem(QGraphicsItem):
                     step = max(1, len(xd) // 64)
                     xs = xd[::step]
                     ys = yd[::step]
-                    bx_arr = ((vx + (xs - xmin) / dx * vw) - hx) * sx
-                    by_arr = ((vy + (eymax - ys) / edy * vh) - hy) * sy
-                    poly = QPolygonF([QPointF(float(px_v), float(py_v)) for px_v, py_v in zip(bx_arr, by_arr)])
-                    pen_c = QColor(x_col_fb)
-                    pen_c.setAlpha(220)
-                    ip.setBrush(Qt.BrushStyle.NoBrush)
-                    ip.setPen(QPen(pen_c, 1.8))
-                    ip.drawPolyline(poly)
+                    bx_arr = ((xs - xmin) / dx) * fbw
+                    by_arr = ((eymax - ys) / edy) * fbh
+                    xpath, _ = cls._fast_fill_and_stroke_paths(bx_arr, by_arr, y_base=None)
+                    if xpath is not None:
+                        pen_c = QColor(x_col_fb)
+                        pen_c.setAlpha(220)
+                        ip.setBrush(Qt.BrushStyle.NoBrush)
+                        ip.setPen(QPen(pen_c, 1.20))
+                        ip.drawPath(xpath)
         except Exception:
             pass
         finally:
             ip.end()
 
-        # Aplicar Gaussian Blur separable rápido en NumPy
+        # Aplicar Gaussian Blur separable rápido en NumPy + ligera atenuación de luminancia (0.92x)
         ptr = img.bits()
-        ptr.setsize(bh * bw * 4)
-        arr = np.frombuffer(ptr, dtype=np.uint8).reshape((bh, bw, 4)).astype(np.float32)
-        blurred = np.clip(cls._separable_gaussian_blur(arr, cls._GAUSS_KERNEL), 0.0, 255.0).astype(np.uint8)
-        blur_bytes = blurred.tobytes()
+        ptr.setsize(full_bh * full_bw * 4)
+        arr = np.frombuffer(ptr, dtype=np.uint8).reshape((full_bh, full_bw, 4)).astype(np.float32)
+        blurred = cls._separable_gaussian_blur(arr, cls._GAUSS_KERNEL)
+        blurred[..., :3] *= 0.92
+        blurred[..., 3] = 255.0
+        blurred = np.clip(blurred, 0.0, 255.0)
+
+        cls._scene_blur_arr = blurred
+        cls._scene_blur_dims = (vx, vy, vw, vh, full_bw, full_bh)
+        cls._scene_blur_last_time = time.perf_counter()
+        cls._scene_blur_cache_key = cache_key
+        return cls._scene_blur_arr, cls._scene_blur_dims
+
+    @classmethod
+    def render_scene_blur_pixmap(
+        cls,
+        overlay,
+        plot_widget,
+        hx: float,
+        hy: float,
+        w: float,
+        h: float,
+        fallback_color: QColor | None = None,
+        corner_radius: float = 12.0,
+    ) -> QPixmap | None:
+        if w <= 4.0 or h <= 4.0 or overlay is None or plot_widget is None:
+            return None
+
+        buf_res = cls._ensure_scene_blur_buffer(overlay, plot_widget)
+        if buf_res is None:
+            return None
+        scene_arr, (vx, vy, vw, vh, full_bw, full_bh) = buf_res
+
+        bw = max(16, int(round(w / 8.0)))
+        bh = max(6, int(round(h / 8.0)))
+
+        x_1d = (np.arange(bw, dtype=np.float32) + 0.5) * (float(w) / float(bw))
+        y_1d = (np.arange(bh, dtype=np.float32) + 0.5) * (float(h) / float(bh))
+
+        sx_scale = float(full_bw) / max(1.0, vw)
+        sy_scale = float(full_bh) / max(1.0, vh)
+        u_1d = np.clip((float(hx) + x_1d - vx) * sx_scale - 0.5, 0.0, float(full_bw - 1))
+        v_1d = np.clip((float(hy) + y_1d - vy) * sy_scale - 0.5, 0.0, float(full_bh - 1))
+
+        u0 = np.floor(u_1d).astype(np.int32)[np.newaxis, :]
+        v0 = np.floor(v_1d).astype(np.int32)[:, np.newaxis]
+        u1 = np.minimum(u0 + 1, full_bw - 1)
+        v1 = np.minimum(v0 + 1, full_bh - 1)
+        fu = (u_1d - np.floor(u_1d))[np.newaxis, :, np.newaxis]
+        fv = (v_1d - np.floor(v_1d))[:, np.newaxis, np.newaxis]
+
+        sampled = (
+            (1.0 - fu) * (1.0 - fv) * scene_arr[v0, u0]
+            + fu * (1.0 - fv) * scene_arr[v0, u1]
+            + (1.0 - fu) * fv * scene_arr[v1, u0]
+            + fu * fv * scene_arr[v1, u1]
+        )
+        sampled[..., 3] = 255.0
+
+        out_u8 = np.clip(sampled, 0.0, 255.0).astype(np.uint8)
+        blur_bytes = out_u8.tobytes()
         qimg_blur = QImage(blur_bytes, bw, bh, bw * 4, QImage.Format.Format_ARGB32_Premultiplied).copy()
         return QPixmap.fromImage(qimg_blur)
 
     def _update_gaussian_blur_texture(self):
-        now = time.perf_counter()
-        if self._blur_pixmap is not None and (now - self._last_blur_time) < 0.080:
-            return
-        self._last_blur_time = now
-
         w = float(self._rect.width())
         h = float(self._rect.height())
         hud_pos = self.pos()
+        hx = float(hud_pos.x())
+        hy = float(hud_pos.y())
+        corner_r = 8.0 if self._custom_path is not None else (10.0 if self._is_minimized else 18.0)
+        now = time.perf_counter()
+        cur_fid = self._scene_blur_frame_id
+        geom_key = (int(round(hx)), int(round(hy)), int(round(w)), int(round(h)), self._is_minimized, round(corner_r, 1))
+        if (
+            self._blur_pixmap is not None
+            and self._blur_frame_id == cur_fid
+            and self._blur_geom_key == geom_key
+            and (now - self._scene_blur_last_time) < 0.014
+        ):
+            return
+
         pix = self.render_scene_blur_pixmap(
             self.overlay,
             self.plot_widget,
-            float(hud_pos.x()),
-            float(hud_pos.y()),
+            hx,
+            hy,
             w,
             h,
             self._active_color,
+            corner_radius=corner_r,
         )
         if pix is not None:
             self._blur_pixmap = pix
+            self._blur_frame_id = self._scene_blur_frame_id
+            self._blur_geom_key = geom_key
 
     def paint(self, painter, option, widget=None):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
@@ -3954,25 +4335,16 @@ class HUDOpenGLBackgroundItem(QGraphicsItem):
             painter.setClipPath(self._cached_path)
             painter.drawPixmap(self._rect.toRect(), self._blur_pixmap)
             # Capa translúcida esmerilada oscura sobre el Gaussian Blur
-            painter.fillRect(self._rect, QColor(14, 16, 22, 136))
+            painter.fillRect(self._rect, QColor(10, 12, 18, 96))
             # Sutil tinte contextual de baja opacidad
             tint = QColor(self._active_color)
-            tint.setAlpha(14)
+            tint.setAlpha(12)
             painter.fillRect(self._rect, tint)
             painter.restore()
         else:
-            painter.fillPath(self._cached_path, QBrush(QColor(16, 18, 24, 130)))
+            painter.fillPath(self._cached_path, QBrush(QColor(10, 12, 18, 180)))
 
-        glow = QColor(self._active_color)
-        glow.setAlpha(38)
-        painter.setPen(QPen(glow, 2.8))
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawPath(self._cached_path)
-
-        border = QColor(self._active_color)
-        border.setAlpha(185)
-        painter.setPen(QPen(border, 1.25))
-        painter.drawPath(self._cached_path)
+        draw_liquid_glass_border_glow(painter, self._cached_path, self._rect, self._active_color)
 
 
 class FloatingBandHUD(QWidget):
@@ -4022,8 +4394,11 @@ class FloatingBandHUD(QWidget):
 
     def _apply_hud_stylesheet(self, color: QColor):
         c = QColor(color) if color else QColor("#00E5FF")
-        r, g, b = c.red(), c.green(), c.blue()
         hex_c = c.name()
+        if getattr(self, "_last_hud_qss_color", None) == hex_c:
+            return
+        self._last_hud_qss_color = hex_c
+        r, g, b = c.red(), c.green(), c.blue()
         bright_hex = _brighten_color(c, 0.35).name()
         self.setStyleSheet(f"""
             QWidget {{
@@ -4663,7 +5038,7 @@ class FloatingBandHUD(QWidget):
         self.parameters_changed.emit()
 
     def _on_overlay_band_modified(self):
-        self.refresh_from_engine()
+        self.sync_selected_band_parameters()
         self.parameters_changed.emit()
 
     def select_band(self, index: int):
@@ -4673,140 +5048,181 @@ class FloatingBandHUD(QWidget):
         if hasattr(self.overlay, "node_callout"):
             self.overlay.node_callout.show_callout()
 
+    def sync_selected_band_parameters(self):
+        """Fast path for node drag: updates only knob values and compact readout without rebuilding combos or QSS."""
+        bands = list(self.eq_engine.bands)
+        idx = self.overlay.selected_band_idx
+        if not (0 <= idx < len(bands)):
+            self.refresh_from_engine()
+            return
+        b = bands[idx]
+        is_iso = bool(b.solo or self.eq_engine.isolated_band_index == idx)
+        cur_struct = (
+            len(bands), idx, b.filter_type, b.slope, b.enabled, b.dyn_enabled,
+            b.is_dynamic_active, b.channel_mode, b.target_output, b.color, is_iso,
+        )
+        if getattr(self, "_last_synced_struct", None) != cur_struct:
+            self.refresh_from_engine()
+            return
+        self._updating_ui = True
+        try:
+            self.freq_knob.setValue(b.freq)
+            self.gain_dyn_knob.setValue(b.gain_db)
+            self.gain_dyn_knob.setDynRangeValue(b.dyn_range_db)
+            self.q_knob.setValue(b.q)
+            self.thresh_meter.setThresholdValue(b.threshold_db)
+            self.attack_knob.setValue(b.attack_ms)
+            self.release_knob.setValue(b.release_ms)
+            self.out_gain_knob.setValue(self.eq_engine.output_gain_db)
+            if hasattr(self, "compact_readout"):
+                gain_txt = f"{b.gain_db:+.1f} dB" if b.supports_gain else b.filter_type
+                self.compact_readout.setText(f"{self._fmt_freq(b.freq)}  |  {gain_txt}  |  Q {b.q:.2f}")
+        finally:
+            self._updating_ui = False
+
     def refresh_from_engine(self):
         self._updating_ui = True
         try:
-            with self.eq_engine.lock:
-                bands = self.eq_engine.bands
-                idx = self.overlay.selected_band_idx
-                if idx < 0 and bands:
-                    idx = 0
-                    self.overlay.selected_band_idx = 0
+            bands = list(self.eq_engine.bands)
+            idx = self.overlay.selected_band_idx
+            if idx < 0 and bands:
+                idx = 0
+                self.overlay.selected_band_idx = 0
 
-                self.band_combo.blockSignals(True)
-                self.band_combo.clear()
+            self.band_combo.blockSignals(True)
+            self.band_combo.clear()
+            for i, b in enumerate(bands):
+                dyn_tag = " [D]" if b.is_dynamic_active else ""
+                self.band_combo.addItem(f"Band {i + 1}{dyn_tag}", i)
+            if 0 <= idx < len(bands):
+                self.band_combo.setCurrentIndex(idx)
+            self.band_combo.blockSignals(False)
+
+            if hasattr(self, "compact_band_combo"):
+                self.compact_band_combo.blockSignals(True)
+                self.compact_band_combo.clear()
                 for i, b in enumerate(bands):
                     dyn_tag = " [D]" if b.is_dynamic_active else ""
-                    self.band_combo.addItem(f"Band {i + 1}{dyn_tag}", i)
+                    self.compact_band_combo.addItem(f"Band {i + 1}{dyn_tag}", i)
                 if 0 <= idx < len(bands):
-                    self.band_combo.setCurrentIndex(idx)
-                self.band_combo.blockSignals(False)
+                    self.compact_band_combo.setCurrentIndex(idx)
+                self.compact_band_combo.blockSignals(False)
 
-                if hasattr(self, "compact_band_combo"):
-                    self.compact_band_combo.blockSignals(True)
-                    self.compact_band_combo.clear()
-                    for i, b in enumerate(bands):
-                        dyn_tag = " [D]" if b.is_dynamic_active else ""
-                        self.compact_band_combo.addItem(f"Band {i + 1}{dyn_tag}", i)
-                    if 0 <= idx < len(bands):
-                        self.compact_band_combo.setCurrentIndex(idx)
-                    self.compact_band_combo.blockSignals(False)
+            has_band = 0 <= idx < len(bands)
+            for w in (
+                self.del_band_btn, self.band_enable_btn, self.prev_band_btn,
+                self.next_band_btn, self.color_swatch, self.band_solo_btn,
+                self.channel_mode_combo, self.target_out_combo,
+                self.type_combo, self.slope_combo, self.freq_knob,
+                self.gain_dyn_knob, self.thresh_meter, self.q_knob,
+                self.dyn_toggle_btn, self.attack_knob, self.release_knob,
+                getattr(self, "compact_del_btn", None),
+                getattr(self, "compact_power_btn", None),
+                getattr(self, "compact_prev_btn", None),
+                getattr(self, "compact_next_btn", None),
+                getattr(self, "compact_color_swatch", None),
+                getattr(self, "compact_solo_btn", None),
+                getattr(self, "compact_target_out", None),
+            ):
+                if w is not None:
+                    w.setEnabled(has_band)
 
-                has_band = 0 <= idx < len(bands)
-                for w in (
-                    self.del_band_btn, self.band_enable_btn, self.prev_band_btn,
-                    self.next_band_btn, self.color_swatch, self.band_solo_btn,
-                    self.channel_mode_combo, self.target_out_combo,
-                    self.type_combo, self.slope_combo, self.freq_knob,
-                    self.gain_dyn_knob, self.thresh_meter, self.q_knob,
-                    self.dyn_toggle_btn, self.attack_knob, self.release_knob,
-                    getattr(self, "compact_del_btn", None),
-                    getattr(self, "compact_power_btn", None),
-                    getattr(self, "compact_prev_btn", None),
-                    getattr(self, "compact_next_btn", None),
-                    getattr(self, "compact_color_swatch", None),
-                    getattr(self, "compact_solo_btn", None),
-                    getattr(self, "compact_target_out", None),
-                ):
-                    if w is not None:
-                        w.setEnabled(has_band)
+            self.freq_knob.max_val = max(24000.0, self.eq_engine.sr * 0.495)
 
-                self.freq_knob.max_val = max(24000.0, self.eq_engine.sr * 0.495)
+            if has_band:
+                b = bands[idx]
+                self._active_band_color = QColor(b.color)
+                self._apply_hud_stylesheet(self._active_band_color)
+                self.color_swatch.setColor(b.color)
+                self.band_enable_btn.setAccentColor(b.color)
 
-                if has_band:
-                    b = bands[idx]
-                    self._active_band_color = QColor(b.color)
-                    self._apply_hud_stylesheet(self._active_band_color)
-                    self.color_swatch.setColor(b.color)
-                    self.band_enable_btn.setAccentColor(b.color)
+                if hasattr(self, "compact_color_swatch"):
+                    self.compact_color_swatch.setColor(b.color)
+                if hasattr(self, "compact_power_btn"):
+                    self.compact_power_btn.setAccentColor(b.color)
+                    self.compact_power_btn.setChecked(b.enabled)
 
-                    if hasattr(self, "compact_color_swatch"):
-                        self.compact_color_swatch.setColor(b.color)
-                    if hasattr(self, "compact_power_btn"):
-                        self.compact_power_btn.setAccentColor(b.color)
-                        self.compact_power_btn.setChecked(b.enabled)
+                self.band_enable_btn.setChecked(b.enabled)
+                is_iso = bool(b.solo or self.eq_engine.isolated_band_index == idx)
+                self.band_solo_btn.setChecked(is_iso)
+                self.band_solo_btn.setActiveTintColor(b.color)
+                if hasattr(self, "compact_solo_btn"):
+                    self.compact_solo_btn.setChecked(is_iso)
+                    self.compact_solo_btn.setActiveTintColor(b.color)
 
-                    self.band_enable_btn.setChecked(b.enabled)
-                    is_iso = bool(b.solo or self.eq_engine.isolated_band_index == idx)
-                    self.band_solo_btn.setChecked(is_iso)
-                    self.band_solo_btn.setActiveTintColor(b.color)
-                    if hasattr(self, "compact_solo_btn"):
-                        self.compact_solo_btn.setChecked(is_iso)
-                        self.compact_solo_btn.setActiveTintColor(b.color)
+                self.type_combo.setCurrentText(b.filter_type)
 
-                    self.type_combo.setCurrentText(b.filter_type)
+                cm_idx = self.channel_mode_combo.findData(b.channel_mode)
+                if cm_idx >= 0:
+                    self.channel_mode_combo.blockSignals(True)
+                    self.channel_mode_combo.setCurrentIndex(cm_idx)
+                    self.channel_mode_combo.blockSignals(False)
 
-                    cm_idx = self.channel_mode_combo.findData(b.channel_mode)
-                    if cm_idx >= 0:
-                        self.channel_mode_combo.blockSignals(True)
-                        self.channel_mode_combo.setCurrentIndex(cm_idx)
-                        self.channel_mode_combo.blockSignals(False)
+                to_idx = self.target_out_combo.findData(b.target_output)
+                if to_idx >= 0:
+                    self.target_out_combo.blockSignals(True)
+                    self.target_out_combo.setCurrentIndex(to_idx)
+                    self.target_out_combo.blockSignals(False)
+                    if hasattr(self, "compact_target_out"):
+                        self.compact_target_out.blockSignals(True)
+                        c_to = self.compact_target_out.findData(b.target_output)
+                        if c_to >= 0:
+                            self.compact_target_out.setCurrentIndex(c_to)
+                        self.compact_target_out.blockSignals(False)
 
-                    to_idx = self.target_out_combo.findData(b.target_output)
-                    if to_idx >= 0:
-                        self.target_out_combo.blockSignals(True)
-                        self.target_out_combo.setCurrentIndex(to_idx)
-                        self.target_out_combo.blockSignals(False)
-                        if hasattr(self, "compact_target_out"):
-                            self.compact_target_out.blockSignals(True)
-                            c_to = self.compact_target_out.findData(b.target_output)
-                            if c_to >= 0:
-                                self.compact_target_out.setCurrentIndex(c_to)
-                            self.compact_target_out.blockSignals(False)
+                slope_idx = self.slope_combo.findData(b.slope)
+                if slope_idx >= 0:
+                    self.slope_combo.setCurrentIndex(slope_idx)
+                self.slope_combo.setVisible(b.supports_slope)
+                self.slope_combo.setEnabled(b.supports_slope)
+                self.gain_dyn_knob.setEnabled(b.supports_gain)
 
-                    slope_idx = self.slope_combo.findData(b.slope)
-                    if slope_idx >= 0:
-                        self.slope_combo.setCurrentIndex(slope_idx)
-                    self.slope_combo.setVisible(b.supports_slope)
-                    self.slope_combo.setEnabled(b.supports_slope)
-                    self.gain_dyn_knob.setEnabled(b.supports_gain)
+                self.freq_knob.setAccentColor(b.color)
+                self.gain_dyn_knob.setAccentColor(b.color)
+                self.thresh_meter.setAccentColor(b.color)
+                self.q_knob.setAccentColor(b.color)
+                self.attack_knob.setAccentColor(b.color)
+                self.release_knob.setAccentColor(b.color)
 
-                    self.freq_knob.setAccentColor(b.color)
-                    self.gain_dyn_knob.setAccentColor(b.color)
-                    self.thresh_meter.setAccentColor(b.color)
-                    self.q_knob.setAccentColor(b.color)
-                    self.attack_knob.setAccentColor(b.color)
-                    self.release_knob.setAccentColor(b.color)
+                self.freq_knob.setValue(b.freq)
+                self.gain_dyn_knob.setValue(b.gain_db)
+                self.gain_dyn_knob.setDynRangeValue(b.dyn_range_db)
+                self.gain_dyn_knob.setDynEnabled(b.dyn_enabled)
+                self.q_knob.setValue(b.q)
 
-                    self.freq_knob.setValue(b.freq)
-                    self.gain_dyn_knob.setValue(b.gain_db)
-                    self.gain_dyn_knob.setDynRangeValue(b.dyn_range_db)
-                    self.gain_dyn_knob.setDynEnabled(b.dyn_enabled)
-                    self.q_knob.setValue(b.q)
-
-                    if hasattr(self, "compact_readout"):
-                        gain_txt = f"{b.gain_db:+.1f} dB" if b.supports_gain else b.filter_type
-                        self.compact_readout.setText(f"{self._fmt_freq(b.freq)}  |  {gain_txt}  |  Q {b.q:.2f}")
+                if hasattr(self, "compact_readout"):
+                    gain_txt = f"{b.gain_db:+.1f} dB" if b.supports_gain else b.filter_type
+                    self.compact_readout.setText(f"{self._fmt_freq(b.freq)}  |  {gain_txt}  |  Q {b.q:.2f}")
+                    if getattr(self, "_last_compact_readout_color", None) != b.color:
+                        self._last_compact_readout_color = b.color
                         self.compact_readout.setStyleSheet(f"color: {b.color}; font-size: 11px; font-weight: bold; padding: 0 4px;")
 
-                    self.dyn_toggle_btn.setChecked(b.dyn_enabled)
-                    self.dyn_toggle_btn.setActiveTintColor(b.color)
+                self.dyn_toggle_btn.setChecked(b.dyn_enabled)
+                self.dyn_toggle_btn.setActiveTintColor(b.color)
 
-                    dyn_active = b.dyn_enabled or abs(b.dyn_range_db) >= 0.05
-                    self.thresh_meter.setEnabled(dyn_active)
-                    self.attack_knob.setEnabled(dyn_active)
-                    self.release_knob.setEnabled(dyn_active)
+                dyn_active = b.dyn_enabled or abs(b.dyn_range_db) >= 0.05
+                self.thresh_meter.setEnabled(dyn_active)
+                self.attack_knob.setEnabled(dyn_active)
+                self.release_knob.setEnabled(dyn_active)
 
-                    self.thresh_meter.setThresholdValue(b.threshold_db)
-                    self.attack_knob.setValue(b.attack_ms)
-                    self.release_knob.setValue(b.release_ms)
-                else:
-                    self.slope_combo.setVisible(False)
-                    if hasattr(self, "compact_readout"):
-                        self.compact_readout.setText("Sin bandas activas")
+                self.thresh_meter.setThresholdValue(b.threshold_db)
+                self.attack_knob.setValue(b.attack_ms)
+                self.release_knob.setValue(b.release_ms)
+
+                self._last_synced_struct = (
+                    len(bands), idx, b.filter_type, b.slope, b.enabled, b.dyn_enabled,
+                    b.is_dynamic_active, b.channel_mode, b.target_output, b.color, is_iso,
+                )
+            else:
+                self._last_synced_struct = None
+                self.slope_combo.setVisible(False)
+                if hasattr(self, "compact_readout"):
+                    self.compact_readout.setText("Sin bandas activas")
+                    if getattr(self, "_last_compact_readout_color", None) != "#727B8E":
+                        self._last_compact_readout_color = "#727B8E"
                         self.compact_readout.setStyleSheet("color: #727B8E; font-size: 11px; font-weight: bold; padding: 0 4px;")
 
-                self.out_gain_knob.setValue(self.eq_engine.output_gain_db)
+            self.out_gain_knob.setValue(self.eq_engine.output_gain_db)
             self.update()
             self.sync_bg_item()
         finally:
@@ -4992,15 +5408,15 @@ class FloatingBandHUD(QWidget):
 
     def update_live_Readouts(self):
         idx = self.overlay.selected_band_idx
-        with self.eq_engine.lock:
-            if 0 <= idx < len(self.eq_engine.bands):
-                b = self.eq_engine.bands[idx]
-                self.gain_dyn_knob.setLiveDynOffset(b.current_dyn_offset_db if b.is_dynamic_active else 0.0)
-                self.thresh_meter.setLiveLevel(b.env_db if b.is_dynamic_active else -70.0)
-                if self._is_minimized and hasattr(self, "compact_readout"):
-                    gain_txt = f"{b.gain_db:+.1f} dB" if b.supports_gain else b.filter_type
-                    dyn_txt = f" (Δ {b.current_dyn_offset_db:+.1f})" if (b.is_dynamic_active and abs(b.current_dyn_offset_db) >= 0.1) else ""
-                    self.compact_readout.setText(f"{self._fmt_freq(b.freq)}  |  {gain_txt}{dyn_txt}  |  Q {b.q:.2f}")
+        bands = list(self.eq_engine.bands)
+        if 0 <= idx < len(bands):
+            b = bands[idx]
+            self.gain_dyn_knob.setLiveDynOffset(b.current_dyn_offset_db if b.is_dynamic_active else 0.0)
+            self.thresh_meter.setLiveLevel(b.env_db if b.is_dynamic_active else -70.0)
+            if self._is_minimized and hasattr(self, "compact_readout"):
+                gain_txt = f"{b.gain_db:+.1f} dB" if b.supports_gain else b.filter_type
+                dyn_txt = f" (Δ {b.current_dyn_offset_db:+.1f})" if (b.is_dynamic_active and abs(b.current_dyn_offset_db) >= 0.1) else ""
+                self.compact_readout.setText(f"{self._fmt_freq(b.freq)}  |  {gain_txt}{dyn_txt}  |  Q {b.q:.2f}")
 
 
 # Alias de compatibilidad
@@ -5376,9 +5792,9 @@ class LimiterControlPopup(HUDPopupDialog):
         self._on_rel_changed(50)
 
 
-class MiniOscilloscopeWidget(QOpenGLWidget):
+class MiniOscilloscopeWidget(QWidget):
     """
-    Mini-Osciloscopio a 60 FPS reales y 0% CPU acelerado por GPU (OpenGL) con Scroll Blitting de 1 píxel.
+    Mini-Osciloscopio a 60 FPS reales y 0% CPU con Scroll Blitting de 1 píxel.
     Acumula picos O(1) entre frames visuales sin bucles en Python ni sobrecarga de GPU.
     """
     clicked = pyqtSignal()
