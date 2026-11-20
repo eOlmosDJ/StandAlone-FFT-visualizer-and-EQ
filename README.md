@@ -1,7 +1,7 @@
 <div align="center">
   <img src="assets/logo.png" width="160" alt="Heaviside DSP Logo" />
   <h1>Heaviside DSP</h1>
-  <p><strong>Standalone Real-Time Parametric &amp; Dynamic Equalizer, Dual-Bus Crossover Matrix, ASRC Multi-Device Sync, Intelligent Auto-Gain, Master Peak Limiter, 192 kHz DSP Engine, 60+ FPS Multi-Resolution FFT Spectrum Analyzer &amp; OpenGL Oscilloscope for Windows</strong></p>
+  <p><strong>Standalone Real-Time Parametric &amp; Dynamic Equalizer, Multiband Compressor &amp; Dynamics Processor, Dual-Bus Crossover Matrix, ASRC Multi-Device Sync, Intelligent Auto-Gain, Master Peak Limiter, 192 kHz DSP Engine, 60+ FPS Multi-Resolution FFT Spectrum Analyzer &amp; OpenGL Oscilloscope for Windows</strong></p>
   <p><em>System-wide studio audio processing and acoustic analysis — no DAW or plugin host required.</em></p>
 
   <p>
@@ -48,29 +48,35 @@ It captures system audio (or live hardware inputs via Dual-Input routing), proce
 - **Per-Band Dynamic EQ:** Independent **Threshold** (`-70` to `0 dBFS`), **Dynamic Range** (`-30` to `+30 dB`), **Attack** (`0.5`–`500 ms`), and **Release** (`5`–`2000 ms`) with live dynamic excursion fill.
 - **Ghost Preview Curve & Floating HUD:** Hover to preview a band and double-click to instantiate it; sculpt parameters with the Liquid Glass floating HUD and attached node callout.
 
-### 3. Digital Crossover Matrix & High-Res PNG Exporter
+### 3. Multiband Compressor & Dynamics Processor (`MultibandDynamicsProcessor`)
+- **Three Per-Band Modes:** Switch each frequency band independently between **Compress**, **Expand**, and **Limit** (`MB_MODES`).
+- **Full Studio Ballistics & Shaping:** Per-band `f_low` / `f_high` crossover boundaries, **Threshold** (`-70` to `0 dBFS`), **Ratio** (`1:1` to `20:1`), **Range** (`-30` to `+12 dB`), **Knee** (`0` to `24 dB`), **Attack** (`0.1`–`500 ms`), **Release** (`5`–`2000 ms`), and **Output Gain** (`±24 dB`).
+- **Character Saturation:** Optional per-band analog-style **Character** drive (`Pre` or `Post` dynamics).
+- **Per-Bus Routing & Live Telemetry:** Route each band to `Out A`, `Out B`, or `A+B` with `Solo`/`Bypass` controls and 60 Hz lock-free input level & Gain Reduction (GR) overlay visualization directly on the spectrum canvas.
+
+### 4. Digital Crossover Matrix & High-Res PNG Exporter
 - **Linkwitz-Riley Topologies:** Selectable `12 dB/oct` (2nd order), `24 dB/oct` (4th order), and `48 dB/oct` (8th order) slopes for flat acoustic summation at the crossover frequency.
 - **Interactive Graph Cutoff:** Drag the vertical crossover marker directly on the EQ canvas with live Hz readout and magnetic snapping.
 - **Dual-Bus Split (`Bus A` / `Bus B`):** Route Low-Pass to Subwoofers and High-Pass to Tops/Satellites (or vice versa), with independent **$180^\circ$ Phase Inversion** and output trim per bus.
 - **High-Resolution PNG Exporter (`📸 Exportar PNG`):** Generates clean `1920x1080` crossover response snapshots with frequency grids, dB scales, and metadata watermarks.
 
-### 4. Dual-Bus Routing, Dual-Input & ASRC Clock Sync (`audio_sync.py`)
+### 5. Dual-Bus Routing, Dual-Input & ASRC Clock Sync (`audio_sync.py`)
 - **Adaptive Resampling Ring Buffer (ASRC):** 32-tap Kaiser-windowed polyphase sinc interpolator (`2048` phases) with a proportional control loop that locks two independent audio hardware clocks (e.g., separate USB DACs, Bluetooth devices, or virtual cables) together without pops, drops, or audible pitch drift (< 5 cents).
 - **Dual-Input Architecture (`Input 1` + `Input 2` Aux / Mic):** Independent secondary PortAudio stream with multi-tier latency fallback, real-time sample-rate conversion, simultaneous FFT/RTA monitoring, and selectable routing to Bus A / Bus B.
 - **Acoustic Latency Auto-Compensation (`StereoDelayLine` & `⚡ Auto Sync`):** Sample-accurate stereo delay lines (up to $250\text{ ms}$) with one-click driver latency detection to phase-align physical speakers.
 
-### 5. Intelligent Auto-Gain (`AutoGain`)
+### 6. Intelligent Auto-Gain (`AutoGain`)
 - **Dual-Bus Loudness Balancing:** Compares Pre-EQ input energy against Post-EQ Bus A and Bus B output energy in real time.
 - **Perceptual Weighting:** Hybrid RMS and ITU-R BS.1770-style weighting for accurate perceived loudness matching.
 - **Slew-Rate Limiting:** Smooth gain transitions prevent pumping or zipper noise, controlled from a dedicated Liquid Glass top-bar pill (`±X.X dB` readout, `Calibrar`, and instant bypass).
 
-### 6. Master Peak Limiter & `MiniScopeGL` Oscilloscope
+### 7. Master Peak Limiter & `MiniScopeGL` Oscilloscope
 - **Dual-Bus Peak Limiter:** Vectorized envelope follower (`Ceiling`, `Threshold`, `Attack`, `Release`) protecting both Bus A and Bus B from digital clipping.
 - **Live Gain Reduction (GR) Envelope:** Real-time purple/magenta gain reduction trace rendered directly over the oscilloscope waveform.
 - **`MiniScopeGL` Hardware Capsule:** Native `QOpenGLWidget` mini oscilloscope in the top bar with adaptive luminous purple glow when limiting is active.
 - **Expanded Analysis Panel:** Left (cyan) and Right (gold) waveforms with `1s`, `5s`, and `10s` history windows and smooth `+18 dBFS` auto-headroom.
 
-### 7. Liquid Glass UI, Custom SVG Icons & Guided Help Tour
+### 8. Liquid Glass UI, Custom SVG Icons & Guided Help Tour
 - **100% Full-Bleed Canvas:** Zero-margin dark studio aesthetic (`#0D0F14`) with shared 60 FPS GPU-cached Gaussian blur menus and custom vector SVG iconography (`dynamic_eq_svg_icons/`).
 - **Dual Right dB Scales:** Signal level scale (`0` to `-120 dBFS`) paired with an EQ Gain scale (`±12 dB` / `±30 dB` toggleable badge) and a natural $-\infty$ bottom vignette.
 - **Interactive Help Tour (`help_tour.py`):** Built-in spotlight overlay (`HelpSpotlightOverlay`) that guides you step-by-step through every control.
