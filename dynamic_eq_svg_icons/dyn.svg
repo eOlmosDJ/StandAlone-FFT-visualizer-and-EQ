@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48" fill="none">
+<title>dyn</title>
+<path d="M4 33C12 33 14 11 24 11s12 22 20 22" stroke="#35C6E8" stroke-width="2.8" stroke-linecap="round"/>
+<path d="M8 33C15 33 17 24 24 24s9 9 16 9" stroke="#FFA94D" stroke-width="2.2" stroke-linecap="round" stroke-dasharray="3 2.5"/>
+<path d="M24 14v9M20.5 19.5L24 23.5l3.5-4" stroke="#FFA94D" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M4 39h40" stroke="#8290A5" stroke-width="1.5" opacity=".7"/>
+</svg>

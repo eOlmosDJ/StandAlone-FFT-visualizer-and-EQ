@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48" fill="none">
+<title>range_12db</title>
+<path d="M9 11V37M5.5 14.5L9 10.5L12.5 14.5M5.5 33.5L9 37.5L12.5 33.5" stroke="#8290A5" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M16.5 22H23.5M20 18.5V25.5M16.5 30H23.5" stroke="#F4D35E" stroke-width="2.8" stroke-linecap="round"/>
+<path d="M27.5 19.5L30.5 16.5V31.5" stroke="#F4D35E" stroke-width="3.0" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M35.5 19.5C35.5 17 37.5 16 39.5 16C41.8 16 43.2 17.4 43.2 19.5C43.2 22 40 24.8 35.5 31.5H43.5" stroke="#F4D35E" stroke-width="3.0" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

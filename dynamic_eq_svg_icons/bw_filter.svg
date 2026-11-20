@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48" fill="none">
+<title>bw_filter</title>
+<path d="M5 14H12C20 14 24 36 33 36H43" stroke="#FFA94D" stroke-width="3.0" stroke-linecap="round"/>
+<path d="M5 36H15C24 36 28 14 36 14H43" stroke="#8290A5" stroke-width="2.6" stroke-linecap="round"/>
+<circle cx="24" cy="18" r="2.8" fill="#FFA94D"/>
+</svg>

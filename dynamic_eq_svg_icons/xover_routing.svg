@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48" fill="none">
+<title>xover_routing</title>
+<path d="M6 24H18C23 24 25 14 31 14H41" stroke="#FFA94D" stroke-width="2.9" stroke-linecap="round"/>
+<path d="M18 24C23 24 25 34 31 34H41" stroke="#8290A5" stroke-width="2.6" stroke-linecap="round"/>
+<path d="M37 10L42 14L37 18M37 30L42 34L37 38" stroke="#FFA94D" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+<circle cx="18" cy="24" r="3" fill="#FFA94D"/>
+</svg>

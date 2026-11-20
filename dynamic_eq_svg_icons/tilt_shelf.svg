@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48" fill="none">
+<title>tilt_shelf</title>
+<path d="M4 33h10L34 15h10" stroke="#55D6A3" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"/>
+<circle cx="24" cy="24" r="2.8" fill="#35C6E8"/>
+<path d="M4 39h40" stroke="#8290A5" stroke-width="1.5" opacity=".7"/>
+</svg>

@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48" fill="none">
+<title>multiband</title>
+<rect x="6" y="12" width="10" height="24" rx="2.5" stroke="#35C6E8" stroke-width="2.3"/>
+<rect x="19" y="16" width="10" height="20" rx="2.5" stroke="#FFA94D" stroke-width="2.3"/>
+<rect x="32" y="10" width="10" height="26" rx="2.5" stroke="#55D6A3" stroke-width="2.3"/>
+<path d="M19 23h10" stroke="#FF6B78" stroke-width="2.4" stroke-linecap="round"/>
+</svg>

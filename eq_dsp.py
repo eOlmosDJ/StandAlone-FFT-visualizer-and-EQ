@@ -583,7 +583,7 @@ def _apply_isolate_channel_mode(
 
 class EQBand:
     """
-    Representa una banda paramétrica y dinámica individual del motor BDJ-FFT-EQ.
+    Representa una banda paramétrica y dinámica individual del motor Heaviside DSP.
     Soporta:
     - Procesamiento por canal (`channel_mode`: "LR", "L", "R", "Mid", "Side")
     - Asignación de bus de salida (`target_output`: "A", "B", "A+B") con estados `zi_A` y `zi_B` independientes
@@ -633,14 +633,17 @@ class EQBand:
         self.attack_ms = float(np.clip(attack_ms, 0.5, 500.0))
         self.release_ms = float(np.clip(release_ms, 5.0, 2000.0))
 
-        # Estado dinámico en tiempo real
+        # Estado dinámico en tiempo real (telemetría lock-free compartida con GUI 60 Hz)
         self.env_db = -90.0
         self.current_dyn_offset_db = 0.0
+        self.live_env_db = -90.0
+        self.live_dyn_delta_db = 0.0
 
         self.sos_static = design_biquad_sos(
             self.filter_type, self.freq, self.gain_db, self.q, self.sr, self.slope
         )
         self.sos_inst = self.sos_static.copy()
+        self.live_sos = self.sos_static
         self.sc_sos = design_biquad_sos("Band Pass", self.freq, 0.0, self.q, self.sr)
         self.iso_sos = design_isolate_bandpass_sos(self.freq, self.q, self.sr, cascade_sections=2)
 
@@ -794,8 +797,10 @@ class EQBand:
         if not self.is_dynamic_active:
             self.sos_inst = new_sos.copy()
             self.current_dyn_offset_db = 0.0
+            self.live_dyn_delta_db = 0.0
         else:
             self._update_instant_sos()
+        self.live_sos = self.sos_inst
 
         new_sc_sos = design_biquad_sos("Band Pass", self.freq, 0.0, self.q, self.sr)
         if self.sc_zi.shape != (1, 1, 2):
@@ -869,6 +874,9 @@ class EQBand:
         self._sos_run = None
         self.env_db = -90.0
         self.current_dyn_offset_db = 0.0
+        self.live_env_db = -90.0
+        self.live_dyn_delta_db = 0.0
+        self.live_sos = self.sos_static
 
     def get_static_freq_response_db(self, z1: np.ndarray, z2: np.ndarray) -> np.ndarray:
         if not self._cache_valid or self._cached_static_db is None or len(self._cached_static_db) != len(z1):
@@ -878,7 +886,8 @@ class EQBand:
         return self._cached_static_db
 
     def get_dynamic_freq_response_db(self, z1: np.ndarray, z2: np.ndarray) -> np.ndarray:
-        return eval_sos_mag_db_fast(self.sos_inst, z1, z2)
+        sos = self.live_sos
+        return eval_sos_mag_db_fast(sos, z1, z2)
 
     def get_isolate_freq_response_db(self, z1: np.ndarray, z2: np.ndarray) -> np.ndarray:
         return eval_sos_mag_db_fast(self.iso_sos, z1, z2)
@@ -1466,6 +1475,9 @@ class ParametricEQEngine:
                     b.current_dyn_offset_db *= 0.85
                 else:
                     b.current_dyn_offset_db = 0.0
+                b.live_dyn_delta_db = float(b.current_dyn_offset_db)
+                b.live_env_db = float(b.env_db)
+                b.live_sos = b.sos_static
             if indata.ndim == 1:
                 out_A = np.column_stack((indata, indata)).astype(np.float32, copy=False)
             elif indata.shape[1] == 1:
@@ -1526,6 +1538,9 @@ class ParametricEQEngine:
                 band.current_dyn_offset_db = (
                     0.0 if abs(band.current_dyn_offset_db) < 0.01 else band.current_dyn_offset_db * 0.85
                 )
+                band.live_dyn_delta_db = float(band.current_dyn_offset_db)
+                band.live_env_db = float(band.env_db)
+                band.live_sos = band.sos_static
                 continue
 
             if band.is_dynamic_active:
@@ -1581,6 +1596,8 @@ class ParametricEQEngine:
                     new_offset = 0.0
 
                 band.current_dyn_offset_db = new_offset
+                band.live_env_db = float(band.env_db)
+                band.live_dyn_delta_db = float(new_offset)
                 if new_offset == 0.0 and prev_offset == 0.0 and band.sos_inst is band.sos_static:
                     pass
                 elif abs(new_offset - prev_offset) > 1e-4 or band.sos_inst is band.sos_static:
@@ -1590,10 +1607,14 @@ class ParametricEQEngine:
                         band._update_instant_sos()
             else:
                 band.current_dyn_offset_db = 0.0
+                band.live_dyn_delta_db = 0.0
+                band.live_env_db = -90.0
                 band.sos_inst = band.sos_static
+                band.live_sos = band.sos_static
 
             if band.is_dynamic_active or abs(band.gain_db) > 0.01 or not band.supports_gain:
                 sos_run = band.smoothed_sos()
+                band.live_sos = sos_run
                 if shared_ab:
                     _apply_sos_channel_first_inplace(
                         sos_run, work_a, band.zi_A, band.channel_mode,
@@ -1712,7 +1733,7 @@ class ParametricEQEngine:
         for band in active_bands:
             static_db = band.get_static_freq_response_db(z1, z2)
             total_static += static_db
-            if band.is_dynamic_active and abs(band.current_dyn_offset_db) > 0.02:
+            if band.is_dynamic_active and abs(band.live_dyn_delta_db) > 0.02:
                 dyn_db = band.get_dynamic_freq_response_db(z1, z2)
                 total_dyn += dyn_db
             else:
@@ -1969,3 +1990,951 @@ def detect_resonances(
         idx = peaks[p]
         results.append((float(f_sub[idx]), float(m_sub[idx]), float(proms[p])))
     return results
+
+
+MB_MODES = ["Compress", "Expand", "Limit"]
+MB_CHARACTER_MODES = ("Off", "Tube", "Diode", "Bright")
+MB_MODE_COLORS = {
+    "Compress": "#00E5FF",
+    "Expand": "#00E676",
+    "Limit": "#FF6D00",
+}
+MAX_MB_BANDS = 6
+
+
+def eval_sos_complex_fast(sos: np.ndarray, z1: np.ndarray, z2: np.ndarray) -> np.ndarray:
+    """Evalúa la respuesta compleja H(z) de una matriz SOS usando fasores z^-1 y z^-2."""
+    b0 = sos[:, 0:1]
+    b1 = sos[:, 1:2]
+    b2 = sos[:, 2:3]
+    a1 = sos[:, 4:5]
+    a2 = sos[:, 5:6]
+    h_sec = (b0 + b1 * z1 + b2 * z2) / (1.0 + a1 * z1 + a2 * z2)
+    return np.prod(h_sec, axis=0) if sos.shape[0] > 1 else h_sec[0]
+
+
+def design_lr4_and_ap2(fc_hz: float, sr: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Diseña el par complementario Linkwitz-Riley de 4to orden (LR4: 24 dB/oct) junto
+    con su filtro All-Pass de 2do orden emparejado en fase (AP2):
+        H_LP4(z) + H_HP4(z) == H_AP2(z)  con error < 1e-11 dB.
+    """
+    sr_f = float(max(sr, 8000.0))
+    fc = float(np.clip(fc_hz, 10.0, 0.48 * sr_f))
+    K = math.tan(math.pi * fc / sr_f)
+    K2 = K * K
+    sqrt2_K = math.sqrt(2.0) * K
+    inv_d0 = 1.0 / (1.0 + sqrt2_K + K2)
+    a1 = 2.0 * (K2 - 1.0) * inv_d0
+    a2 = (1.0 - sqrt2_K + K2) * inv_d0
+
+    lp_row = [K2 * inv_d0, 2.0 * K2 * inv_d0, K2 * inv_d0, 1.0, a1, a2]
+    hp_row = [inv_d0, -2.0 * inv_d0, inv_d0, 1.0, a1, a2]
+    ap_row = [a2, a1, 1.0, 1.0, a1, a2]
+
+    sos_lp4 = np.array([lp_row, lp_row], dtype=np.float64)
+    sos_hp4 = np.array([hp_row, hp_row], dtype=np.float64)
+    sos_ap2 = np.array([ap_row], dtype=np.float64)
+    return sos_lp4, sos_hp4, sos_ap2
+
+
+class DynamicsBand:
+    """
+    Banda individual de Dinámica Multibanda (Compress, Expand o Limit por banda de frecuencia).
+    Expone telemetría lock-free `live_level_db` y `live_gr_db` para la UI a 60 Hz.
+    """
+
+    def __init__(
+        self,
+        f_low: float = 100.0,
+        f_high: float = 1000.0,
+        enabled: bool = True,
+        solo: bool = False,
+        bypass: bool = False,
+        bus_target: str = "A+B",
+        mode: str = "Compress",
+        threshold_db: float = -24.0,
+        range_db: float = -12.0,
+        ratio: float = 4.0,
+        attack_ms: float = 10.0,
+        release_ms: float = 120.0,
+        knee_db: float = 6.0,
+        output_gain_db: float = 0.0,
+        color: str | None = None,
+        character_mode: str = "Off",
+        character_drive: float = 0.35,
+        character_post: bool = True,
+        custom_color: bool = False,
+    ):
+        self.f_low = float(np.clip(f_low, 10.0, 22000.0))
+        self.f_high = float(np.clip(f_high, self.f_low * 1.12, 24000.0))
+        self.enabled = bool(enabled)
+        self.solo = bool(solo)
+        self.bypass = bool(bypass)
+        self.bus_target = bus_target if bus_target in TARGET_OUTPUTS else "A+B"
+        self.mode = mode if mode in MB_MODES else "Compress"
+        self.threshold_db = float(np.clip(threshold_db, -70.0, 0.0))
+        self.range_db = float(np.clip(range_db, -30.0, 12.0))
+        self.ratio = float(np.clip(ratio, 1.0, 20.0))
+        self.attack_ms = float(np.clip(attack_ms, 0.1, 500.0))
+        self.release_ms = float(np.clip(release_ms, 5.0, 2000.0))
+        self.knee_db = float(np.clip(knee_db, 0.0, 24.0))
+        self.output_gain_db = float(np.clip(output_gain_db, -24.0, 24.0))
+        self.custom_color = bool(custom_color)
+        self.color = str(color) if color else MB_MODE_COLORS.get(self.mode, "#00E5FF")
+        self.character_mode = character_mode if character_mode in MB_CHARACTER_MODES else "Off"
+        self.character_drive = float(np.clip(character_drive, 0.0, 1.0))
+        self.character_post = bool(character_post)
+
+        # Telemetría lock-free compartida con la UI
+        self.live_level_db: float = -90.0
+        self.live_gr_db: float = 0.0
+
+        # Estado de envolvente por bus (A y B)
+        self._gr_env_a: float = 0.0
+        self._gr_env_b: float = 0.0
+        self._prev_glin_a: float = 1.0
+        self._prev_glin_b: float = 1.0
+        self._lvl_env_a: float = -90.0
+        self._lvl_env_b: float = -90.0
+        self._bright_z_a: list[float] = [0.0, 0.0]
+        self._bright_z_b: list[float] = [0.0, 0.0]
+
+    def reset_state(self):
+        self.live_level_db = -90.0
+        self.live_gr_db = 0.0
+        self._gr_env_a = 0.0
+        self._gr_env_b = 0.0
+        self._prev_glin_a = 1.0
+        self._prev_glin_b = 1.0
+        self._lvl_env_a = -90.0
+        self._lvl_env_b = -90.0
+        self._bright_z_a = [0.0, 0.0]
+        self._bright_z_b = [0.0, 0.0]
+
+    def to_dict(self) -> dict:
+        return {
+            "f_low": round(self.f_low, 2),
+            "f_high": round(self.f_high, 2),
+            "enabled": bool(self.enabled),
+            "solo": bool(self.solo),
+            "bypass": bool(self.bypass),
+            "bus_target": str(self.bus_target),
+            "mode": str(self.mode),
+            "threshold_db": round(self.threshold_db, 2),
+            "range_db": round(self.range_db, 2),
+            "ratio": round(self.ratio, 2),
+            "attack_ms": round(self.attack_ms, 2),
+            "release_ms": round(self.release_ms, 1),
+            "knee_db": round(self.knee_db, 2),
+            "output_gain_db": round(self.output_gain_db, 2),
+            "color": str(self.color),
+            "custom_color": bool(self.custom_color),
+            "character_mode": str(self.character_mode),
+            "character_drive": round(self.character_drive, 3),
+            "character_post": bool(self.character_post),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "DynamicsBand":
+        mode = str(data.get("mode", "Compress"))
+        if mode not in MB_MODES:
+            mode = "Compress"
+        default_col = MB_MODE_COLORS.get(mode, "#00E5FF")
+        char_mode = str(data.get("character_mode", "Off"))
+        if char_mode not in MB_CHARACTER_MODES:
+            char_mode = "Off"
+        return cls(
+            f_low=float(data.get("f_low", 100.0)),
+            f_high=float(data.get("f_high", 1000.0)),
+            enabled=bool(data.get("enabled", True)),
+            solo=bool(data.get("solo", False)),
+            bypass=bool(data.get("bypass", False)),
+            bus_target=str(data.get("bus_target", "A+B")),
+            mode=mode,
+            threshold_db=float(data.get("threshold_db", -24.0)),
+            range_db=float(data.get("range_db", -12.0)),
+            ratio=float(data.get("ratio", 4.0)),
+            attack_ms=float(data.get("attack_ms", 10.0)),
+            release_ms=float(data.get("release_ms", 120.0)),
+            knee_db=float(data.get("knee_db", 6.0)),
+            output_gain_db=float(data.get("output_gain_db", 0.0)),
+            color=str(data.get("color", default_col)),
+            character_mode=char_mode,
+            character_drive=float(data.get("character_drive", 0.35)),
+            character_post=bool(data.get("character_post", True)),
+            custom_color=bool(data.get("custom_color", False)),
+        )
+
+
+class _MBSplitPlan:
+    """Plan atómico inmutable para división de bandas LR4 + AP2 en tiempo real sin locks."""
+
+    def __init__(
+        self,
+        any_active: bool,
+        active_bands: tuple[DynamicsBand, ...],
+        split_freqs: tuple[float, ...],
+        lp4_sos: tuple[np.ndarray, ...],
+        hp4_sos: tuple[np.ndarray, ...],
+        ap_sos: tuple[np.ndarray | None, ...],
+        region_band_a: tuple[DynamicsBand | None, ...],
+        region_band_b: tuple[DynamicsBand | None, ...],
+        shared_ab: bool,
+        any_solo: bool,
+        zi_lp_a: list[np.ndarray],
+        zi_hp_a: list[np.ndarray],
+        zi_ap_a: list[np.ndarray | None],
+        zi_lp_b: list[np.ndarray],
+        zi_hp_b: list[np.ndarray],
+        zi_ap_b: list[np.ndarray | None],
+    ):
+        self.any_active = any_active
+        self.active_bands = active_bands
+        self.split_freqs = split_freqs
+        self.lp4_sos = lp4_sos
+        self.hp4_sos = hp4_sos
+        self.ap_sos = ap_sos
+        self.region_band_a = region_band_a
+        self.region_band_b = region_band_b
+        self.shared_ab = shared_ab
+        self.any_solo = any_solo
+        self.zi_lp_a = zi_lp_a
+        self.zi_hp_a = zi_hp_a
+        self.zi_ap_a = zi_ap_a
+        self.zi_lp_b = zi_lp_b
+        self.zi_hp_b = zi_hp_b
+        self.zi_ap_b = zi_ap_b
+
+
+class MultibandDynamicsProcessor:
+    """
+    Procesador Dinámico Multibanda (Compressor / Expander / Per-Frequency Limiter) estilo Pro-MB:
+    - División de bandas libres sin solapamiento mediante cascada LR4 (24 dB/oct) con compensación
+      All-Pass AP2 emparejada en fase (suma plana exacta de 0.00 dB a 0 dB de GR).
+    - Detección y envolvente en sub-bloques de 8 muestras en buffers float64 `(2, N)` prealocados.
+    - Intercambio atómico de plan `_plan` para ejecución 100% lock-free en el callback RT.
+    """
+
+    def __init__(self, sample_rate: float = 48000.0):
+        self.sr = float(max(8000.0, sample_rate))
+        self.lock = threading.RLock()
+        self.bypass = False
+        self.bands: list[DynamicsBand] = []
+        self.static_version: int = 0
+        self._tls = threading.local()
+        self._plan = _MBSplitPlan(
+            any_active=False, active_bands=(), split_freqs=(),
+            lp4_sos=(), hp4_sos=(), ap_sos=(),
+            region_band_a=(), region_band_b=(),
+            shared_ab=True, any_solo=False,
+            zi_lp_a=[], zi_hp_a=[], zi_ap_a=[],
+            zi_lp_b=[], zi_hp_b=[], zi_ap_b=[],
+        )
+
+    def mark_dirty(self):
+        with self.lock:
+            self.static_version += 1
+            self._rebuild_plan()
+
+    def set_sample_rate(self, sr: float):
+        with self.lock:
+            new_sr = float(max(8000.0, sr))
+            if abs(new_sr - self.sr) > 1.0:
+                self.sr = new_sr
+                self.static_version += 1
+                self._rebuild_plan()
+
+    def _max_band_freq(self) -> float:
+        return min(22000.0, 0.47 * self.sr)
+
+    def _clamp_non_overlapping(self):
+        """Ordena por f_low y garantiza que ninguna banda se solape con sus vecinas."""
+        max_f = self._max_band_freq()
+        self.bands.sort(key=lambda b: b.f_low)
+        for i, b in enumerate(self.bands):
+            lo_bound = 15.0 if i == 0 else max(15.0, self.bands[i - 1].f_high)
+            hi_bound = max_f if i == len(self.bands) - 1 else min(max_f, self.bands[i + 1].f_low)
+            b.f_low = float(np.clip(b.f_low, lo_bound, max(lo_bound, max_f / 1.15)))
+            min_hi = min(max_f, b.f_low * 1.15)
+            b.f_high = float(np.clip(b.f_high, min_hi, max(min_hi, hi_bound)))
+
+    def get_band_edge_limits(self, idx: int) -> tuple[float, float]:
+        max_f = self._max_band_freq()
+        if not (0 <= idx < len(self.bands)):
+            return 15.0, max_f
+        lo = 15.0 if idx == 0 else self.bands[idx - 1].f_high
+        hi = max_f if idx == len(self.bands) - 1 else self.bands[idx + 1].f_low
+        return float(lo), float(hi)
+
+    def add_band(
+        self,
+        f_low: float | None = None,
+        f_high: float | None = None,
+        mode: str = "Compress",
+        threshold_db: float = -24.0,
+        range_db: float | None = None,
+        ratio: float = 4.0,
+        attack_ms: float | None = None,
+        release_ms: float = 120.0,
+        knee_db: float = 6.0,
+        output_gain_db: float = 0.0,
+        bus_target: str = "A+B",
+        color: str | None = None,
+        character_mode: str = "Off",
+        character_drive: float = 0.35,
+        character_post: bool = True,
+        custom_color: bool = False,
+    ) -> DynamicsBand | None:
+        with self.lock:
+            if len(self.bands) >= MAX_MB_BANDS:
+                return None
+            max_f = self._max_band_freq()
+            existing = sorted(self.bands, key=lambda b: b.f_low)
+
+            if f_low is None or f_high is None:
+                # Buscar el mayor hueco logarítmico disponible
+                edges = [20.0]
+                for eb in existing:
+                    edges.append(eb.f_low)
+                    edges.append(eb.f_high)
+                edges.append(min(18000.0, max_f))
+                best_gap = None
+                best_span = 0.0
+                for k in range(0, len(edges), 2):
+                    g_lo, g_hi = edges[k], edges[k + 1]
+                    if g_hi > g_lo * 1.25:
+                        span = math.log10(g_hi / g_lo)
+                        if span > best_span:
+                            best_span = span
+                            best_gap = (g_lo, g_hi)
+                if best_gap is None:
+                    return None
+                g_lo, g_hi = best_gap
+                f_low = g_lo * ((g_hi / g_lo) ** 0.15)
+                f_high = g_lo * ((g_hi / g_lo) ** 0.85)
+            else:
+                f_low = float(np.clip(f_low, 15.0, max_f / 1.15))
+                f_high = float(np.clip(f_high, f_low * 1.15, max_f))
+                # Ajustar dentro del hueco que contiene el centro geométrico para evitar solapamientos
+                fc = math.sqrt(f_low * f_high)
+                lo_lim, hi_lim = 15.0, max_f
+                for eb in existing:
+                    if eb.f_high <= fc:
+                        lo_lim = max(lo_lim, eb.f_high)
+                    elif eb.f_low >= fc:
+                        hi_lim = min(hi_lim, eb.f_low)
+                        break
+                    else:
+                        # Dentro de una banda existente: buscar el hueco libre más amplio
+                        return None
+                if hi_lim < lo_lim * 1.15:
+                    return None
+                f_low = max(lo_lim, min(f_low, hi_lim / 1.15))
+                f_high = min(hi_lim, max(f_high, f_low * 1.15))
+
+            if mode not in MB_MODES:
+                mode = "Compress"
+            if range_db is None:
+                range_db = -30.0 if mode == "Limit" else (-12.0 if mode == "Compress" else 6.0)
+            if attack_ms is None:
+                attack_ms = 0.5 if mode == "Limit" else 10.0
+            if mode == "Limit":
+                ratio = 20.0
+
+            band = DynamicsBand(
+                f_low=f_low,
+                f_high=f_high,
+                enabled=True,
+                bus_target=bus_target,
+                mode=mode,
+                threshold_db=threshold_db,
+                range_db=range_db,
+                ratio=ratio,
+                attack_ms=attack_ms,
+                release_ms=release_ms,
+                knee_db=knee_db,
+                output_gain_db=output_gain_db,
+                color=color,
+                character_mode=character_mode,
+                character_drive=character_drive,
+                character_post=character_post,
+                custom_color=custom_color,
+            )
+            self.bands.append(band)
+            self._clamp_non_overlapping()
+            self.static_version += 1
+            self._rebuild_plan()
+            return band
+
+    def remove_band(self, index: int):
+        with self.lock:
+            if 0 <= index < len(self.bands):
+                self.bands.pop(index)
+                self.static_version += 1
+                self._rebuild_plan()
+
+    def set_band_edges(self, index: int, f_low: float, f_high: float):
+        with self.lock:
+            if not (0 <= index < len(self.bands)):
+                return
+            lo_lim, hi_lim = self.get_band_edge_limits(index)
+            if hi_lim <= lo_lim * 1.15:
+                return
+            new_lo = float(np.clip(f_low, lo_lim, hi_lim / 1.15))
+            new_hi = float(np.clip(f_high, new_lo * 1.15, hi_lim))
+            b = self.bands[index]
+            b.f_low = new_lo
+            b.f_high = new_hi
+            self.static_version += 1
+            self._rebuild_plan()
+
+    def set_solo_band(self, index: int | None, solo: bool = True):
+        with self.lock:
+            for i, b in enumerate(self.bands):
+                if index is not None and i == index:
+                    b.solo = bool(solo)
+                elif solo:
+                    b.solo = False
+            self.static_version += 1
+            self._rebuild_plan()
+
+    def _rebuild_plan(self):
+        active = tuple(
+            b for b in sorted(self.bands, key=lambda x: x.f_low)
+            if b.enabled and not b.bypass
+        )
+        if not active:
+            self._plan = _MBSplitPlan(
+                any_active=False, active_bands=(), split_freqs=(),
+                lp4_sos=(), hp4_sos=(), ap_sos=(),
+                region_band_a=(), region_band_b=(),
+                shared_ab=True, any_solo=False,
+                zi_lp_a=[], zi_hp_a=[], zi_ap_a=[],
+                zi_lp_b=[], zi_hp_b=[], zi_ap_b=[],
+            )
+            return
+
+        lo_open = 12.0
+        hi_open = self._max_band_freq() * 0.995
+        raw_splits: list[float] = []
+        for b in active:
+            if b.f_low > lo_open:
+                raw_splits.append(b.f_low)
+            if b.f_high < hi_open:
+                raw_splits.append(b.f_high)
+        raw_splits.sort()
+
+        splits: list[float] = []
+        for f in raw_splits:
+            if not splits or abs(f - splits[-1]) / max(1.0, splits[-1]) > 0.002:
+                splits.append(float(f))
+
+        K = len(splits)
+        lp_list: list[np.ndarray] = []
+        hp_list: list[np.ndarray] = []
+        ap_single: list[np.ndarray] = []
+        for fc in splits:
+            lp, hp, ap = design_lr4_and_ap2(fc, self.sr)
+            lp_list.append(lp)
+            hp_list.append(hp)
+            ap_single.append(ap)
+
+        ap_packed: list[np.ndarray | None] = []
+        for i in range(K):
+            if i + 1 < K:
+                ap_packed.append(np.ascontiguousarray(np.vstack(ap_single[i + 1:]), dtype=np.float64))
+            else:
+                ap_packed.append(None)
+
+        # Conservar estados zi cuando el número de puntos de cruce no cambia (arrastre suave sin clics)
+        old = getattr(self, "_plan", None)
+        can_reuse_zi = (old is not None and len(old.split_freqs) == K)
+
+        zi_lp_a, zi_hp_a, zi_ap_a = [], [], []
+        zi_lp_b, zi_hp_b, zi_ap_b = [], [], []
+        for i in range(K):
+            if can_reuse_zi:
+                zi_lp_a.append(old.zi_lp_a[i].copy())
+                zi_hp_a.append(old.zi_hp_a[i].copy())
+                zi_lp_b.append(old.zi_lp_b[i].copy())
+                zi_hp_b.append(old.zi_hp_b[i].copy())
+            else:
+                zi_lp_a.append(np.zeros((2, 2, 2), dtype=np.float64))
+                zi_hp_a.append(np.zeros((2, 2, 2), dtype=np.float64))
+                zi_lp_b.append(np.zeros((2, 2, 2), dtype=np.float64))
+                zi_hp_b.append(np.zeros((2, 2, 2), dtype=np.float64))
+
+            ap_s = ap_packed[i]
+            if ap_s is not None:
+                n_sec = ap_s.shape[0]
+                if can_reuse_zi and old.zi_ap_a[i] is not None and old.zi_ap_a[i].shape == (2, n_sec, 2):
+                    zi_ap_a.append(old.zi_ap_a[i].copy())
+                    zi_ap_b.append(old.zi_ap_b[i].copy())
+                else:
+                    zi_ap_a.append(np.zeros((2, n_sec, 2), dtype=np.float64))
+                    zi_ap_b.append(np.zeros((2, n_sec, 2), dtype=np.float64))
+            else:
+                zi_ap_a.append(None)
+                zi_ap_b.append(None)
+
+        reg_edges = [10.0] + splits + [self.sr * 0.49]
+        reg_band_a: list[DynamicsBand | None] = []
+        reg_band_b: list[DynamicsBand | None] = []
+        for r in range(K + 1):
+            fc_r = math.sqrt(max(10.0, reg_edges[r]) * max(10.0, reg_edges[r + 1]))
+            owner = None
+            for b in active:
+                if b.f_low <= fc_r <= b.f_high:
+                    owner = b
+                    break
+            if owner is not None:
+                reg_band_a.append(owner if owner.bus_target in ("A", "A+B") else None)
+                reg_band_b.append(owner if owner.bus_target in ("B", "A+B") else None)
+            else:
+                reg_band_a.append(None)
+                reg_band_b.append(None)
+
+        shared_ab = all(b.bus_target == "A+B" for b in active)
+        any_solo = any(b.solo for b in active)
+
+        self._plan = _MBSplitPlan(
+            any_active=True,
+            active_bands=active,
+            split_freqs=tuple(splits),
+            lp4_sos=tuple(lp_list),
+            hp4_sos=tuple(hp_list),
+            ap_sos=tuple(ap_packed),
+            region_band_a=tuple(reg_band_a),
+            region_band_b=tuple(reg_band_b),
+            shared_ab=shared_ab,
+            any_solo=any_solo,
+            zi_lp_a=zi_lp_a, zi_hp_a=zi_hp_a, zi_ap_a=zi_ap_a,
+            zi_lp_b=zi_lp_b, zi_hp_b=zi_hp_b, zi_ap_b=zi_ap_b,
+        )
+
+    def _ensure_tls(self, frames: int):
+        tls = self._tls
+        if getattr(tls, "frames", -1) != frames:
+            tls.frames = frames
+            tls.work_a = np.empty((2, frames), dtype=np.float64)
+            tls.work_b = np.empty((2, frames), dtype=np.float64)
+            tls.rem_buf = np.empty((2, frames), dtype=np.float64)
+            tls.reg_buf = np.empty((2, frames), dtype=np.float64)
+            tls.sum_buf = np.empty((2, frames), dtype=np.float64)
+            tls.abs_l = np.empty(frames, dtype=np.float64)
+            tls.abs_r = np.empty(frames, dtype=np.float64)
+            tls.gain_1d = np.empty(frames, dtype=np.float64)
+            tls.ramp_unit = np.arange(1, 9, dtype=np.float64) / 8.0
+            tls.sat_tmp = np.empty((2, frames), dtype=np.float64)
+            tls.out_a_f32 = np.empty((frames, 2), dtype=np.float32)
+            tls.out_b_f32 = np.empty((frames, 2), dtype=np.float32)
+        return tls
+
+    @staticmethod
+    def _apply_character_inplace(
+        buf_2xN: np.ndarray,
+        band: DynamicsBand,
+        is_bus_b: bool,
+        sat_tmp: np.ndarray,
+    ):
+        cm = band.character_mode
+        drv = band.character_drive
+        if cm == "Off" or drv <= 1e-4:
+            return
+        frames = buf_2xN.shape[1]
+        if frames == 0:
+            return
+
+        if cm == "Tube":
+            k = 1.0 + 3.5 * drv
+            bias = 0.12 * drv
+            tb = math.tanh(bias)
+            norm = 1.0 / (k * max(1e-6, 1.0 - tb * tb))
+            np.multiply(buf_2xN, k, out=sat_tmp)
+            sat_tmp += bias
+            np.tanh(sat_tmp, out=sat_tmp)
+            sat_tmp -= tb
+            np.multiply(sat_tmp, norm, out=buf_2xN)
+        elif cm == "Diode":
+            k = 1.0 + 5.0 * drv
+            inv_k = 1.0 / k
+            np.multiply(buf_2xN, k, out=sat_tmp)
+            np.arctan(sat_tmp, out=sat_tmp)
+            np.multiply(sat_tmp, inv_k, out=buf_2xN)
+        elif cm == "Bright":
+            z = band._bright_z_b if is_bus_b else band._bright_z_a
+            for ch in (0, 1):
+                x = buf_2xN[ch]
+                d = sat_tmp[ch]
+                d[0] = x[0] - 0.85 * z[ch]
+                if frames > 1:
+                    np.multiply(x[:-1], 0.85, out=d[1:])
+                    np.subtract(x[1:], d[1:], out=d[1:])
+                z[ch] = float(x[-1])
+            bias_b = 0.14 * drv
+            tb_b = math.tanh(bias_b)
+            sat_tmp *= (8.0 + 22.0 * drv)
+            sat_tmp += bias_b
+            np.tanh(sat_tmp, out=sat_tmp)
+            sat_tmp -= tb_b
+            sat_tmp *= (0.28 * drv)
+            buf_2xN += sat_tmp
+
+    def _process_band_inplace(self, buf_2xN: np.ndarray, band: DynamicsBand, is_bus_b: bool, tls, write_telemetry: bool):
+        frames = buf_2xN.shape[1]
+        if frames == 0:
+            return
+        if not band.character_post:
+            self._apply_character_inplace(buf_2xN, band, is_bus_b, tls.sat_tmp)
+        ch0 = buf_2xN[0]
+        ch1 = buf_2xN[1]
+        abs_l = tls.abs_l
+        abs_r = tls.abs_r
+        gain_1d = tls.gain_1d
+        ramp_unit = tls.ramp_unit
+
+        mode = band.mode
+        thresh_db = band.threshold_db
+        range_db = band.range_db
+        ratio = max(1.0, band.ratio)
+        kw = max(0.0, band.knee_db)
+        out_gain_db = band.output_gain_db
+        att_sec = max(0.0001, band.attack_ms * 0.001)
+        rel_sec = max(0.0005, band.release_ms * 0.001)
+        sr = self.sr
+
+        if mode == "Limit":
+            np.abs(ch0, out=abs_l)
+            np.abs(ch1, out=abs_r)
+
+        gr_env = band._gr_env_b if is_bus_b else band._gr_env_a
+        prev_glin = band._prev_glin_b if is_bus_b else band._prev_glin_a
+
+        peak_lvl_db = -90.0
+        ext_gr_db = 0.0
+        sub_sz = 8
+
+        for start in range(0, frames, sub_sz):
+            end = start + sub_sz
+            if end > frames:
+                end = frames
+            n_sub = end - start
+            dt = n_sub / sr
+            a_att = math.exp(-dt / att_sec)
+            a_rel = math.exp(-dt / rel_sec)
+
+            if mode == "Limit":
+                pk = max(float(np.max(abs_l[start:end])), float(np.max(abs_r[start:end])))
+                lvl_db = 20.0 * math.log10(pk + 1e-10)
+                over = lvl_db - thresh_db
+                gr_target = -over if over > 0.0 else 0.0
+                if gr_target < -60.0:
+                    gr_target = -60.0
+            else:
+                s0 = ch0[start:end]
+                s1 = ch1[start:end]
+                e = 0.5 * (float(np.dot(s0, s0)) + float(np.dot(s1, s1))) / n_sub
+                lvl_db = 10.0 * math.log10(e + 1e-20)
+
+                if mode == "Compress":
+                    over = lvl_db - thresh_db
+                    if kw <= 1e-4:
+                        eff_over = over if over > 0.0 else 0.0
+                    elif over <= -0.5 * kw:
+                        eff_over = 0.0
+                    elif over < 0.5 * kw:
+                        t = over + 0.5 * kw
+                        eff_over = (t * t) / (2.0 * kw)
+                    else:
+                        eff_over = over
+                    gr_target = -eff_over * (1.0 - 1.0 / ratio)
+                    max_cut = -abs(range_db)
+                    if gr_target < max_cut:
+                        gr_target = max_cut
+                    elif gr_target > 0.0:
+                        gr_target = 0.0
+                else:  # "Expand"
+                    if range_db >= 0.0:
+                        over = lvl_db - thresh_db
+                        if kw <= 1e-4:
+                            eff = over if over > 0.0 else 0.0
+                        elif over <= -0.5 * kw:
+                            eff = 0.0
+                        elif over < 0.5 * kw:
+                            t = over + 0.5 * kw
+                            eff = (t * t) / (2.0 * kw)
+                        else:
+                            eff = over
+                        gr_target = eff * (1.0 - 1.0 / ratio)
+                        if gr_target > range_db:
+                            gr_target = range_db
+                        elif gr_target < 0.0:
+                            gr_target = 0.0
+                    else:
+                        under = thresh_db - lvl_db
+                        if kw <= 1e-4:
+                            eff = under if under > 0.0 else 0.0
+                        elif under <= -0.5 * kw:
+                            eff = 0.0
+                        elif under < 0.5 * kw:
+                            t = under + 0.5 * kw
+                            eff = (t * t) / (2.0 * kw)
+                        else:
+                            eff = under
+                        gr_target = -eff * max(0.0, ratio - 1.0)
+                        if gr_target < range_db:
+                            gr_target = range_db
+                        elif gr_target > 0.0:
+                            gr_target = 0.0
+
+            is_attack = abs(gr_target) > abs(gr_env)
+            alpha = a_att if is_attack else a_rel
+            gr_env = alpha * gr_env + (1.0 - alpha) * gr_target
+            if abs(gr_env) < 1e-4 and abs(gr_target) < 1e-4:
+                gr_env = 0.0
+
+            g_lin = 10.0 ** ((gr_env + out_gain_db) * 0.05)
+            dg = g_lin - prev_glin
+            if abs(dg) < 1e-6:
+                gain_1d[start:end] = g_lin
+            elif n_sub == 8:
+                np.multiply(ramp_unit, dg, out=gain_1d[start:end])
+                gain_1d[start:end] += prev_glin
+            else:
+                inv_n = 1.0 / float(n_sub)
+                for k in range(n_sub):
+                    gain_1d[start + k] = prev_glin + dg * ((k + 1) * inv_n)
+            prev_glin = g_lin
+
+            if lvl_db > peak_lvl_db:
+                peak_lvl_db = lvl_db
+            if abs(gr_env) > abs(ext_gr_db):
+                ext_gr_db = gr_env
+
+        ch0 *= gain_1d
+        ch1 *= gain_1d
+
+        if band.character_post:
+            self._apply_character_inplace(buf_2xN, band, is_bus_b, tls.sat_tmp)
+
+        if mode == "Limit":
+            ceil_lin = 10.0 ** ((thresh_db + out_gain_db) * 0.05)
+            np.clip(ch0, -ceil_lin, ceil_lin, out=ch0)
+            np.clip(ch1, -ceil_lin, ceil_lin, out=ch1)
+
+        if is_bus_b:
+            band._gr_env_b = gr_env
+            band._prev_glin_b = prev_glin
+            band._lvl_env_b = peak_lvl_db
+        else:
+            band._gr_env_a = gr_env
+            band._prev_glin_a = prev_glin
+            band._lvl_env_a = peak_lvl_db
+
+        if write_telemetry:
+            band.live_level_db = float(peak_lvl_db)
+            band.live_gr_db = float(ext_gr_db)
+
+    def _process_single_bus(
+        self,
+        in_2xN: np.ndarray,
+        plan: _MBSplitPlan,
+        is_bus_b: bool,
+        tls,
+    ) -> np.ndarray:
+        frames = in_2xN.shape[1]
+        rem = tls.rem_buf
+        reg = tls.reg_buf
+        sum_buf = tls.sum_buf
+        np.copyto(rem, in_2xN)
+        sum_buf.fill(0.0)
+
+        zi_lp = plan.zi_lp_b if is_bus_b else plan.zi_lp_a
+        zi_hp = plan.zi_hp_b if is_bus_b else plan.zi_hp_a
+        zi_ap = plan.zi_ap_b if is_bus_b else plan.zi_ap_a
+        reg_bands = plan.region_band_b if is_bus_b else plan.region_band_a
+        any_solo = plan.any_solo
+        K = len(plan.split_freqs)
+
+        for i in range(K):
+            np.copyto(reg, rem)
+            _apply_sos_channel_first_inplace(plan.lp4_sos[i], reg, zi_lp[i], "LR")
+            _apply_sos_channel_first_inplace(plan.hp4_sos[i], rem, zi_hp[i], "LR")
+            ap_s = plan.ap_sos[i]
+            if ap_s is not None and zi_ap[i] is not None:
+                _apply_sos_channel_first_inplace(ap_s, reg, zi_ap[i], "LR")
+
+            owner = reg_bands[i]
+            if owner is not None:
+                write_tel = (not is_bus_b) or (owner.bus_target == "B")
+                self._process_band_inplace(reg, owner, is_bus_b, tls, write_tel)
+            if not any_solo or (owner is not None and owner.solo):
+                sum_buf += reg
+
+        # Región superior restante
+        owner_top = reg_bands[K]
+        if owner_top is not None:
+            write_tel = (not is_bus_b) or (owner_top.bus_target == "B")
+            self._process_band_inplace(rem, owner_top, is_bus_b, tls, write_tel)
+        if not any_solo or (owner_top is not None and owner_top.solo):
+            sum_buf += rem
+
+        return sum_buf
+
+    def process_dual_block(self, out_a: np.ndarray, out_b: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Procesa en paralelo phase-coherent out_a y out_b en tiempo real sin adquirir locks.
+        Utiliza ruta rápida single-pass cuando todas las bandas activas apuntan a 'A+B'
+        y out_a / out_b son idénticos.
+        """
+        plan = self._plan
+        frames = out_a.shape[0] if out_a.ndim > 0 else 0
+        if self.bypass or not plan.any_active or frames == 0:
+            for b in plan.active_bands:
+                b.live_gr_db = 0.0
+                b.live_level_db = -90.0
+            return out_a, out_b
+
+        tls = self._ensure_tls(frames)
+        work_a = tls.work_a
+        work_a[0] = out_a[:, 0]
+        work_a[1] = out_a[:, 1]
+
+        single_pass = plan.shared_ab and (out_a is out_b or np.array_equal(out_a, out_b))
+        sum_a = self._process_single_bus(work_a, plan, is_bus_b=False, tls=tls)
+        out_a_f32 = tls.out_a_f32
+        out_a_f32[:, 0] = sum_a[0]
+        out_a_f32[:, 1] = sum_a[1]
+
+        if single_pass:
+            K = len(plan.split_freqs)
+            for i in range(K):
+                np.copyto(plan.zi_lp_b[i], plan.zi_lp_a[i])
+                np.copyto(plan.zi_hp_b[i], plan.zi_hp_a[i])
+                if plan.zi_ap_b[i] is not None and plan.zi_ap_a[i] is not None:
+                    np.copyto(plan.zi_ap_b[i], plan.zi_ap_a[i])
+            for b in plan.active_bands:
+                b._gr_env_b = b._gr_env_a
+                b._prev_glin_b = b._prev_glin_a
+                b._lvl_env_b = b._lvl_env_a
+                b._bright_z_b[0] = b._bright_z_a[0]
+                b._bright_z_b[1] = b._bright_z_a[1]
+            out_b_f32 = tls.out_b_f32
+            np.copyto(out_b_f32, out_a_f32)
+            return out_a_f32, out_b_f32
+
+        work_b = tls.work_b
+        work_b[0] = out_b[:, 0]
+        work_b[1] = out_b[:, 1]
+        sum_b = self._process_single_bus(work_b, plan, is_bus_b=True, tls=tls)
+        out_b_f32 = tls.out_b_f32
+        out_b_f32[:, 0] = sum_b[0]
+        out_b_f32[:, 1] = sum_b[1]
+        return out_a_f32, out_b_f32
+
+    def get_band_response_curves_db(
+        self, z1: np.ndarray, z2: np.ndarray, target_bus: str = "A"
+    ) -> tuple[dict[int, np.ndarray], np.ndarray]:
+        """
+        Devuelve `(band_curves_by_idx, net_db)` evaluando de forma exacta la cascada LR4+AP2:
+        - Cada banda `idx` recibe su curva individual analítica (0 dB fuera de sus cruces y suave LR4 dentro)
+          para que la sombra de banda y la curva maestra coincidan píxel por píxel.
+        """
+        n = len(z1)
+        zeros = np.zeros(n, dtype=np.float64)
+        plan = self._plan
+        if self.bypass or not plan.any_active:
+            return {}, zeros
+
+        is_b = (target_bus == "B")
+        reg_bands = plan.region_band_b if is_b else plan.region_band_a
+        K = len(plan.split_freqs)
+        any_solo = plan.any_solo
+
+        rem_h = np.ones(n, dtype=np.complex128)
+        tot_h = np.zeros(n, dtype=np.complex128)
+        ap_total_h = np.zeros(n, dtype=np.complex128)
+        owner_reg_h: dict[int, np.ndarray] = {}
+        id_to_band: dict[int, DynamicsBand] = {}
+
+        for i in range(K):
+            h_lp = eval_sos_complex_fast(plan.lp4_sos[i], z1, z2)
+            h_hp = eval_sos_complex_fast(plan.hp4_sos[i], z1, z2)
+            reg_h = rem_h * h_lp
+            ap_s = plan.ap_sos[i]
+            if ap_s is not None:
+                reg_h = reg_h * eval_sos_complex_fast(ap_s, z1, z2)
+            ap_total_h += reg_h
+
+            owner = reg_bands[i]
+            if owner is not None:
+                oid = id(owner)
+                id_to_band[oid] = owner
+                if oid in owner_reg_h:
+                    owner_reg_h[oid] = owner_reg_h[oid] + reg_h
+                else:
+                    owner_reg_h[oid] = reg_h
+            if not any_solo or (owner is not None and owner.solo):
+                g_db = (owner.output_gain_db + owner.live_gr_db) if owner is not None else 0.0
+                tot_h += reg_h * (10.0 ** (g_db * 0.05))
+            rem_h = rem_h * h_hp
+
+        ap_total_h += rem_h
+        owner_top = reg_bands[K]
+        if owner_top is not None:
+            oid = id(owner_top)
+            id_to_band[oid] = owner_top
+            if oid in owner_reg_h:
+                owner_reg_h[oid] = owner_reg_h[oid] + rem_h
+            else:
+                owner_reg_h[oid] = rem_h
+        if not any_solo or (owner_top is not None and owner_top.solo):
+            g_db = (owner_top.output_gain_db + owner_top.live_gr_db) if owner_top is not None else 0.0
+            tot_h += rem_h * (10.0 ** (g_db * 0.05))
+
+        band_curves: dict[int, np.ndarray] = {}
+        for idx, b in enumerate(self.bands):
+            oid = id(b)
+            h_b = owner_reg_h.get(oid)
+            if h_b is None or (any_solo and not b.solo):
+                band_curves[idx] = zeros
+                continue
+            g_db = b.output_gain_db + b.live_gr_db
+            if abs(g_db) < 0.02:
+                band_curves[idx] = zeros
+            else:
+                g_lin = 10.0 ** (g_db * 0.05)
+                h_single = ap_total_h + (g_lin - 1.0) * h_b
+                band_curves[idx] = 20.0 * np.log10(np.maximum(np.abs(h_single), 1e-6))
+
+        net_db = 20.0 * np.log10(np.maximum(np.abs(tot_h), 1e-6))
+        return band_curves, net_db
+
+    def get_net_response_db(self, z1: np.ndarray, z2: np.ndarray, target_bus: str = "A") -> np.ndarray:
+        """Calcula la respuesta neta analítica LR4+AP2 (ganancia de salida + GR en vivo)."""
+        _, net_db = self.get_band_response_curves_db(z1, z2, target_bus=target_bus)
+        return net_db
+
+    def to_dict(self) -> dict:
+        with self.lock:
+            return {
+                "bypass": bool(self.bypass),
+                "bands": [b.to_dict() for b in self.bands],
+            }
+
+    def load_from_dict(self, data: dict):
+        if not isinstance(data, dict):
+            return
+        with self.lock:
+            self.bypass = bool(data.get("bypass", False))
+            loaded: list[DynamicsBand] = []
+            raw_bands = data.get("bands", [])
+            if isinstance(raw_bands, list):
+                for item in raw_bands[:MAX_MB_BANDS]:
+                    if isinstance(item, dict):
+                        loaded.append(DynamicsBand.from_dict(item))
+            self.bands = loaded
+            self._clamp_non_overlapping()
+            self.static_version += 1
+            self._rebuild_plan()

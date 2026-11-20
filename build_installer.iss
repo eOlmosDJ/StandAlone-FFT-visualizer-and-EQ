@@ -1,22 +1,28 @@
 ; =====================================================================
-; Inno Setup Script para BDJ-FFT-EQ & Limiter
+; Inno Setup Script para Heaviside DSP
 ; Compilador: Inno Setup 6 / 7 (ISCC.exe)
-; Genera: Instalador\setup.exe
+; Genera: Instalador\Heaviside DSP Setup.exe
 ; =====================================================================
 
 [Setup]
-AppId={{BDJ-FFT-EQ-LIMITER-BAUTISTA-OLMOS}}
-AppName=BDJ Standalone Fast Fourier Transform analyzer, equalizer and limiter
+AppId={{HEAVISIDE-DSP-BAUTISTA-OLMOS}}
+AppName=Heaviside DSP
 AppVersion=1.2.0
 AppPublisher=Bautista Eneas Olmos
-DefaultDirName={autopf}\BDJ_FFT_EQ
+VersionInfoDescription=Heaviside DSP Setup
+VersionInfoProductName=Heaviside DSP
+VersionInfoProductVersion=1.2.0
+VersionInfoVersion=1.2.0.0
+VersionInfoCompany=Bautista Eneas Olmos
+DefaultDirName={autopf}\Heaviside DSP
 DisableProgramGroupPage=yes
 OutputDir=.\Instalador
-OutputBaseFilename=setup
+OutputBaseFilename=Heaviside DSP Setup
 Compression=lzma2/ultra64
 SolidCompression=yes
 SetupIconFile=icon.ico
-UninstallDisplayIcon={app}\FFTEQ&LIM.exe
+UninstallDisplayIcon={app}\Heaviside DSP.exe
+UninstallDisplayName=Heaviside DSP
 ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
@@ -31,19 +37,19 @@ Name: "autostart"; Description: "Iniciar automáticamente con Windows"; GroupDes
 
 [Dirs]
 Name: "{app}\presets"; Permissions: users-modify
-Name: "{userappdata}\BDJ_FFT_EQ\presets"; Flags: uninsneveruninstall
+Name: "{userappdata}\Heaviside_DSP\presets"; Flags: uninsneveruninstall
 
 [Files]
-Source: "dist\FFTEQ&LIM.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "dist\Heaviside DSP.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "icon.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "README.md"; DestDir: "{app}"; Flags: ignoreversion isreadme
 
 [Icons]
-Name: "{autoprograms}\BDJ FFT-EQ"; Filename: "{app}\FFTEQ&LIM.exe"; IconFilename: "{app}\icon.ico"
-Name: "{autodesktop}\BDJ FFT-EQ"; Filename: "{app}\FFTEQ&LIM.exe"; IconFilename: "{app}\icon.ico"; Tasks: desktopicon
+Name: "{autoprograms}\Heaviside DSP"; Filename: "{app}\Heaviside DSP.exe"; IconFilename: "{app}\icon.ico"; AppUserModelID: "heaviside.dsp.1.0"
+Name: "{autodesktop}\Heaviside DSP"; Filename: "{app}\Heaviside DSP.exe"; IconFilename: "{app}\icon.ico"; AppUserModelID: "heaviside.dsp.1.0"; Tasks: desktopicon
 
 [Registry]
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "BDJ_FFT_EQ"; ValueData: """{app}\FFTEQ&LIM.exe"""; Tasks: autostart; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "Heaviside_DSP"; ValueData: """{app}\Heaviside DSP.exe"""; Tasks: autostart; Flags: uninsdeletevalue
 
 [Run]
-Filename: "{app}\FFTEQ&LIM.exe"; Description: "{cm:LaunchProgram,BDJ FFT-EQ}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\Heaviside DSP.exe"; Description: "{cm:LaunchProgram,Heaviside DSP}"; Flags: nowait postinstall skipifsilent

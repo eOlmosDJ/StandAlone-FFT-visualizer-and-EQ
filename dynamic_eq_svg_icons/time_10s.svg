@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48" fill="none">
+<title>time_10s</title>
+<path d="M24 6A18 18 0 1 1 8.5 33" stroke="#8290A5" stroke-width="2.6" stroke-linecap="round"/>
+<path d="M5.5 29L8.5 34L13.5 31" stroke="#8290A5" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M12.5 20L15 17V31" stroke="#35C6E8" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"/>
+<rect x="19.5" y="17" width="6.5" height="14" rx="3.2" stroke="#35C6E8" stroke-width="2.8"/>
+<path d="M36 23C36 21.7 34.7 21.2 33.2 21.2C31.6 21.2 30.4 22.1 30.4 23.5C30.4 24.9 31.6 25.4 33.4 25.9C35.2 26.4 36.3 27.2 36.3 28.7C36.3 30.2 34.9 31.1 33.1 31.1C31.4 31.1 30.3 30.4 30 29.4" stroke="#35C6E8" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

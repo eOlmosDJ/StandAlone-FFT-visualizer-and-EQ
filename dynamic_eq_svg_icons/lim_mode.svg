@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48" fill="none">
+<title>lim_mode</title>
+<path d="M8 38L23 21h19" stroke="#FFA94D" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M6 21h36" stroke="#FF6B78" stroke-width="1.5" stroke-dasharray="3 2.5"/>
+<circle cx="23" cy="21" r="3" fill="#FF6B78"/>
+</svg>

@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48" fill="none">
+<title>all_pass</title>
+<path d="M4 24h40" stroke="#35C6E8" stroke-width="2.6" stroke-linecap="round"/>
+<path d="M10 15c8 0 10 18 18 18h10" stroke="#B18CFF" stroke-width="2.2" stroke-linecap="round" stroke-dasharray="3 2.5"/>
+<text x="24" y="21" fill="#DCE4EF" font-family="Segoe UI,Arial,sans-serif" font-size="11" font-weight="bold" text-anchor="middle">Φ</text>
+<path d="M4 39h40" stroke="#8290A5" stroke-width="1.5" opacity=".7"/>
+</svg>

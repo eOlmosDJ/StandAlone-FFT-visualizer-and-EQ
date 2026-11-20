@@ -2,7 +2,7 @@
 setlocal enabledelayedexpansion
 
 echo ========================================================
-echo   Compilando BDJ-FFT-EQ & Limiter Standalone
+echo   Compilando Heaviside DSP Standalone
 echo ========================================================
 echo.
 echo 1. Verificando dependencias...
@@ -14,7 +14,7 @@ if errorlevel 1 (
 )
 echo.
 echo 2. Generando ejecutable standalone optimizado con PyInstaller...
-pyinstaller "FFTEQ&LIM.spec" --noconfirm
+pyinstaller "Heaviside DSP.spec" --noconfirm
 if errorlevel 1 (
     echo [ERROR] Fallo PyInstaller al compilar el ejecutable.
     pause
@@ -23,7 +23,7 @@ if errorlevel 1 (
 
 echo.
 echo ========================================================
-echo   Ejecutable generado con exito: dist\FFTEQ&LIM.exe
+echo   Ejecutable generado con exito: dist\Heaviside DSP.exe
 echo ========================================================
 echo.
 echo 3. Buscando compilador de Inno Setup (ISCC)...
@@ -40,19 +40,19 @@ if not defined ISCC_PATH (
 
 if defined ISCC_PATH (
     echo Compilador Inno Setup encontrado en: "!ISCC_PATH!"
-    echo Compilando instalador setup.exe con setup.iss...
+    echo Compilando instalador Heaviside DSP Setup.exe con setup.iss...
     "!ISCC_PATH!" "setup.iss"
     if errorlevel 1 (
         echo [ADVERTENCIA] Fallo la compilacion de Inno Setup.
     ) else (
         echo.
         echo ========================================================
-        echo   Instalador generado con exito: setup.exe
+        echo   Instalador generado con exito: Heaviside DSP Setup.exe
         echo ========================================================
     )
 ) else (
     echo [INFO] Inno Setup no fue encontrado en las rutas estandar ni en el PATH.
-    echo Para compilar el instalador setup.exe:
+    echo Para compilar el instalador Heaviside DSP Setup.exe:
     echo 1. Instala Inno Setup 6 o 7 (https://jrsoftware.org/isdl.php)
     echo 2. Abre setup.iss (o setup.ino) y pulsa Run/Compile (Ctrl+F9).
 )

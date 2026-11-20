@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48" fill="none">
+<title>exp_mode</title>
+<path d="M12 40l12-18 16-14" stroke="#55D6A3" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M8 38L40 8" stroke="#8290A5" stroke-width="1.6" stroke-dasharray="3 3" opacity=".65"/>
+<circle cx="24" cy="22" r="3" fill="#55D6A3"/>
+</svg>

@@ -14,13 +14,14 @@ if sys.platform == "win32":
     try:
         import ctypes
         ctypes.windll.winmm.timeBeginPeriod(1)
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("bdj.ffteq.audioanalyzer.1.0")
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("heaviside.dsp.1.0")
     except Exception:
         pass
 
 import json
 import math
 import queue
+import time
 import collections
 import threading
 import numpy as np
@@ -175,16 +176,19 @@ except Exception:
     pg.setConfigOptions(antialias=True)
 
 from eq_ui import (
-    ProQ4Overlay, FloatingBandHUD, LiquidGlassButton, style_dark_combobox,
-    style_hud_spinbox, HUDPopupDialog, HUDPopupMenu, HUDOpenGLBackgroundItem,
+    ProQ4Overlay, FloatingBandHUD, LiquidGlassButton, SvgToggleButton, SvgActionButton,
+    ColorSwatchButton, RangeDbSvgButton, TimeWindowSvgButton, AutoGainScopeMeter,
+    style_dark_combobox, style_hud_spinbox, HUDPopupDialog, HUDPopupMenu, HUDOpenGLBackgroundItem,
     LimiterControlPopup, LimiterGRMiniWidget, MiniOscilloscopeWidget, CompactScopeGLWidget,
-    AutoGainMiniBar, CrossoverMenuWidget, EditInputSelector, CrossoverLineItem
+    AutoGainMiniBar, CrossoverMenuWidget, EditInputSelector, CanvasModeSelector, CrossoverLineItem
 )
 from fft_analyzer import FFTSpectrumAnalyzer, FFTComputationWorker
 from eq_dsp import (
     ParametricEQEngine, DualOutputCrossover, AsyncInputRingBuffer,
-    smooth_spectrum_12th_octave, detect_resonances, eval_sos_mag_db_fast
+    MultibandDynamicsProcessor, smooth_spectrum_12th_octave,
+    detect_resonances, eval_sos_mag_db_fast
 )
+from help_tour import InteractiveHelpTour
 
 
 def get_resource_path(relative_path: str) -> str:
@@ -193,31 +197,92 @@ def get_resource_path(relative_path: str) -> str:
     return os.path.join(base_path, relative_path)
 
 
+_retained_win_hicons: list[int] = []
+_win_hicons_cache: dict[str, tuple[int, int]] = {}
+
+
 def apply_windows_taskbar_icon(hwnd: int, icon_path: str):
     """Asegura que el HWND nativo de Windows reciba explícitamente los iconos grande y pequeño vía Win32 API."""
     if sys.platform != "win32" or not hwnd or not icon_path or not os.path.exists(icon_path):
         return
+    if not icon_path.lower().endswith(".ico"):
+        return
     try:
         import ctypes
+        from ctypes import wintypes
+
         WM_SETICON = 0x0080
         ICON_SMALL = 0
         ICON_BIG = 1
         IMAGE_ICON = 1
         LR_LOADFROMFILE = 0x00000010
         LR_DEFAULTSIZE = 0x00000040
+        SM_CXICON = 11
+        SM_CYICON = 12
+        SM_CXSMICON = 49
+        SM_CYSMICON = 50
         abs_path = os.path.abspath(icon_path)
 
-        # Cargar HICON explícito de tamaño nativo/grande (Barra de tareas / Alt-Tab) y 16x16 (Barra de título)
-        hicon_big = ctypes.windll.user32.LoadImageW(
-            None, abs_path, IMAGE_ICON, 0, 0, LR_LOADFROMFILE | LR_DEFAULTSIZE
-        )
-        hicon_small = ctypes.windll.user32.LoadImageW(
-            None, abs_path, IMAGE_ICON, 16, 16, LR_LOADFROMFILE
-        )
+        user32 = ctypes.windll.user32
+        user32.GetSystemMetrics.argtypes = [wintypes.INT]
+        user32.GetSystemMetrics.restype = wintypes.INT
+        user32.LoadImageW.argtypes = [
+            wintypes.HINSTANCE,
+            wintypes.LPCWSTR,
+            wintypes.UINT,
+            wintypes.INT,
+            wintypes.INT,
+            wintypes.UINT,
+        ]
+        user32.LoadImageW.restype = wintypes.HANDLE
+        user32.SendMessageW.argtypes = [
+            wintypes.HWND,
+            wintypes.UINT,
+            wintypes.WPARAM,
+            wintypes.LPARAM,
+        ]
+        user32.SendMessageW.restype = ctypes.c_ssize_t
+
+        cached = _win_hicons_cache.get(abs_path)
+        if cached is not None:
+            hicon_big, hicon_small = cached
+        else:
+            cx_big = int(user32.GetSystemMetrics(SM_CXICON) or 0)
+            cy_big = int(user32.GetSystemMetrics(SM_CYICON) or 0)
+            cx_small = int(user32.GetSystemMetrics(SM_CXSMICON) or 0)
+            cy_small = int(user32.GetSystemMetrics(SM_CYSMICON) or 0)
+
+            big_flags = LR_LOADFROMFILE | (LR_DEFAULTSIZE if cx_big <= 0 or cy_big <= 0 else 0)
+            small_flags = LR_LOADFROMFILE | (LR_DEFAULTSIZE if cx_small <= 0 or cy_small <= 0 else 0)
+            if cx_small <= 0 or cy_small <= 0:
+                cx_small, cy_small = 16, 16
+                small_flags = LR_LOADFROMFILE
+
+            hicon_big = int(user32.LoadImageW(None, abs_path, IMAGE_ICON, cx_big, cy_big, big_flags) or 0)
+            hicon_small = int(user32.LoadImageW(None, abs_path, IMAGE_ICON, cx_small, cy_small, small_flags) or 0)
+            _win_hicons_cache[abs_path] = (hicon_big, hicon_small)
+            if hicon_big:
+                _retained_win_hicons.append(hicon_big)
+            if hicon_small:
+                _retained_win_hicons.append(hicon_small)
+
         if hicon_big:
-            ctypes.windll.user32.SendMessageW(hwnd, WM_SETICON, ICON_BIG, hicon_big)
+            user32.SendMessageW(int(hwnd), WM_SETICON, ICON_BIG, hicon_big)
         if hicon_small:
-            ctypes.windll.user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, hicon_small)
+            user32.SendMessageW(int(hwnd), WM_SETICON, ICON_SMALL, hicon_small)
+
+        # Actualizar también el icono de clase de la ventana (GCLP_HICON / GCLP_HICONSM)
+        # para que la barra de tareas y Alt-Tab de Windows 10/11 muestren siempre el icono.
+        GCLP_HICON = -14
+        GCLP_HICONSM = -34
+        set_class_long_ptr = getattr(user32, "SetClassLongPtrW", None)
+        if set_class_long_ptr is not None:
+            set_class_long_ptr.argtypes = [wintypes.HWND, wintypes.INT, ctypes.c_ssize_t]
+            set_class_long_ptr.restype = ctypes.c_ssize_t
+            if hicon_big:
+                set_class_long_ptr(int(hwnd), GCLP_HICON, int(hicon_big))
+            if hicon_small:
+                set_class_long_ptr(int(hwnd), GCLP_HICONSM, int(hicon_small))
     except Exception:
         pass
 
@@ -228,6 +293,7 @@ THEME_PRESETS = {
         "background": "#141414", "curve": "#00E5FF", "curve_width": 15,
         "curve_in": "#9E9E9E", "curve_in2": "#BA68C8", "curve_out1": "#00E5FF", "curve_out2": "#00E676",
         "curve_rta": "#FFD740", "curve_eq_a": "#FFD54F", "curve_eq_b": "#00E5FF",
+        "mini_scope": "#00E5FF",
         "fill": "#6E747E", "fill_alpha": 40,
         "grid": "#2A2A2A", "grid_alpha": 45, "axis_text": "#8C919B",
     },
@@ -235,6 +301,7 @@ THEME_PRESETS = {
         "background": "#1E1E1E", "curve": "#C5CAD3", "curve_width": 16,
         "curve_in": "#9E9E9E", "curve_in2": "#BA68C8", "curve_out1": "#00E5FF", "curve_out2": "#00E676",
         "curve_rta": "#FFD740", "curve_eq_a": "#FFD54F", "curve_eq_b": "#00E5FF",
+        "mini_scope": "#00E5FF",
         "fill": "#767C87", "fill_alpha": 42,
         "grid": "#333333", "grid_alpha": 45, "axis_text": "#989EA8",
     },
@@ -242,6 +309,7 @@ THEME_PRESETS = {
         "background": "#080808", "curve": "#00E5FF", "curve_width": 17,
         "curve_in": "#9E9E9E", "curve_in2": "#BA68C8", "curve_out1": "#00E5FF", "curve_out2": "#00E676",
         "curve_rta": "#FFD740", "curve_eq_a": "#FFD54F", "curve_eq_b": "#00E5FF",
+        "mini_scope": "#00E5FF",
         "fill": "#00ACC1", "fill_alpha": 42,
         "grid": "#222222", "grid_alpha": 45, "axis_text": "#858A94",
     },
@@ -249,6 +317,7 @@ THEME_PRESETS = {
         "background": "#0D1017", "curve": "#A0AAB8", "curve_width": 15,
         "curve_in": "#9E9E9E", "curve_in2": "#BA68C8", "curve_out1": "#00E5FF", "curve_out2": "#00E676",
         "curve_rta": "#FFD740", "curve_eq_a": "#FFD54F", "curve_eq_b": "#00E5FF",
+        "mini_scope": "#00E5FF",
         "fill": "#606B7D", "fill_alpha": 38,
         "grid": "#2D3340", "grid_alpha": 30, "axis_text": "#7A8496",
     },
@@ -256,6 +325,7 @@ THEME_PRESETS = {
         "background": "#140C02", "curve": "#FFB300", "curve_width": 20,
         "curve_in": "#9E9E9E", "curve_in2": "#BA68C8", "curve_out1": "#FFB300", "curve_out2": "#00E676",
         "curve_rta": "#FFD740", "curve_eq_a": "#FFD54F", "curve_eq_b": "#00E5FF",
+        "mini_scope": "#FFB300",
         "fill": "#FF8F00", "fill_alpha": 50,
         "grid": "#8A6A3A", "grid_alpha": 35, "axis_text": "#D9B98A",
     },
@@ -272,7 +342,7 @@ THEME_NUMERIC_RANGES = {"curve_width": (10, 60), "fill_alpha": (0, 255), "grid_a
 THEME_COLOR_KEYS = (
     "background", "curve", "fill", "grid", "axis_text",
     "curve_in", "curve_in2", "curve_out1", "curve_out2",
-    "curve_rta", "curve_eq_a", "curve_eq_b"
+    "curve_rta", "curve_eq_a", "curve_eq_b", "mini_scope"
 )
 CONFIG_FILENAME = "config.json"
 CURRENT_CONFIG_VERSION = 4
@@ -319,14 +389,14 @@ def _is_writable_dir(path: str) -> bool:
 
 def _user_data_dir() -> str:
     """
-    Retorna el directorio de datos de usuario (%APPDATA%\\BDJ_FFT_EQ).
+    Retorna el directorio de datos de usuario (%APPDATA%\\Heaviside_DSP).
     Garantiza que la carpeta exista con permisos de lectura/escritura completos.
     """
     appdata = os.environ.get("APPDATA")
     if appdata:
-        base = os.path.join(appdata, "BDJ_FFT_EQ")
+        base = os.path.join(appdata, "Heaviside_DSP")
     else:
-        base = os.path.join(os.path.expanduser("~"), ".bdj_fft_eq")
+        base = os.path.join(os.path.expanduser("~"), ".heaviside_dsp")
     try:
         os.makedirs(base, exist_ok=True)
     except OSError:
@@ -338,20 +408,25 @@ def _config_candidates():
     paths = []
     user_cfg = os.path.join(_user_data_dir(), CONFIG_FILENAME)
     appdata = os.environ.get("APPDATA")
-    legacy_cfg = os.path.join(appdata, "AnalizadorFFT", CONFIG_FILENAME) if appdata else None
+    legacy_bdj_cfg = os.path.join(appdata, "BDJ_FFT_EQ", CONFIG_FILENAME) if appdata else None
+    legacy_fft_cfg = os.path.join(appdata, "AnalizadorFFT", CONFIG_FILENAME) if appdata else None
     app_cfg = os.path.join(_app_dir(), CONFIG_FILENAME)
 
     if _is_writable_dir(_app_dir()):
         # Modo desarrollo o portátil: prioridad a la carpeta local junto al .exe
         paths.append(app_cfg)
         paths.append(user_cfg)
-        if legacy_cfg:
-            paths.append(legacy_cfg)
+        if legacy_bdj_cfg:
+            paths.append(legacy_bdj_cfg)
+        if legacy_fft_cfg:
+            paths.append(legacy_fft_cfg)
     else:
         # Modo instalado en Program Files: prioridad absoluta a datos de usuario
         paths.append(user_cfg)
-        if legacy_cfg:
-            paths.append(legacy_cfg)
+        if legacy_bdj_cfg:
+            paths.append(legacy_bdj_cfg)
+        if legacy_fft_cfg:
+            paths.append(legacy_fft_cfg)
         paths.append(app_cfg)
 
     return [p for p in paths if p]
@@ -398,6 +473,8 @@ def load_full_config() -> dict:
         theme["curve_eq_a"] = "#FFD54F"
     if "curve_eq_b" not in theme:
         theme["curve_eq_b"] = "#00E5FF"
+    if "mini_scope" not in theme:
+        theme["mini_scope"] = "#00E5FF"
 
     raw_data["theme"] = theme
     return raw_data
@@ -794,47 +871,43 @@ CompactScopeGLWidget = MiniOscilloscopeWidget
 
 class WaveformScopeWidget(QWidget):
     """
-    Vista Compacta Integrada en la Top Bar Flotante con estética Apple Liquid Glass.
-    Incluye Mini-Osciloscopio a 60 FPS reales y 0% CPU con Scroll Blitting de 1 píxel,
-    control de tiempo (1s / 5s / 10s) y resplandor 'LED' de alerta del Limitador Master.
+    Vista Compacta Flotante Integrada en la Top Bar sin marco ni caja exterior:
+    Mini-Osciloscopio transparente a 60 FPS reales y 0% CPU con Scroll Blitting.
     """
 
     toggleExpandedRequested = pyqtSignal()
     durationChanged = pyqtSignal(int)
+    miniScopeColorRequested = pyqtSignal()
 
     def __init__(self, env_buffer: WaveformEnvelopeBuffer, parent=None):
         super().__init__(parent)
         self.env_buffer = env_buffer
         self._limit_glow_alpha: float = 0.0
         self.current_duration_sec: int = 10
-        self.setFixedHeight(30)
-        self.setMinimumWidth(130)
-        self.setMaximumWidth(240)
+        self.setFixedHeight(36)
+        self.setMinimumWidth(160)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
 
         row = QHBoxLayout(self)
-        row.setContentsMargins(5, 3, 5, 3)
+        row.setContentsMargins(4, 2, 4, 2)
         row.setSpacing(4)
 
         self.mini_scope = MiniOscilloscopeWidget(self)
-        self.mini_scope.setFixedHeight(22)
-        self.mini_scope.setMinimumWidth(60)
+        self.mini_scope.setFixedHeight(32)
+        self.mini_scope.setMinimumWidth(110)
         self.mini_scope.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.mini_scope.set_time_window(10.0)
         self.mini_scope.clicked.connect(self.toggleExpandedRequested.emit)
+        self.mini_scope.colorPickRequested.connect(self.miniScopeColorRequested.emit)
         self.canvas = self.mini_scope  # compat alias
         row.addWidget(self.mini_scope, 1)
 
-        self.dur_btn = LiquidGlassButton("10s", self, pill_radius=6.0)
-        self.dur_btn.setFixedSize(36, 22)
-        self.dur_btn.setToolTip("Alternar tiempo del osciloscopio: 1s -> 5s -> 10s")
-        self.dur_btn.clicked.connect(self._cycle_duration)
-        self.btn_scope_time = self.dur_btn  # compat alias
-        row.addWidget(self.dur_btn)
-
-        self.expand_btn = LiquidGlassButton("▾", self, active_tint_color="#00E5FF", pill_radius=6.0)
-        self.expand_btn.setCheckable(True)
-        self.expand_btn.setFixedSize(24, 22)
+        self.expand_btn = SvgToggleButton(
+            "chevron_up.svg", "▾", self, active_tint_color="#00E5FF", pill_radius=6.0,
+            off_svg_name="chevron_down.svg"
+        )
+        self.expand_btn.setFixedSize(24, 24)
         self.expand_btn.setToolTip("Desplegar / Plegar Osciloscopio detallado")
         self.expand_btn.clicked.connect(self.toggleExpandedRequested.emit)
         row.addWidget(self.expand_btn)
@@ -844,20 +917,17 @@ class WaveformScopeWidget(QWidget):
     def setAccentColor(self, hex_color: str):
         if hex_color:
             self._accent_color = QColor(hex_color)
-            self.dur_btn.setActiveTintColor(hex_color)
             self.expand_btn.setActiveTintColor(hex_color)
             self.update()
 
     def update_gr(self, gr_db: float):
-        """Actualiza el nivel de reducción de ganancia y modula el glow del LED analógico."""
+        """Actualiza el nivel de reducción de ganancia del Limitador Master."""
         if gr_db < -0.2:
             self._limit_glow_alpha = 1.0
         else:
             self._limit_glow_alpha = max(0.0, self._limit_glow_alpha - 0.08)
 
         self.mini_scope.set_current_gr(gr_db)
-        if self._limit_glow_alpha > 0.0:
-            self.update()
 
     def _cycle_duration(self):
         """Alterna cíclicamente el tiempo entre 1s -> 5s -> 10s -> 1s."""
@@ -871,7 +941,6 @@ class WaveformScopeWidget(QWidget):
         if sec not in (1, 3, 5, 10):
             sec = 10
         self.current_duration_sec = sec
-        self.dur_btn.setText(f"{sec}s")
         self.mini_scope.set_time_window(float(sec))
         if hasattr(self, "env_buffer") and self.env_buffer is not None:
             self.env_buffer.duration_sec = sec
@@ -884,140 +953,54 @@ class WaveformScopeWidget(QWidget):
 
     def refresh_scope(self):
         self.mini_scope.refresh_scope()
-        if self._limit_glow_alpha > 0.0:
-            self.update()
 
     def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        rect = QRectF(1.0, 1.0, self.width() - 2.0, self.height() - 2.0)
-        r = 7.0
-
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(16, 18, 24, 132))
-        painter.drawRoundedRect(rect, r, r)
-
-        if getattr(self, "_expanded", False):
-            tint = QColor(self._accent_color)
-            tint.setAlpha(28)
-            painter.setBrush(tint)
-            painter.drawRoundedRect(rect, r, r)
-
-        # "LED" de Alerta: Resplandor (Glow) del Limitador Master
-        if self._limit_glow_alpha > 0.0:
-            glow_pen = QPen(QColor(213, 0, 249, int(175 * self._limit_glow_alpha)), 1.8)
-            painter.setPen(glow_pen)
-            painter.setBrush(QBrush(QColor(213, 0, 249, int(35 * self._limit_glow_alpha))))
-            painter.drawRoundedRect(rect, r, r)
-        else:
-            if getattr(self, "_expanded", False):
-                b_col = QColor(self._accent_color)
-                b_col.setAlpha(185)
-                painter.setPen(QPen(b_col, 1.2))
-            else:
-                painter.setPen(QPen(QColor(62, 68, 82, 155), 1.05))
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawRoundedRect(rect, r, r)
+        # Sin caja ni fondo sólido: la forma de onda flota directamente sobre el lienzo
+        return
 
 
 class ScopeSignalSettingsPopup(HUDPopupDialog):
     """
-    Popup flotante no-modal para seleccionar qué señales se visualizan en el osciloscopio desplegado,
-    personalizar sus colores (vía QColorDialog) y ajustar la opacidad global de las curvas,
-    siguiendo el diseño translúcido del HUD y renderizado por GPU con OpenGL.
+    Popup flotante no-modal gráfico SVG para seleccionar señales del osciloscopio,
+    personalizar sus colores (vía ColorSwatchButton circular) y ajustar opacidad global,
+    siguiendo el diseño translúcido HUD + Gaussian Blur en GPU con OpenGL.
     """
 
-    def __init__(self, overlay_widget: "WaveformOverlayWidget", parent=None):
-        super().__init__(parent=parent, accent_color="#00E5FF", corner_radius=10.0)
+    def __init__(self, overlay_widget: "WaveformOverlayWidget", parent=None, accent_color: str = "#00E5FF"):
+        acc_hex = str(accent_color) if accent_color else "#00E5FF"
+        super().__init__(parent=parent, accent_color=acc_hex, corner_radius=10.0)
         self.overlay = overlay_widget
-        self.setFixedWidth(460)
-        self.setStyleSheet("""
-            QWidget {
-                background: transparent;
-                color: #ECEFF4;
-                font-family: "Segoe UI", sans-serif;
-                font-size: 11px;
-            }
-            QCheckBox {
-                color: #D8DEE9;
-                spacing: 6px;
-                font-weight: 600;
-            }
-            QCheckBox::indicator {
-                width: 13px;
-                height: 13px;
-                border: 1px solid rgba(62, 68, 82, 180);
-                border-radius: 3px;
-                background-color: rgba(16, 18, 24, 150);
-            }
-            QCheckBox::indicator:checked {
-                background-color: #00E5FF;
-                border: 1px solid #00B0FF;
-            }
-            QSlider::groove:horizontal {
-                height: 4px;
-                background: rgba(43, 48, 60, 200);
-                border-radius: 2px;
-            }
-            QSlider::sub-page:horizontal {
-                background: #00E5FF;
-                border-radius: 2px;
-            }
-            QSlider::handle:horizontal {
-                background: #FFFFFF;
-                border: 1px solid #00B0FF;
-                width: 12px;
-                margin-top: -4px;
-                margin-bottom: -4px;
-                border-radius: 6px;
-            }
-            QPushButton#actionBtn {
-                background-color: rgba(16, 18, 24, 145);
-                color: #C5CDD9;
-                border: 1px solid rgba(62, 68, 82, 165);
-                border-radius: 5px;
-                padding: 3px 10px;
-                font-size: 10px;
-                font-weight: bold;
-            }
-            QPushButton#actionBtn:hover {
-                background-color: rgba(0, 229, 255, 36);
-                color: #FFFFFF;
-                border-color: #00E5FF;
-            }
-        """)
+        self._accent_color = acc_hex
+        self.setFixedWidth(440)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setContentsMargins(14, 10, 14, 12)
         layout.setSpacing(8)
 
-        # Encabezado
+        # Encabezado con botones SVG puros Reset y Cerrar
         hdr_row = QHBoxLayout()
-        title_lbl = QLabel("Configuración de Señales y Opacidad")
+        hdr_row.setSpacing(6)
+        title_lbl = QLabel("Señales y Opacidad")
         title_lbl.setStyleSheet("font-weight: bold; font-size: 11px; color: #E5E9F0;")
         hdr_row.addWidget(title_lbl)
         hdr_row.addStretch(1)
-        close_btn = QPushButton("✕")
-        close_btn.setFixedSize(18, 18)
-        close_btn.setStyleSheet("""
-            QPushButton {
-                background: transparent;
-                color: #8C919B;
-                border: none;
-                font-weight: bold;
-                font-size: 11px;
-            }
-            QPushButton:hover {
-                color: #FF5252;
-            }
-        """)
+
+        self.reset_btn = SvgActionButton("reset.svg", "Reset", self, active_tint_color=acc_hex)
+        self.reset_btn.setFixedSize(22, 22)
+        self.reset_btn.setToolTip("Restaurar señales y colores por defecto")
+        self.reset_btn.clicked.connect(self._reset_defaults)
+        hdr_row.addWidget(self.reset_btn)
+
+        close_btn = SvgActionButton("close.svg", "✕", self, active_tint_color="#FF6B78")
+        close_btn.setFixedSize(22, 22)
+        close_btn.setToolTip("Cerrar panel")
         close_btn.clicked.connect(self.close)
         hdr_row.addWidget(close_btn)
         layout.addLayout(hdr_row)
 
         # 3 Columnas: Entrada Pre-EQ, Salida 1 (Bus A), Salida 2 (Bus B)
         cols_row = QHBoxLayout()
-        cols_row.setSpacing(10)
+        cols_row.setSpacing(12)
 
         groups_data = [
             ("Entrada (Pre-EQ)", ["L_in", "R_in", "LR_in"]),
@@ -1038,18 +1021,24 @@ class ScopeSignalSettingsPopup(HUDPopupDialog):
             for key in keys:
                 item_row = QHBoxLayout()
                 item_row.setSpacing(6)
-                chk = QCheckBox(SHORT_SIGNAL_LABELS[key])
-                chk.setChecked(key in self.overlay.active_signals)
-                chk.toggled.connect(lambda chked, k=key: self._on_chk_toggled(k, chked))
-                self.checkboxes[key] = chk
-                item_row.addWidget(chk, 1)
-
-                swatch = QPushButton()
-                swatch.setFixedSize(20, 15)
-                swatch.setCursor(Qt.CursorShape.PointingHandCursor)
+                sig_svg = "left.svg" if key.startswith("L_") else ("right.svg" if key.startswith("R_") else "stereo.svg")
                 col_hex = self.overlay.signal_colors.get(key, "#FFFFFF")
-                swatch.setStyleSheet(f"background-color: {col_hex}; border: 1px solid #444C5C; border-radius: 3px;")
-                swatch.clicked.connect(lambda _, k=key, s=swatch: self._on_pick_color(k, s))
+
+                tog = SvgToggleButton(sig_svg, SHORT_SIGNAL_LABELS[key], self, active_tint_color=col_hex)
+                tog.setFixedSize(24, 22)
+                tog.setChecked(key in self.overlay.active_signals)
+                tog.setToolTip(f"Mostrar / ocultar señal {SHORT_SIGNAL_LABELS[key]}")
+                tog.toggled.connect(lambda chked, k=key: self._on_chk_toggled(k, chked))
+                self.checkboxes[key] = tog
+                item_row.addWidget(tog)
+
+                lbl = QLabel(SHORT_SIGNAL_LABELS[key], self)
+                lbl.setStyleSheet("color: #D8DEE9; font-size: 10px; font-weight: 600;")
+                item_row.addWidget(lbl, 1)
+
+                swatch = ColorSwatchButton(col_hex, self)
+                swatch.setToolTip(f"Color de {SHORT_SIGNAL_LABELS[key]}")
+                swatch.colorSelected.connect(lambda new_hex, k=key, t=tog: self._on_swatch_color_selected(k, new_hex, t))
                 self.swatches[key] = swatch
                 item_row.addWidget(swatch)
 
@@ -1062,14 +1051,14 @@ class ScopeSignalSettingsPopup(HUDPopupDialog):
         # Separador horizontal
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setStyleSheet("color: #2A2E38; margin: 2px 0;")
+        sep.setStyleSheet("background-color: rgba(255, 255, 255, 24); min-height: 1px; max-height: 1px;")
         layout.addWidget(sep)
 
         # Fila de Opacidad Global
         opac_row = QHBoxLayout()
         opac_row.setSpacing(8)
         opac_lbl = QLabel("Opacidad de curvas:")
-        opac_lbl.setStyleSheet("color: #D8DEE9; font-size: 10px;")
+        opac_lbl.setStyleSheet("color: #D8DEE9; font-size: 10px; font-weight: 600;")
         opac_row.addWidget(opac_lbl)
 
         self.opac_slider = QSlider(Qt.Orientation.Horizontal)
@@ -1077,26 +1066,51 @@ class ScopeSignalSettingsPopup(HUDPopupDialog):
         self.opac_slider.setValue(self.overlay.opacity_pct)
         self.opac_val_lbl = QLabel(f"{self.overlay.opacity_pct}%")
         self.opac_val_lbl.setFixedWidth(34)
-        self.opac_val_lbl.setStyleSheet("color: #00E5FF; font-weight: bold; font-size: 10px;")
 
         self.opac_slider.valueChanged.connect(self._on_opacity_slider_changed)
         opac_row.addWidget(self.opac_slider, 1)
         opac_row.addWidget(self.opac_val_lbl)
         layout.addLayout(opac_row)
 
-        # Botones inferiores: Restaurar por defecto y Cerrar
-        bottom_row = QHBoxLayout()
-        reset_btn = QPushButton("Restaurar por defecto")
-        reset_btn.setObjectName("actionBtn")
-        reset_btn.clicked.connect(self._reset_defaults)
-        bottom_row.addWidget(reset_btn)
-        bottom_row.addStretch(1)
+        self._apply_accent_styles(acc_hex)
 
-        done_btn = QPushButton("Listo")
-        done_btn.setObjectName("actionBtn")
-        done_btn.clicked.connect(self.close)
-        bottom_row.addWidget(done_btn)
-        layout.addLayout(bottom_row)
+    def setAccentColor(self, hex_color: str):
+        c = QColor(hex_color) if hex_color else QColor("#00E5FF")
+        hex_c = c.name()
+        self._accent_color = hex_c
+        super().setAccentColor(hex_c)
+        self._apply_accent_styles(hex_c)
+        if hasattr(self, "reset_btn"):
+            self.reset_btn.setActiveTintColor(hex_c)
+
+    def _apply_accent_styles(self, hex_c: str):
+        self.setStyleSheet(f"""
+            QWidget {{
+                background: transparent;
+                color: #ECEFF4;
+                font-family: "Segoe UI", sans-serif;
+                font-size: 11px;
+            }}
+            QSlider::groove:horizontal {{
+                height: 4px;
+                background: rgba(43, 48, 60, 200);
+                border-radius: 2px;
+            }}
+            QSlider::sub-page:horizontal {{
+                background: {hex_c};
+                border-radius: 2px;
+            }}
+            QSlider::handle:horizontal {{
+                background: #FFFFFF;
+                border: 1px solid {hex_c};
+                width: 12px;
+                margin-top: -4px;
+                margin-bottom: -4px;
+                border-radius: 6px;
+            }}
+        """)
+        if hasattr(self, "opac_val_lbl"):
+            self.opac_val_lbl.setStyleSheet(f"color: {hex_c}; font-weight: bold; font-size: 10px;")
 
     def _on_chk_toggled(self, key: str, checked: bool):
         if checked:
@@ -1107,17 +1121,12 @@ class ScopeSignalSettingsPopup(HUDPopupDialog):
         if hasattr(self.overlay, "app_ref") and self.overlay.app_ref:
             self.overlay.app_ref.schedule_config_save()
 
-    def _on_pick_color(self, key: str, swatch_btn: QPushButton):
-        curr_hex = self.overlay.signal_colors.get(key, "#FFFFFF")
-        dlg = QColorDialog(QColor(curr_hex), self)
-        dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
-        if dlg.exec():
-            new_hex = dlg.selectedColor().name()
-            self.overlay.signal_colors[key] = new_hex
-            swatch_btn.setStyleSheet(f"background-color: {new_hex}; border: 1px solid #444C5C; border-radius: 3px;")
-            self.overlay.invalidate_cache()
-            if hasattr(self.overlay, "app_ref") and self.overlay.app_ref:
-                self.overlay.app_ref.schedule_config_save()
+    def _on_swatch_color_selected(self, key: str, new_hex: str, tog: SvgToggleButton):
+        self.overlay.signal_colors[key] = new_hex
+        tog.setActiveTintColor(new_hex)
+        self.overlay.invalidate_cache()
+        if hasattr(self.overlay, "app_ref") and self.overlay.app_ref:
+            self.overlay.app_ref.schedule_config_save()
 
     def _on_opacity_slider_changed(self, val: int):
         self.opac_val_lbl.setText(f"{val}%")
@@ -1127,13 +1136,16 @@ class ScopeSignalSettingsPopup(HUDPopupDialog):
 
     def _reset_defaults(self):
         self.overlay.reset_signals_to_default()
-        for k, chk in self.checkboxes.items():
-            chk.blockSignals(True)
-            chk.setChecked(k in self.overlay.active_signals)
-            chk.blockSignals(False)
+        for k, tog in self.checkboxes.items():
+            col = self.overlay.signal_colors.get(k, "#FFFFFF")
+            tog.blockSignals(True)
+            tog.setChecked(k in self.overlay.active_signals)
+            tog.setActiveTintColor(col)
+            tog.blockSignals(False)
+            tog.update()
         for k, sw in self.swatches.items():
             col = self.overlay.signal_colors.get(k, "#FFFFFF")
-            sw.setStyleSheet(f"background-color: {col}; border: 1px solid #444C5C; border-radius: 3px;")
+            sw.setColor(col)
         self.opac_slider.blockSignals(True)
         self.opac_slider.setValue(self.overlay.opacity_pct)
         self.opac_slider.blockSignals(False)
@@ -1150,7 +1162,8 @@ class WaveformOverlayWidget(QWidget):
        o transparencias costosas sobre el lienzo OpenGL.
     2. Scroll Blitting multi-canal (< 1% CPU): Desplaza `self.wave_canvas` hacia la izquierda `dx`
        píxeles y dibuja únicamente la franja nueva de ancho `dx` para todas las señales activadas.
-    3. Selector interactivo `Señales y Color ▾` y control de opacidad en la cabecera.
+    3. Cabecera puramente gráfica SVG sin cajas: Señales/Color, Limitador + GR pulsante,
+       Crossover, medidor gráfico A/B de Auto-Gain y selector SVG de ventana temporal.
     """
 
     collapseRequested = pyqtSignal()
@@ -1177,45 +1190,57 @@ class WaveformOverlayWidget(QWidget):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setToolTip("Clic para plegar el osciloscopio de vuelta a la barra superior")
 
-        self.settings_btn = LiquidGlassButton("Señales y Color ▾", self, active_tint_color="#00E5FF", pill_radius=6.0)
-        self.settings_btn.setFixedSize(118, 20)
+        self.header_bar = QWidget(self)
+        self.header_bar.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        hdr_row = QHBoxLayout(self.header_bar)
+        hdr_row.setContentsMargins(0, 0, 0, 0)
+        hdr_row.setSpacing(8)
+
+        self.settings_btn = SvgToggleButton(
+            "scope_signals.svg", "Señales", self.header_bar,
+            active_tint_color="#00E5FF", checkable_on_click=False
+        )
+        self.settings_btn.setFixedSize(24, 22)
+        self.settings_btn.setToolTip("Señales, Colores y Opacidad del Osciloscopio")
         self.settings_btn.clicked.connect(self._toggle_settings_popup)
+        hdr_row.addWidget(self.settings_btn)
 
-        self.limiter_btn = LiquidGlassButton("Limitador ▾", self, active_tint_color="#D500F9", pill_radius=6.0)
-        self.limiter_btn.setFixedSize(102, 20)
+        self.limiter_btn = SvgToggleButton(
+            "lim_mode.svg", "Limitador", self.header_bar,
+            active_tint_color="#D500F9", checkable_on_click=False
+        )
+        self.limiter_btn.setFixedSize(24, 22)
+        self.limiter_btn.setToolTip("Configurar Limitador Master")
         self.limiter_btn.clicked.connect(self._toggle_limiter_popup)
+        hdr_row.addWidget(self.limiter_btn)
 
-        self.gr_meter_widget = LimiterGRMiniWidget(self)
+        self.gr_meter_widget = LimiterGRMiniWidget(self.header_bar)
         self.gr_meter_widget.clicked.connect(self._toggle_limiter_popup)
+        hdr_row.addWidget(self.gr_meter_widget)
 
-        self.btn_scope_autogain = LiquidGlassButton("Auto-Gain", self, active_tint_color="#00E5FF", pill_radius=6.0)
-        self.btn_scope_autogain.setFixedSize(86, 20)
-        self.btn_scope_autogain.setCheckable(True)
-        self.btn_scope_autogain.setToolTip("Auto-Gain (Compensación de Loudness)\nClic para Activar / Desactivar")
-        self.btn_scope_autogain.toggled.connect(self._on_autogain_toggled)
+        self.xover_scope_btn = SvgToggleButton(
+            "crossover.svg", "Crossover", self.header_bar,
+            active_tint_color="#FFB300", checkable_on_click=False
+        )
+        self.xover_scope_btn.setFixedSize(24, 22)
+        self.xover_scope_btn.setToolTip("Configurar Crossover Digital (Out A / Out B)")
+        self.xover_scope_btn.clicked.connect(self._toggle_crossover_popup)
+        hdr_row.addWidget(self.xover_scope_btn)
 
-        self.lbl_scope_ag = QLabel("AG: OFF", self)
-        self.lbl_scope_ag.setFixedSize(130, 20)
-        self.lbl_scope_ag.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
-        self.lbl_scope_ag.setStyleSheet("""
-            QLabel {
-                color: #8C96A5;
-                font-size: 9px;
-                font-weight: 600;
-                background: transparent;
-            }
-        """)
+        self.ag_scope_meter = AutoGainScopeMeter(self.header_bar)
+        hdr_row.addWidget(self.ag_scope_meter)
 
-        self.dur_btn = LiquidGlassButton(f"{self.env_buffer.duration_sec}s", self, active_tint_color="#00E5FF", pill_radius=6.0)
-        self.dur_btn.setFixedSize(38, 20)
+        self.dur_btn = TimeWindowSvgButton(self.env_buffer.duration_sec, self.header_bar, active_tint_color="#00E5FF")
+        self.dur_btn.setFixedSize(26, 22)
         self.dur_btn.setToolTip("Alternar ventana de tiempo: 1s -> 5s -> 10s")
         self.dur_btn.clicked.connect(self._cycle_duration)
+        hdr_row.addWidget(self.dur_btn)
 
         self.hide()
 
-    def _on_autogain_toggled(self, checked: bool):
-        if self.app_ref and hasattr(self.app_ref, "_on_autogain_toggled"):
-            self.app_ref._on_autogain_toggled(checked)
+    def _toggle_crossover_popup(self):
+        if self.app_ref and hasattr(self.app_ref, "_show_crossover_menu"):
+            self.app_ref._show_crossover_menu(anchor_widget=self.xover_scope_btn)
 
     def _cycle_duration(self):
         if self.app_ref and hasattr(self.app_ref, "scope_widget"):
@@ -1245,9 +1270,16 @@ class WaveformOverlayWidget(QWidget):
         if self.settings_popup is not None and self.settings_popup.isVisible():
             self.settings_popup.close()
             return
+        acc = (
+            self.app_ref._get_active_hud_accent_hex()
+            if (self.app_ref and hasattr(self.app_ref, "_get_active_hud_accent_hex"))
+            else "#00E5FF"
+        )
         if self.settings_popup is None:
-            self.settings_popup = ScopeSignalSettingsPopup(self)
-        pos = self.settings_btn.mapToGlobal(QPoint(0, self.settings_btn.height() + 2))
+            self.settings_popup = ScopeSignalSettingsPopup(self, accent_color=acc)
+        else:
+            self.settings_popup.setAccentColor(acc)
+        pos = self.settings_btn.mapToGlobal(QPoint(0, self.settings_btn.height() + 4))
         self.settings_popup.move(pos)
         self.settings_popup.show()
         self.settings_popup.raise_()
@@ -1259,7 +1291,7 @@ class WaveformOverlayWidget(QWidget):
         if self.limiter_popup is None:
             eq_engine = self.app_ref.eq_engine if (self.app_ref and hasattr(self.app_ref, "eq_engine")) else None
             self.limiter_popup = LimiterControlPopup(eq_engine=eq_engine, overlay_ref=self, app_ref=self.app_ref, parent=self)
-        pos = self.limiter_btn.mapToGlobal(QPoint(0, self.limiter_btn.height() + 2))
+        pos = self.limiter_btn.mapToGlobal(QPoint(0, self.limiter_btn.height() + 4))
         self.limiter_popup.move(pos)
         self.limiter_popup.show()
         self.limiter_popup.raise_()
@@ -1279,69 +1311,26 @@ class WaveformOverlayWidget(QWidget):
         if self.isVisible():
             self.update()
 
+    def _position_header_bar(self):
+        if hasattr(self, "header_bar"):
+            sh = self.header_bar.sizeHint()
+            self.header_bar.setGeometry(40, 1, sh.width(), 22)
+            self.header_bar.raise_()
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self.wave_canvas = None
         self._hud_overlay_cache = None
-        if hasattr(self, "settings_btn"):
-            self.settings_btn.move(40, 2)
-            self.settings_btn.raise_()
-        if hasattr(self, "limiter_btn"):
-            self.limiter_btn.move(172, 2)
-            self.limiter_btn.raise_()
-        if hasattr(self, "gr_meter_widget"):
-            self.gr_meter_widget.move(294, 2)
-            self.gr_meter_widget.raise_()
-        if hasattr(self, "btn_scope_autogain"):
-            self.btn_scope_autogain.move(382, 2)
-            self.btn_scope_autogain.raise_()
-        if hasattr(self, "lbl_scope_ag"):
-            self.lbl_scope_ag.move(484, 2)
-            self.lbl_scope_ag.raise_()
-        if hasattr(self, "dur_btn"):
-            self.dur_btn.move(620, 2)
-            self.dur_btn.raise_()
+        self._position_header_bar()
 
     def showEvent(self, event):
         super().showEvent(event)
         self.wave_canvas = None
-        if hasattr(self, "settings_btn"):
-            self.settings_btn.move(40, 2)
-            self.settings_btn.raise_()
-        if hasattr(self, "limiter_btn"):
-            self.limiter_btn.move(172, 2)
-            self.limiter_btn.raise_()
-        if hasattr(self, "gr_meter_widget"):
-            self.gr_meter_widget.move(294, 2)
-            self.gr_meter_widget.raise_()
-        if hasattr(self, "btn_scope_autogain"):
-            self.btn_scope_autogain.move(382, 2)
-            self.btn_scope_autogain.raise_()
-        if hasattr(self, "lbl_scope_ag"):
-            self.lbl_scope_ag.move(484, 2)
-            self.lbl_scope_ag.raise_()
-        if hasattr(self, "dur_btn"):
-            self.dur_btn.move(620, 2)
-            self.dur_btn.raise_()
+        self._position_header_bar()
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            if hasattr(self, "settings_btn") and self.settings_btn.geometry().contains(event.pos()):
-                event.accept()
-                return
-            if hasattr(self, "limiter_btn") and self.limiter_btn.geometry().contains(event.pos()):
-                event.accept()
-                return
-            if hasattr(self, "gr_meter_widget") and self.gr_meter_widget.geometry().contains(event.pos()):
-                event.accept()
-                return
-            if hasattr(self, "btn_scope_autogain") and self.btn_scope_autogain.geometry().contains(event.pos()):
-                event.accept()
-                return
-            if hasattr(self, "lbl_scope_ag") and self.lbl_scope_ag.geometry().contains(event.pos()):
-                event.accept()
-                return
-            if hasattr(self, "dur_btn") and self.dur_btn.geometry().contains(event.pos()):
+            if hasattr(self, "header_bar") and self.header_bar.geometry().contains(event.pos()):
                 event.accept()
                 return
             if self.settings_popup and self.settings_popup.isVisible():
@@ -1443,8 +1432,8 @@ class WaveformOverlayWidget(QWidget):
             p.setPen(QColor("#8E95A4"))
             p.drawText(QRectF(x_s - 18.0, h - 18.0, 36.0, 15.0), Qt.AlignmentFlag.AlignCenter, lbl)
 
-        # Badges de señales activas junto a los botones (desplazado a la derecha de dur_btn para evitar solapamiento)
-        cur_x = 668.0
+        # Badges de señales activas junto a los botones (desplazado dinámicamente a la derecha de header_bar)
+        cur_x = float(self.header_bar.x() + self.header_bar.sizeHint().width() + 14) if hasattr(self, "header_bar") else 440.0
         font_badge = QFont("Segoe UI", 8, QFont.Weight.DemiBold)
         p.setFont(font_badge)
         fm = QFontMetrics(font_badge)
@@ -1766,6 +1755,7 @@ class ColorSettingsDialog(QDialog):
         ("curve_rta", "Curva RTA (Medición Sala)"),
         ("curve_eq_a", "Curva Sumatoria EQ Out A"),
         ("curve_eq_b", "Curva Sumatoria EQ Out B"),
+        ("mini_scope", "Mini-Osciloscopio"),
         ("fill", "Relleno bajo el espectro"),
         ("grid", "Líneas de grilla / frecuencia"),
         ("axis_text", "Texto de los ejes"),
@@ -2102,8 +2092,8 @@ class FullBleedEdgeMasksAndScalesItem(pg.GraphicsObject):
             first_tick = int(np.ceil(db_min / step_db) * step_db)
             x_dbfs_col = rect.right() - 34.0
 
-            min_tick_y = rect.top() + (212.0 if scope_open else 42.0)
-            min_eq_tick_y = rect.top() + (216.0 if scope_open else 62.0)
+            min_tick_y = rect.top() + (218.0 if scope_open else 48.0)
+            min_eq_tick_y = rect.top() + (222.0 if scope_open else 68.0)
 
             for db_val in range(first_tick, int(db_max) + 1, step_db):
                 y_s = vb.mapViewToScene(QPointF(0.0, float(db_val))).y()
@@ -2117,17 +2107,31 @@ class FullBleedEdgeMasksAndScalesItem(pg.GraphicsObject):
             eq_vb = self.app_ref.eq_overlay.eq_vb
             font_eq = QFont("Segoe UI", 9, QFont.Weight.Bold)
             painter.setFont(font_eq)
-            painter.setPen(QColor("#E0B84C"))
+            base_eq_col = QColor("#E0B84C")
 
-            if abs(eq_range - 12.0) < 0.1:
-                eq_ticks = [9, 6, 3, 0, -3, -6, -9, -12]
+            t = float(np.clip((eq_range - 12.0) / 18.0, 0.0, 1.0))
+            if t <= 0.001:
+                tick_specs = [(g, 255) for g in (9, 6, 3, 0, -3, -6, -9, -12)]
+            elif t >= 0.999:
+                tick_specs = [(g, 255) for g in (24, 18, 12, 6, 0, -6, -12, -18, -24, -30)]
             else:
-                eq_ticks = [24, 18, 12, 6, 0, -6, -12, -18, -24, -30]
+                a12 = int(round(255 * (1.0 - t)))
+                a30 = int(round(255 * t))
+                tick_specs = (
+                    [(g, 255) for g in (6, 0, -6, -12)]
+                    + [(g, a12) for g in (9, 3, -3, -9)]
+                    + [(g, a30) for g in (24, 18, 12, -18, -24, -30)]
+                )
 
             x_eq_col = rect.right() - 72.0
-            for g_val in eq_ticks:
+            for g_val, alpha in tick_specs:
+                if alpha <= 4:
+                    continue
                 y_eq = eq_vb.mapViewToScene(QPointF(0.0, float(g_val))).y()
                 if min_eq_tick_y <= y_eq <= rect.bottom() - 16.0:
+                    col = QColor(base_eq_col)
+                    col.setAlpha(alpha)
+                    painter.setPen(col)
                     lbl_eq = f"+{g_val}" if g_val > 0 else f"{g_val}"
                     painter.drawText(
                         QRectF(x_eq_col, y_eq - 8.0, 32.0, 16.0),
@@ -2153,7 +2157,7 @@ class FullBleedEdgeMasksAndScalesItem(pg.GraphicsObject):
             and self.app_ref.scope_overlay is not None
             and self.app_ref.scope_overlay.isVisible()
         )
-        eq_range = float(getattr(self.app_ref.eq_overlay, "eq_range_db", 12.0))
+        eq_range = round(float(getattr(self.app_ref.eq_overlay, "eq_range_db", 12.0)), 2)
         key = (w, h, is_x_log, is_y_log, db_min, db_max, nyquist, scope_open, eq_range)
 
         if self._cache_pixmap is None or self._cache_key != key:
@@ -2212,7 +2216,7 @@ class GraphStageContainer(QWidget):
             self.plot_widget.setGeometry(0, 0, w, h)
 
         if self.top_bar is not None:
-            self.top_bar.setGeometry(10, 8, max(200, w - 20), 34)
+            self.top_bar.setGeometry(10, 6, max(200, w - 20), 42)
             self.top_bar.raise_()
 
         if self.eq_range_badge is not None:
@@ -2220,13 +2224,13 @@ class GraphStageContainer(QWidget):
             badge_w = self.eq_range_badge.width()
             badge_x = max(10, w - 38 - badge_w)
             scope_open = (self.scope_overlay is not None and self.scope_overlay.isVisible())
-            badge_y = 216 if scope_open else 46
+            badge_y = 222 if scope_open else 52
             self.eq_range_badge.move(badge_x, badge_y)
             self.eq_range_badge.raise_()
 
         if self.scope_overlay is not None:
             scope_w = max(240, w - 104)
-            self.scope_overlay.setGeometry(12, 46, scope_w, 164)
+            self.scope_overlay.setGeometry(12, 52, scope_w, 164)
             if self.scope_overlay.isVisible():
                 self.scope_overlay.raise_()
 
@@ -2237,7 +2241,7 @@ class GraphStageContainer(QWidget):
             if custom is not None:
                 # Posición elegida por el usuario (arrastre), limitada a los bordes del lienzo
                 hud_x = int(max(0, min(w - hud_w, custom.x())))
-                hud_y = int(max(44, min(h - hud_h, custom.y())))
+                hud_y = int(max(50, min(h - hud_h, custom.y())))
             else:
                 hud_x = max(16, (w - 72 - hud_w) // 2)
                 # Posicionado justo encima de las etiquetas de frecuencia inferiores
@@ -2251,7 +2255,7 @@ class GraphStageContainer(QWidget):
 class AudioAnalyzerApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("BDJ-FFT-EQ")
+        self.setWindowTitle("Heaviside DSP")
         self.setMinimumSize(860, 520)
 
         icon_path = get_resource_path(os.path.join("assets", "icon.ico"))
@@ -2339,6 +2343,7 @@ class AudioAnalyzerApp(QMainWindow):
         self.crossover = DualOutputCrossover(self.current_sr)
         self.crossover.set_config(self.crossover_state, self.current_sr)
         self._crossover_menu = None
+        self._hud_was_auto_minimized_for_fft = False
         self._get_presets_dir()
 
         # Motor Dual-Input asíncrono y dos bancos independientes de filtros Biquad
@@ -2359,6 +2364,13 @@ class AudioAnalyzerApp(QMainWindow):
         self.bands_in2 = self.eq_proc_in2.bands
         self.current_edit_input = 1
         self.eq_engine = self.eq_proc_in1
+        self.bypass_eq = False
+        self.multiband_dyn_in1 = MultibandDynamicsProcessor(sample_rate=self.current_sr)
+        self.multiband_dyn_in2 = MultibandDynamicsProcessor(sample_rate=self.current_sr)
+        self.multiband_dyn = self.multiband_dyn_in1
+        self._selected_band_idx_by_input = {1: 0, 2: 0}
+        self._selected_mb_idx_by_input = {1: -1, 2: -1}
+        self._help_tour = None
 
         # Generador de Ruido Blanco y Analizador Acústico RTA (10.0s)
         self.rta_measuring = False
@@ -2425,7 +2437,7 @@ class AudioAnalyzerApp(QMainWindow):
 
     @property
     def bands(self):
-        return self.bands_in1 if getattr(self, "current_edit_input", 1) == 1 else self.bands_in2
+        return self.eq_proc_in1.bands if getattr(self, "current_edit_input", 1) == 1 else self.eq_proc_in2.bands
 
     @bands.setter
     def bands(self, value):
@@ -2439,20 +2451,98 @@ class AudioAnalyzerApp(QMainWindow):
     def set_active_edit_input(self, inp: int):
         if inp not in (1, 2):
             return
+        prev_inp = getattr(self, "current_edit_input", 1)
+        if hasattr(self, "eq_overlay") and self.eq_overlay is not None:
+            self._selected_band_idx_by_input[prev_inp] = int(getattr(self.eq_overlay, "selected_band_idx", -1))
+            self._selected_mb_idx_by_input[prev_inp] = int(getattr(self.eq_overlay, "selected_mb_idx", -1))
+
         self.current_edit_input = inp
         active_engine = self.eq_proc_in1 if inp == 1 else self.eq_proc_in2
+        active_mb = self.multiband_dyn_in1 if inp == 1 else self.multiband_dyn_in2
         self.eq_engine = active_engine
+        self.multiband_dyn = active_mb
+        self.bypass_eq = bool(active_engine.bypass)
+        if hasattr(self, "bypass_btn") and self.bypass_btn is not None:
+            self.bypass_btn.setChecked(self.bypass_eq)
+            self.bypass_btn.update()
         if hasattr(self, "eq_overlay") and self.eq_overlay is not None:
             self.eq_overlay.eq_engine = active_engine
-            self.eq_overlay.selected_band_idx = 0 if active_engine.bands else -1
+            saved_b_idx = self._selected_band_idx_by_input.get(inp, 0)
+            if active_engine.bands:
+                if not (0 <= saved_b_idx < len(active_engine.bands)):
+                    saved_b_idx = 0
+            else:
+                saved_b_idx = -1
+            self.eq_overlay.selected_band_idx = saved_b_idx
+
+            saved_mb_idx = self._selected_mb_idx_by_input.get(inp, 0)
+            if active_mb.bands:
+                if not (0 <= saved_mb_idx < len(active_mb.bands)):
+                    saved_mb_idx = 0
+            else:
+                saved_mb_idx = -1
+            self.eq_overlay.selected_mb_idx = saved_mb_idx
+            self.eq_overlay._last_mb_rendered_version = -1
+            self.eq_overlay.set_multiband_processor(active_mb)
             self.eq_overlay.update_eq_curves(force=True)
             self.eq_overlay.update()
         if hasattr(self, "eq_panel") and self.eq_panel is not None:
             self.eq_panel.eq_engine = active_engine
-            self.eq_panel.refresh_from_engine()
+            self.eq_panel.set_multiband_processor(active_mb)
+            c_mode = getattr(self.eq_overlay, "canvas_mode", "BOTH") if hasattr(self, "eq_overlay") and self.eq_overlay is not None else "BOTH"
+            if getattr(self.eq_panel, "_hud_mode", "eq") == "mb" and not active_mb.bands and active_engine.bands and c_mode != "MB":
+                self.eq_panel.set_hud_mode("eq")
+            else:
+                self.eq_panel.refresh_from_engine()
+                self.eq_panel.refresh_mb_from_engine()
         if hasattr(self, "edit_input_selector") and self.edit_input_selector is not None:
             self.edit_input_selector.set_active_input(inp)
         self.recalculate_autogain_target()
+
+    def _on_canvas_mode_changed(self, mode: str):
+        prev_mode = getattr(self.eq_overlay, "canvas_mode", "BOTH") if hasattr(self, "eq_overlay") else "BOTH"
+        if hasattr(self, "eq_overlay") and self.eq_overlay is not None:
+            self.eq_overlay.set_canvas_mode(mode)
+        if hasattr(self, "eq_panel") and self.eq_panel is not None:
+            if mode == "NONE":
+                self._hud_was_auto_minimized_for_fft = True
+                self.eq_panel.set_minimized(True)
+            else:
+                if prev_mode == "NONE" or getattr(self, "_hud_was_auto_minimized_for_fft", False):
+                    self._hud_was_auto_minimized_for_fft = False
+                    self.eq_panel.set_minimized(False)
+                if mode == "MB":
+                    if hasattr(self, "multiband_dyn") and self.multiband_dyn.bands:
+                        idx = max(0, getattr(self.eq_overlay, "selected_mb_idx", 0))
+                        self.eq_panel.select_mb_band(idx)
+                    else:
+                        self.eq_panel.set_hud_mode("mb")
+                elif mode == "EQ":
+                    self.eq_panel.set_hud_mode("eq")
+        self.schedule_config_save()
+
+    def _ensure_canvas_layer_enabled(self, layer: str):
+        cur = getattr(self.eq_overlay, "canvas_mode", "BOTH") if hasattr(self, "eq_overlay") else "BOTH"
+        new_mode = cur
+        if layer == "EQ":
+            if cur == "NONE":
+                new_mode = "EQ"
+            elif cur == "MB":
+                new_mode = "BOTH"
+        elif layer == "MB":
+            if cur == "NONE":
+                new_mode = "MB"
+            elif cur == "EQ":
+                new_mode = "BOTH"
+        if new_mode != cur:
+            if hasattr(self, "canvas_mode_selector") and self.canvas_mode_selector is not None:
+                self.canvas_mode_selector.set_mode(new_mode, emit_signal=False)
+            if hasattr(self, "eq_overlay") and self.eq_overlay is not None:
+                self.eq_overlay.set_canvas_mode(new_mode)
+            if (cur == "NONE" or getattr(self, "_hud_was_auto_minimized_for_fft", False)) and hasattr(self, "eq_panel") and self.eq_panel is not None:
+                self._hud_was_auto_minimized_for_fft = False
+                self.eq_panel.set_minimized(False)
+            self.schedule_config_save()
 
     def _init_ui(self):
         main_widget = QWidget()
@@ -2570,6 +2660,7 @@ class AudioAnalyzerApp(QMainWindow):
         self.xover_line.sigPositionChanged.connect(self._on_xover_line_dragged)
         self.xover_line.sigPositionChangeFinished.connect(self.schedule_config_save)
         self.eq_overlay.eq_range_changed.connect(lambda _: self.update_crossover_visuals())
+        self.eq_overlay.eq_range_changed.connect(lambda _: self.edge_masks_and_scales.update())
 
         # Capa de viñetas (Top Gradient Mask + Bottom -inf Vignette) y Escalas Unificadas a la derecha
         self.edge_masks_and_scales = FullBleedEdgeMasksAndScalesItem(self)
@@ -2586,36 +2677,54 @@ class AudioAnalyzerApp(QMainWindow):
         logo_path = get_resource_path(os.path.join("assets", "logo.png"))
         if os.path.exists(logo_path):
             logo_lbl = QLabel(self.top_bar)
+            dpr = max(1.0, float(self.devicePixelRatioF()))
+            logo_size = 22
             logo_pix = QPixmap(logo_path).scaled(
-                20, 20, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
+                int(round(logo_size * dpr)),
+                int(round(logo_size * dpr)),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
             )
+            logo_pix.setDevicePixelRatio(dpr)
             logo_lbl.setPixmap(logo_pix)
-            logo_lbl.setContentsMargins(1, 0, 0, 0)
+            logo_lbl.setFixedSize(logo_size + 2, logo_size)
+            logo_lbl.setContentsMargins(1, 0, 1, 0)
+            logo_lbl.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
             top_layout.addWidget(logo_lbl)
 
         brand_label = QLabel(
-            "<b style='color:#00E5FF; font-size:12px; letter-spacing:0.6px;'>BDJ</b> "
-            "<b style='color:#FFD54F; font-size:12px;'>FFT-EQ</b>"
+            "<b style='color:#FF5252; font-size:12px; letter-spacing:0.4px;'>Heaviside</b> "
+            "<b style='color:#FFD54F; font-size:12px; letter-spacing:0.5px;'>DSP</b>"
         )
-        brand_label.setContentsMargins(0, 0, 2, 0)
+        brand_label.setContentsMargins(0, 0, 4, 0)
+        brand_label.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         top_layout.addWidget(brand_label)
 
-        self.mute_btn = LiquidGlassButton("Mute", self.top_bar, active_tint_color="#FF5252")
-        self.mute_btn.setCheckable(True)
+        self.mute_btn = SvgToggleButton(
+            "mute.svg", "Mute", self.top_bar, active_tint_color="#FF5252", off_svg_name="unmute.svg"
+        )
+        self.mute_btn.setFixedSize(30, 26)
         self.mute_btn.setChecked(True)
+        self.mute_btn.setToolTip("Silenciar / Activar Audio")
         self.mute_btn.clicked.connect(self.toggle_mute)
         self._update_mute_button_style()
         top_layout.addWidget(self.mute_btn)
 
         # Panel emergente de Dispositivos de Audio y Sample Rate
-        self.audio_menu_btn = LiquidGlassButton("Audio I/O ▾", self.top_bar)
+        self.audio_menu_btn = SvgToggleButton(
+            "audio_io.svg", "Audio I/O", self.top_bar, active_tint_color="#35C6E8", checkable_on_click=False
+        )
+        self.audio_menu_btn.setFixedSize(30, 26)
         self.audio_menu_btn.setToolTip("Seleccionar Dispositivo de Entrada, Salida y Sample Rate")
         self.audio_menu_btn.clicked.connect(self._show_audio_popup)
         self._build_audio_io_popup()
         top_layout.addWidget(self.audio_menu_btn)
 
         # Panel emergente de Analizador FFT (incluye FFT Samples y Color de Fondo)
-        self.analyzer_menu_btn = LiquidGlassButton("FFT: In+Out1 ▾", self.top_bar)
+        self.analyzer_menu_btn = SvgToggleButton(
+            "fft.svg", "FFT", self.top_bar, active_tint_color="#35C6E8", checkable_on_click=False
+        )
+        self.analyzer_menu_btn.setFixedSize(30, 26)
         self.analyzer_menu_btn.setToolTip("Configurar Analizador FFT, Curvas, Escalas, Rango dB y Colores")
         self.analyzer_menu_btn.clicked.connect(self._show_analyzer_popup)
         self._build_analyzer_popup()
@@ -2626,10 +2735,16 @@ class AudioAnalyzerApp(QMainWindow):
         self.edit_input_selector.inputChanged.connect(self.set_active_edit_input)
         top_layout.addWidget(self.edit_input_selector)
 
+        # Selector de capa interactiva del lienzo (EQ / MB / BOTH)
+        self.canvas_mode_selector = CanvasModeSelector(self.top_bar)
+        self.canvas_mode_selector.modeChanged.connect(self._on_canvas_mode_changed)
+        top_layout.addWidget(self.canvas_mode_selector)
+
         # --- MINI-OSCILOSCOPIO EN CÁPSULA HUD (Expandible dinámicamente) ---
         self.scope_widget = WaveformScopeWidget(self.scope_buffer, self.top_bar)
         self.scope_widget.toggleExpandedRequested.connect(self.toggle_expanded_scope)
         self.scope_widget.durationChanged.connect(self._on_scope_duration_changed)
+        self.scope_widget.miniScopeColorRequested.connect(lambda: self._pick_curve_color("mini_scope", "Mini-Osciloscopio"))
         top_layout.addWidget(self.scope_widget, 1)
 
         # --- AUTO-GAIN MINI BAR ---
@@ -2637,9 +2752,10 @@ class AudioAnalyzerApp(QMainWindow):
         self.autogain_mini_bar.toggled.connect(self._on_autogain_toggled)
         top_layout.addWidget(self.autogain_mini_bar, 0)
 
-        self.crossover_btn = LiquidGlassButton("X-Over ▾", self.top_bar, active_tint_color="#FFB300")
-        self.crossover_btn.setToolTip("Crossover Digital de Salidas (Out A / Out B)")
-        self.crossover_btn.clicked.connect(self._show_crossover_menu)
+        self.crossover_btn = SvgToggleButton("crossover.svg", "X-Over", self.top_bar, active_tint_color="#FFB300", checkable_on_click=True)
+        self.crossover_btn.setFixedSize(28, 26)
+        self.crossover_btn.setToolTip("Activar / Desactivar Crossover Digital (Out A / Out B)")
+        self.crossover_btn.clicked.connect(self._on_top_crossover_toggled)
         top_layout.addWidget(self.crossover_btn)
 
         self._crossover_menu = HUDPopupMenu(self, accent_color="#FFB300", corner_radius=10.0)
@@ -2650,30 +2766,42 @@ class AudioAnalyzerApp(QMainWindow):
         action_xover.setDefaultWidget(self.crossover_widget)
         self._crossover_menu.addAction(action_xover)
 
-        self.bypass_btn = LiquidGlassButton("Bypass", self.top_bar, active_tint_color="#FF5252")
-        self.bypass_btn.setCheckable(True)
-        self.bypass_btn.setToolTip("Desactivar temporalmente todas las bandas del ecualizador")
+        self.bypass_btn = SvgToggleButton("bypass.svg", "Bypass", self.top_bar, active_tint_color="#FFA94D")
+        self.bypass_btn.setFixedSize(28, 26)
+        self.bypass_btn.setToolTip("Desactivar temporalmente todas las bandas del ecualizador (Bypass)")
         self.bypass_btn.clicked.connect(self._on_global_bypass_toggled)
         top_layout.addWidget(self.bypass_btn)
 
-        self.presets_btn = LiquidGlassButton("Presets ▾", self.top_bar, active_tint_color="#FFD54F")
-        self.presets_btn.setMinimumWidth(74)
+        self.presets_btn = SvgToggleButton(
+            "presets.svg", "Presets", self.top_bar, active_tint_color="#FFD54F", checkable_on_click=False
+        )
+        self.presets_btn.setFixedSize(28, 26)
         self.presets_btn.setToolTip("Gestión de Presets: Guardar, Cargar, Resetear y Auto-inicio")
         self.presets_btn.clicked.connect(self._show_presets_menu)
         self.reset_eq_btn = self.presets_btn
         top_layout.addWidget(self.presets_btn)
 
-        self.fullscreen_btn = LiquidGlassButton("⛶", self.top_bar)
-        self.fullscreen_btn.setFixedWidth(28)
+        self.fullscreen_btn = SvgToggleButton(
+            "fullscreen_exit.svg", "⛶", self.top_bar, active_tint_color="#35C6E8",
+            checkable_on_click=False, off_svg_name="fullscreen.svg"
+        )
+        self.fullscreen_btn.setFixedSize(28, 26)
         self.fullscreen_btn.setToolTip("Pantalla completa (Atajo: F11)")
         self.fullscreen_btn.clicked.connect(self.toggle_fullscreen)
         top_layout.addWidget(self.fullscreen_btn)
 
-        # --- BADGE INTERACTIVO DE RANGO EQ (+12 dB / +30 dB) EN LA ESCALA DERECHA ---
-        self.eq_range_badge = LiquidGlassButton("+12 dB", self.graph_container, active_tint_color="#FFD54F", pill_radius=6.0)
-        self.eq_range_badge.setFixedSize(48, 20)
-        self.eq_range_badge.setCheckable(True)
-        self.eq_range_badge.setChecked(True)
+        self.help_btn = SvgToggleButton(
+            "help.svg", "?", self.top_bar, active_tint_color="#00E5FF", checkable_on_click=True
+        )
+        self.help_btn.setFixedSize(28, 26)
+        self.help_btn.setToolTip("Ayuda interactiva: explica cada botón y perilla (Clic de nuevo o Esc para salir)")
+        self.help_btn.clicked.connect(self._toggle_interactive_help)
+        top_layout.addWidget(self.help_btn)
+
+        # --- BOTÓN SVG SIN CAJA DE RANGO EQ (±12 dB / ±30 dB) EN LA ESCALA DERECHA ---
+        self.eq_range_badge = RangeDbSvgButton(
+            12.0, self.graph_container, active_tint_color=self.theme.get("curve_eq_a", "#FFD54F")
+        )
         self.eq_range_badge.setToolTip("Clic para alternar el rango visual de ganancia EQ entre ±12 dB y ±30 dB")
         self.eq_range_badge.clicked.connect(self._on_toggle_eq_range_badge)
 
@@ -2683,8 +2811,13 @@ class AudioAnalyzerApp(QMainWindow):
 
         # --- HUD FLOTANTE SUPERPUESTO CON `GAIN` EN LA JOROBA ---
         self.eq_panel = FloatingBandHUD(self.eq_engine, self.eq_overlay, self.graph_container)
+        self.eq_overlay.set_multiband_processor(self.multiband_dyn)
+        self.eq_panel.set_multiband_processor(self.multiband_dyn)
         self.eq_panel.parameters_changed.connect(self.schedule_config_save)
         self.eq_panel.parameters_changed.connect(self.recalculate_autogain_target)
+        self.eq_panel.active_accent_changed.connect(self._sync_main_menus_accent)
+        self.eq_panel.ensure_layer_requested.connect(self._ensure_canvas_layer_enabled)
+        self.eq_overlay.mb_band_modified.connect(self.schedule_config_save)
         # Fondo semitransparente del HUD compuesto en la escena OpenGL de la FFT (blending en GPU)
         self.eq_panel.attach_gl_background(self.plot_widget)
         # Inspector flotante: curvas FFT para lectura de dBFS (prioridad Out 1 > In > Out 2)
@@ -2712,9 +2845,8 @@ class AudioAnalyzerApp(QMainWindow):
         self.apply_theme()
 
     def _on_toggle_eq_range_badge(self):
-        new_range = self.eq_overlay.toggle_eq_range_db()
-        self.eq_range_badge.setChecked(True)
-        self.eq_range_badge.setText(f"+{int(new_range)} dB")
+        new_range = self.eq_overlay.toggle_eq_range_db(animate=True)
+        self.eq_range_badge.setRangeDb(new_range)
         self.edge_masks_and_scales.update()
         self.schedule_config_save()
 
@@ -2755,7 +2887,7 @@ class AudioAnalyzerApp(QMainWindow):
 
     def _on_scope_duration_changed(self, _sec: int):
         if hasattr(self, "scope_overlay") and hasattr(self.scope_overlay, "dur_btn"):
-            self.scope_overlay.dur_btn.setText(f"{_sec}s")
+            self.scope_overlay.dur_btn.set_duration(_sec)
         self.scope_overlay.invalidate_cache()
         self.schedule_config_save()
 
@@ -2801,62 +2933,6 @@ class AudioAnalyzerApp(QMainWindow):
 
     def _build_audio_io_popup(self):
         self.audio_popup = HUDPopupDialog(self, accent_color="#00E5FF", corner_radius=10.0)
-        self.audio_popup.setStyleSheet("""
-            QDialog {
-                background: transparent;
-                border: none;
-            }
-            QLabel {
-                background: transparent;
-                border: none;
-                color: #C5CDD9;
-                font-size: 11px;
-                font-weight: bold;
-            }
-            QCheckBox {
-                color: #ECEFF4;
-                font-size: 11px;
-                font-weight: 600;
-                spacing: 6px;
-            }
-            QCheckBox::indicator {
-                width: 14px;
-                height: 14px;
-                border: 1px solid rgba(74, 82, 99, 185);
-                border-radius: 3px;
-                background-color: rgba(16, 18, 24, 150);
-            }
-            QCheckBox::indicator:checked {
-                background-color: #00E5FF;
-                border: 1px solid #33EBFF;
-            }
-            QComboBox {
-                background-color: rgba(16, 18, 24, 155);
-                color: #ECEFF4;
-                border: 1px solid rgba(62, 68, 82, 175);
-                border-radius: 5px;
-                padding: 3px 8px;
-                font-size: 11px;
-                font-weight: 600;
-            }
-            QComboBox:hover {
-                border-color: #00E5FF;
-            }
-            QPushButton {
-                background-color: rgba(16, 18, 24, 145);
-                color: #ECEFF4;
-                border: 1px solid rgba(62, 68, 82, 165);
-                border-radius: 5px;
-                padding: 4px 10px;
-                font-size: 11px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: rgba(0, 229, 255, 36);
-                border-color: #00E5FF;
-                color: #FFFFFF;
-            }
-        """)
         grid = QGridLayout(self.audio_popup)
         grid.setContentsMargins(12, 10, 12, 10)
         grid.setSpacing(8)
@@ -3113,6 +3189,107 @@ class AudioAnalyzerApp(QMainWindow):
         rta_btn_row.addWidget(self.rta_clear_btn)
         grid.addLayout(rta_btn_row, 18, 0, 1, 2)
 
+        self._last_audio_popup_accent = None
+        self._apply_audio_popup_accent("#00E5FF")
+
+    def _apply_audio_popup_accent(self, acc_hex: str):
+        c = QColor(acc_hex) if acc_hex else QColor("#00E5FF")
+        hex_c = c.name()
+        if getattr(self, "_last_audio_popup_accent", None) == hex_c:
+            return
+        self._last_audio_popup_accent = hex_c
+        r, g, b = c.red(), c.green(), c.blue()
+        if hasattr(self, "audio_popup") and self.audio_popup is not None:
+            self.audio_popup.setAccentColor(hex_c)
+            self.audio_popup.setStyleSheet(f"""
+                QDialog {{
+                    background: transparent;
+                    border: none;
+                }}
+                QLabel {{
+                    background: transparent;
+                    border: none;
+                    color: #C5CDD9;
+                    font-size: 11px;
+                    font-weight: bold;
+                }}
+                QCheckBox {{
+                    color: #ECEFF4;
+                    font-size: 11px;
+                    font-weight: 600;
+                    spacing: 6px;
+                }}
+                QCheckBox::indicator {{
+                    width: 14px;
+                    height: 14px;
+                    border: 1px solid rgba(74, 82, 99, 185);
+                    border-radius: 3px;
+                    background-color: rgba(16, 18, 24, 150);
+                }}
+                QCheckBox::indicator:checked {{
+                    background-color: {hex_c};
+                    border: 1px solid {hex_c};
+                }}
+                QComboBox {{
+                    background-color: rgba(16, 18, 24, 155);
+                    color: #ECEFF4;
+                    border: 1px solid rgba(62, 68, 82, 175);
+                    border-radius: 5px;
+                    padding: 3px 8px;
+                    font-size: 11px;
+                    font-weight: 600;
+                }}
+                QComboBox:hover {{
+                    border-color: {hex_c};
+                }}
+                QPushButton {{
+                    background-color: rgba(16, 18, 24, 145);
+                    color: #ECEFF4;
+                    border: 1px solid rgba(62, 68, 82, 165);
+                    border-radius: 5px;
+                    padding: 4px 10px;
+                    font-size: 11px;
+                    font-weight: bold;
+                }}
+                QPushButton:hover {{
+                    background-color: rgba({r}, {g}, {b}, 36);
+                    border-color: {hex_c};
+                    color: #FFFFFF;
+                }}
+            """)
+        if hasattr(self, "auto_sync_btn"):
+            self.auto_sync_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: rgba(16, 18, 24, 145);
+                    color: #C5CDD9;
+                    border: 1px solid rgba(62, 68, 82, 165);
+                    border-radius: 5px;
+                    padding: 3px 10px;
+                    font-size: 10px;
+                    font-weight: bold;
+                }}
+                QPushButton:hover {{
+                    background-color: rgba(24, 28, 36, 180);
+                    color: #FFFFFF;
+                    border-color: {hex_c};
+                }}
+                QPushButton:pressed {{
+                    background-color: rgba({r}, {g}, {b}, 55);
+                    color: {hex_c};
+                    border-color: {hex_c};
+                }}
+            """)
+        for cb_attr in (
+            "host_api_combo", "in_combo", "in2_combo", "out_combo",
+            "out_b_combo", "sr_combo", "buffer_size_combo",
+            "rta_input_combo", "rta_bus_combo",
+        ):
+            cb = getattr(self, cb_attr, None)
+            if cb is not None:
+                style_dark_combobox(cb, accent_color=hex_c)
+        if hasattr(self, "delay_out1_spin"):
+            style_hud_spinbox(self.delay_out1_spin, accent_color=hex_c)
+
     def _on_user_delay_a_changed(self, val: float):
         if not getattr(self, "_is_auto_syncing", False):
             self._delay_manually_adjusted = True
@@ -3187,6 +3364,7 @@ class AudioAnalyzerApp(QMainWindow):
         self.schedule_config_save()
 
     def _show_audio_popup(self):
+        self._apply_audio_popup_accent(self._get_active_hud_accent_hex())
         self.audio_popup.adjustSize()
         pos = self.audio_menu_btn.mapToGlobal(QPoint(0, self.audio_menu_btn.height() + 4))
         self.audio_popup.move(pos)
@@ -3195,63 +3373,6 @@ class AudioAnalyzerApp(QMainWindow):
     def _build_analyzer_popup(self):
         """Panel del Analizador con FFT Samples, Curvas FFT (In, Out 1, Out 2) y Colores con diseño HUD + OpenGL."""
         self.analyzer_popup = HUDPopupDialog(self, accent_color="#00E5FF", corner_radius=10.0)
-        self.analyzer_popup.setStyleSheet("""
-            QDialog {
-                background: transparent;
-                border: none;
-            }
-            QLabel {
-                background: transparent;
-                border: none;
-                color: #C5CDD9;
-                font-size: 11px;
-                font-weight: bold;
-            }
-            QCheckBox {
-                color: #ECEFF4;
-                font-size: 11px;
-                font-weight: 600;
-                spacing: 6px;
-            }
-            QCheckBox::indicator {
-                width: 14px;
-                height: 14px;
-                border: 1px solid rgba(74, 82, 99, 185);
-                border-radius: 3px;
-                background-color: rgba(16, 18, 24, 150);
-            }
-            QCheckBox::indicator:checked {
-                background-color: #00E5FF;
-                border: 1px solid #33EBFF;
-            }
-            QComboBox {
-                background-color: rgba(16, 18, 24, 155);
-                color: #ECEFF4;
-                border: 1px solid rgba(62, 68, 82, 175);
-                border-radius: 5px;
-                padding: 3px 8px;
-                font-size: 11px;
-                font-weight: 600;
-            }
-            QComboBox:hover {
-                border-color: #00E5FF;
-            }
-            QPushButton {
-                background-color: rgba(16, 18, 24, 145);
-                color: #ECEFF4;
-                border: 1px solid rgba(62, 68, 82, 165);
-                border-radius: 5px;
-                padding: 5px 8px;
-                font-size: 11px;
-                font-weight: 600;
-                text-align: left;
-            }
-            QPushButton:hover {
-                background-color: rgba(0, 229, 255, 36);
-                border-color: #00E5FF;
-                color: #FFFFFF;
-            }
-        """)
         grid = QGridLayout(self.analyzer_popup)
         grid.setContentsMargins(12, 10, 12, 10)
         grid.setSpacing(8)
@@ -3347,52 +3468,129 @@ class AudioAnalyzerApp(QMainWindow):
         grid.addWidget(QLabel("Retención FFT:"), 6, 0)
         grid.addLayout(hold_row, 6, 1)
 
-        grid.addWidget(QLabel("Color de Fondo:"), 7, 0)
-        self.bg_color_combo = QComboBox()
-        style_dark_combobox(self.bg_color_combo)
-        for label, hex_val in BACKGROUND_COLOR_PRESETS:
-            self.bg_color_combo.addItem(label, hex_val)
-        self.bg_color_combo.addItem("Personalizado...", "custom")
-        self.bg_color_combo.activated.connect(self._on_bg_combo_activated)
-        grid.addWidget(self.bg_color_combo, 7, 1)
-
-        # Botones de personalización de color de las curvas FFT
-        colors_layout = QVBoxLayout()
-        colors_layout.setSpacing(4)
-
-        btn_color_in = QPushButton("Color Curva Input 1 (Pre)...")
-        btn_color_in.clicked.connect(lambda: (self.analyzer_popup.close(), self._pick_curve_color("curve_in", "Curva Input 1 (Pre)")))
-        colors_layout.addWidget(btn_color_in)
-
-        btn_color_in2 = QPushButton("Color Curva Mic / Input 2...")
-        btn_color_in2.clicked.connect(lambda: (self.analyzer_popup.close(), self._pick_curve_color("curve_in2", "Curva Mic / Input 2")))
-        colors_layout.addWidget(btn_color_in2)
-
-        btn_color_out1 = QPushButton("Color Curva Output 1 (Bus A)...")
-        btn_color_out1.clicked.connect(lambda: (self.analyzer_popup.close(), self._pick_curve_color("curve_out1", "Curva Output 1 (Bus A)")))
-        colors_layout.addWidget(btn_color_out1)
-
-        btn_color_out2 = QPushButton("Color Curva Output 2 (Bus B)...")
-        btn_color_out2.clicked.connect(lambda: (self.analyzer_popup.close(), self._pick_curve_color("curve_out2", "Curva Output 2 (Bus B)")))
-        colors_layout.addWidget(btn_color_out2)
-
-        btn_color_rta = QPushButton("Color Curva RTA (Sala)...")
-        btn_color_rta.clicked.connect(lambda: (self.analyzer_popup.close(), self._pick_curve_color("curve_rta", "Curva RTA Sala")))
-        colors_layout.addWidget(btn_color_rta)
-
-        btn_color_eq_a = QPushButton("Color Curva EQ Out A...")
-        btn_color_eq_a.clicked.connect(lambda: (self.analyzer_popup.close(), self._pick_curve_color("curve_eq_a", "Curva EQ Out A")))
-        colors_layout.addWidget(btn_color_eq_a)
-
-        btn_color_eq_b = QPushButton("Color Curva EQ Out B...")
-        btn_color_eq_b.clicked.connect(lambda: (self.analyzer_popup.close(), self._pick_curve_color("curve_eq_b", "Curva EQ Out B")))
-        colors_layout.addWidget(btn_color_eq_b)
-
         colors_btn = QPushButton("Configuración Completa de Colores...")
         colors_btn.clicked.connect(lambda: (self.analyzer_popup.close(), self.open_color_settings()))
-        colors_layout.addWidget(colors_btn)
+        grid.addWidget(colors_btn, 7, 0, 1, 2)
 
-        grid.addLayout(colors_layout, 8, 0, 1, 2)
+        self._last_analyzer_popup_accent = None
+        self._apply_analyzer_popup_accent("#00E5FF")
+
+    def _apply_analyzer_popup_accent(self, acc_hex: str):
+        c = QColor(acc_hex) if acc_hex else QColor("#00E5FF")
+        hex_c = c.name()
+        if getattr(self, "_last_analyzer_popup_accent", None) == hex_c:
+            return
+        self._last_analyzer_popup_accent = hex_c
+        r, g, b = c.red(), c.green(), c.blue()
+        if hasattr(self, "analyzer_popup") and self.analyzer_popup is not None:
+            self.analyzer_popup.setAccentColor(hex_c)
+            self.analyzer_popup.setStyleSheet(f"""
+                QDialog {{
+                    background: transparent;
+                    border: none;
+                }}
+                QLabel {{
+                    background: transparent;
+                    border: none;
+                    color: #C5CDD9;
+                    font-size: 11px;
+                    font-weight: bold;
+                }}
+                QCheckBox {{
+                    color: #ECEFF4;
+                    font-size: 11px;
+                    font-weight: 600;
+                    spacing: 6px;
+                }}
+                QCheckBox::indicator {{
+                    width: 14px;
+                    height: 14px;
+                    border: 1px solid rgba(74, 82, 99, 185);
+                    border-radius: 3px;
+                    background-color: rgba(16, 18, 24, 150);
+                }}
+                QCheckBox::indicator:checked {{
+                    background-color: {hex_c};
+                    border: 1px solid {hex_c};
+                }}
+                QComboBox {{
+                    background-color: rgba(16, 18, 24, 155);
+                    color: #ECEFF4;
+                    border: 1px solid rgba(62, 68, 82, 175);
+                    border-radius: 5px;
+                    padding: 3px 8px;
+                    font-size: 11px;
+                    font-weight: 600;
+                }}
+                QComboBox:hover {{
+                    border-color: {hex_c};
+                }}
+                QPushButton {{
+                    background-color: rgba(16, 18, 24, 145);
+                    color: #ECEFF4;
+                    border: 1px solid rgba(62, 68, 82, 165);
+                    border-radius: 5px;
+                    padding: 5px 8px;
+                    font-size: 11px;
+                    font-weight: 600;
+                    text-align: left;
+                }}
+                QPushButton:hover {{
+                    background-color: rgba({r}, {g}, {b}, 36);
+                    border-color: {hex_c};
+                    color: #FFFFFF;
+                }}
+            """)
+        for cb_attr in ("fft_combo", "x_scale_combo", "y_scale_combo"):
+            cb = getattr(self, cb_attr, None)
+            if cb is not None:
+                style_dark_combobox(cb, accent_color=hex_c)
+        for sp_attr in ("db_min_spin", "db_max_spin"):
+            sp = getattr(self, sp_attr, None)
+            if sp is not None:
+                style_hud_spinbox(sp, accent_color=hex_c)
+
+    def _get_active_hud_accent_hex(self) -> str:
+        fallback = str(self.theme.get("curve_out1", self.theme.get("curve", "#00E5FF"))) if hasattr(self, "theme") else "#00E5FF"
+        panel = getattr(self, "eq_panel", None)
+        ov = getattr(self, "eq_overlay", None)
+        if panel is None or ov is None:
+            return fallback
+        mode = getattr(panel, "_hud_mode", "eq")
+        if mode == "mb":
+            mb = getattr(self, "multiband_dyn", None)
+            idx = getattr(ov, "selected_mb_idx", -1)
+            if mb is not None:
+                with mb.lock:
+                    if 0 <= idx < len(mb.bands):
+                        return str(mb.bands[idx].color)
+        else:
+            idx = getattr(ov, "selected_band_idx", -1)
+            with self.eq_engine.lock:
+                if 0 <= idx < len(self.eq_engine.bands):
+                    return str(self.eq_engine.bands[idx].color)
+        return fallback
+
+    def _sync_main_menus_accent(self, hex_color: str = ""):
+        c = QColor(hex_color) if hex_color else QColor()
+        acc = c.name() if c.isValid() else self._get_active_hud_accent_hex()
+        if hasattr(self, "audio_popup") and self.audio_popup is not None:
+            self.audio_popup.setAccentColor(acc)
+            if self.audio_popup.isVisible():
+                self._apply_audio_popup_accent(acc)
+        if hasattr(self, "analyzer_popup") and self.analyzer_popup is not None:
+            self.analyzer_popup.setAccentColor(acc)
+            if self.analyzer_popup.isVisible():
+                self._apply_analyzer_popup_accent(acc)
+        if (
+            hasattr(self, "scope_overlay")
+            and self.scope_overlay is not None
+            and getattr(self.scope_overlay, "settings_popup", None) is not None
+        ):
+            spop = self.scope_overlay.settings_popup
+            spop._hud_gl.set_accent_color(acc)
+            if spop.isVisible():
+                spop.setAccentColor(acc)
 
     def _pick_curve_color(self, key: str, label: str):
         original = self.theme.get(key, "#00E5FF")
@@ -3406,6 +3604,9 @@ class AudioAnalyzerApp(QMainWindow):
                 if key == "curve_out1":
                     self.theme["curve"] = c.name()
                 self.apply_theme()
+                if self.color_dialog is not None and self.color_dialog.isVisible():
+                    self.color_dialog._refresh_widgets()
+                    self.color_dialog._sync_preset_combo()
                 self.schedule_config_save()
 
         dlg.currentColorChanged.connect(_apply)
@@ -3416,8 +3617,13 @@ class AudioAnalyzerApp(QMainWindow):
             if key == "curve_out1":
                 self.theme["curve"] = original
             self.apply_theme()
+            if self.color_dialog is not None and self.color_dialog.isVisible():
+                self.color_dialog._refresh_widgets()
+                self.color_dialog._sync_preset_combo()
 
     def _on_bg_combo_activated(self, index: int):
+        if not hasattr(self, "bg_color_combo") or self.bg_color_combo is None:
+            return
         val = self.bg_color_combo.itemData(index)
         if val == "custom":
             self.analyzer_popup.close()
@@ -3426,6 +3632,8 @@ class AudioAnalyzerApp(QMainWindow):
             self._set_background_color(val)
 
     def _sync_bg_combo(self):
+        if not hasattr(self, "bg_color_combo") or self.bg_color_combo is None:
+            return
         cur_bg = self.theme.get("background", "#141414").lower()
         self.bg_color_combo.blockSignals(True)
         matched = False
@@ -3440,7 +3648,7 @@ class AudioAnalyzerApp(QMainWindow):
         self.bg_color_combo.blockSignals(False)
 
     def _show_analyzer_popup(self):
-        self._sync_bg_combo()
+        self._apply_analyzer_popup_accent(self._get_active_hud_accent_hex())
         self.analyzer_popup.adjustSize()
         pos = self.analyzer_menu_btn.mapToGlobal(QPoint(0, self.analyzer_menu_btn.height() + 4))
         self.analyzer_popup.move(pos)
@@ -3489,12 +3697,14 @@ class AudioAnalyzerApp(QMainWindow):
         else:
             txt = "FFT: Off ▾"
         self.analyzer_menu_btn.setText(txt)
+        self.analyzer_menu_btn.setToolTip(f"Analizador FFT ({txt}) — Curvas, Escalas, Rango dB y Colores")
         self.analyzer_menu_btn.setForceActive(bool(active))
         self.schedule_config_save()
 
     def _on_global_bypass_toggled(self, checked: bool):
+        self.bypass_eq = bool(checked)
         with self.eq_engine.lock:
-            self.eq_engine.bypass = checked
+            self.eq_engine.bypass = bool(checked)
             self.eq_engine.mark_dirty()
         self.recalculate_autogain_target()
         self.bypass_btn.setChecked(checked)
@@ -3522,15 +3732,18 @@ class AudioAnalyzerApp(QMainWindow):
         self.recalculate_autogain_target()
         if hasattr(self, "autogain_mini_bar") and self.autogain_mini_bar._enabled != enabled:
             self.autogain_mini_bar.set_state(bool(enabled), getattr(self, "current_autogain_a_db", 0.0), getattr(self, "current_autogain_b_db", 0.0))
-        if hasattr(self, "scope_overlay") and hasattr(self.scope_overlay, "btn_scope_autogain"):
-            self.scope_overlay.btn_scope_autogain.blockSignals(True)
-            self.scope_overlay.btn_scope_autogain.setChecked(bool(enabled))
-            self.scope_overlay.btn_scope_autogain.blockSignals(False)
+        if hasattr(self, "scope_overlay") and hasattr(self.scope_overlay, "ag_scope_meter"):
+            self.scope_overlay.ag_scope_meter.set_state(
+                bool(enabled),
+                getattr(self, "current_autogain_a_db", 0.0),
+                getattr(self, "current_autogain_b_db", 0.0),
+            )
         self.schedule_config_save()
 
     def recalculate_autogain_target(self):
         ag_en = getattr(self, "autogain_enabled", False)
-        if not ag_en or getattr(self, "bypass_eq", False):
+        eq_bypassed = bool(getattr(self.eq_engine, "bypass", False)) if hasattr(self, "eq_engine") else False
+        if not ag_en or eq_bypassed:
             self.target_autogain_a_db = 0.0
             self.target_autogain_b_db = 0.0
             self.target_autogain_db = 0.0
@@ -3596,16 +3809,18 @@ class AudioAnalyzerApp(QMainWindow):
             self.eq_proc_in2.target_autogain_b_db = self.target_autogain_b_db
             self.eq_proc_in2.target_autogain_db = self.target_autogain_a_db
 
-    def _show_crossover_menu(self):
+    def _on_top_crossover_toggled(self, checked: bool):
+        self.crossover_state["enabled"] = bool(checked)
+        if hasattr(self, "crossover"):
+            self.crossover.set_config(self.crossover_state, self.current_sr)
+        if hasattr(self, "crossover_widget") and self.crossover_widget is not None:
+            self.crossover_widget.set_state(self.crossover_state)
+        self.update_crossover_visuals()
+        self.schedule_config_save()
+
+    def _show_crossover_menu(self, anchor_widget=None):
         if self._crossover_menu is None:
             self._crossover_menu = HUDPopupMenu(self, accent_color="#FFB300", corner_radius=10.0)
-            self._crossover_menu.setStyleSheet("""
-                QMenu {
-                    background-color: transparent;
-                    border: none;
-                    padding: 4px;
-                }
-            """)
             action = QWidgetAction(self._crossover_menu)
             self.crossover_widget = CrossoverMenuWidget(self._crossover_menu)
             self.crossover_widget.configChanged.connect(self._on_crossover_widget_changed)
@@ -3613,7 +3828,12 @@ class AudioAnalyzerApp(QMainWindow):
             self._crossover_menu.addAction(action)
 
         self.crossover_widget.set_state(self.crossover_state)
-        btn_pos = self.crossover_btn.mapToGlobal(QPoint(0, self.crossover_btn.height() + 2))
+        anchor = anchor_widget
+        if anchor is None and hasattr(self, "scope_overlay") and hasattr(self.scope_overlay, "xover_scope_btn"):
+            anchor = self.scope_overlay.xover_scope_btn
+        if anchor is None:
+            anchor = self.crossover_btn
+        btn_pos = anchor.mapToGlobal(QPoint(0, anchor.height() + 2))
         self._crossover_menu.exec(btn_pos)
 
     def _on_crossover_widget_changed(self):
@@ -3679,7 +3899,12 @@ class AudioAnalyzerApp(QMainWindow):
 
         if hasattr(self, "crossover_btn"):
             self.crossover_btn.setActiveTintColor("#FFB300")
+            self.crossover_btn.blockSignals(True)
+            self.crossover_btn.setChecked(is_enabled)
             self.crossover_btn.setForceActive(is_enabled)
+            self.crossover_btn.blockSignals(False)
+        if hasattr(self, "scope_overlay") and hasattr(self.scope_overlay, "xover_scope_btn"):
+            self.scope_overlay.xover_scope_btn.setForceActive(is_enabled)
 
         if not is_enabled:
             if hasattr(self, "xover_curve_a"):
@@ -3697,16 +3922,11 @@ class AudioAnalyzerApp(QMainWindow):
 
         self._redraw_xover_curves()
 
-    @property
-    def bands(self):
-        """Acceso directo a las bandas del ecualizador."""
-        return self.eq_engine.bands if hasattr(self, "eq_engine") else []
-
     def _get_presets_dir(self) -> str:
         r"""
         Retorna la ruta hacia la carpeta de presets del usuario garantizando permisos de escritura.
         Si la carpeta del ejecutable es escribible (modo desarrollo/portátil), se usa 'presets' local.
-        De lo contrario (instalada en C:\Program Files), se usa %APPDATA%\BDJ_FFT_EQ\presets.
+        De lo contrario (instalada en C:\Program Files), se usa %APPDATA%\Heaviside_DSP\presets.
         """
         app_d = _app_dir()
         if _is_writable_dir(app_d):
@@ -3732,6 +3952,11 @@ class AudioAnalyzerApp(QMainWindow):
         app_p = os.path.join(_app_dir(), "presets", "default_startup.json")
         if os.path.isfile(app_p):
             return app_p
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            legacy_bdj_p = os.path.join(appdata, "BDJ_FFT_EQ", "presets", "default_startup.json")
+            if os.path.isfile(legacy_bdj_p):
+                return legacy_bdj_p
         return user_p
 
     def _get_preset_files(self) -> list[tuple[str, str]]:
@@ -3745,9 +3970,10 @@ class AudioAnalyzerApp(QMainWindow):
 
         appdata = os.environ.get("APPDATA")
         if appdata:
-            legacy_dir = os.path.join(appdata, "AnalizadorFFT", "presets")
-            if legacy_dir not in search_dirs and os.path.isdir(legacy_dir):
-                search_dirs.append(legacy_dir)
+            for legacy_folder in ("BDJ_FFT_EQ", "AnalizadorFFT"):
+                legacy_dir = os.path.join(appdata, legacy_folder, "presets")
+                if legacy_dir not in search_dirs and os.path.isdir(legacy_dir):
+                    search_dirs.append(legacy_dir)
 
         for folder in search_dirs:
             if not os.path.isdir(folder):
@@ -3784,6 +4010,8 @@ class AudioAnalyzerApp(QMainWindow):
                         "dyn_threshold": float(getattr(b, "threshold_db", getattr(b, "dyn_threshold", -20.0))),
                         "dyn_ratio": float(getattr(b, "dyn_ratio", 2.0)),
                         "dyn_range_db": float(getattr(b, "dyn_range_db", 0.0)),
+                        "attack_ms": float(getattr(b, "attack_ms", 15.0)),
+                        "release_ms": float(getattr(b, "release_ms", 120.0)),
                         "slope": int(getattr(b, "slope", 12)),
                         "color": str(getattr(b, "color", "#00E5FF")),
                     })
@@ -3795,12 +4023,18 @@ class AudioAnalyzerApp(QMainWindow):
                 b2 = list(self.eq_proc_in2.bands)
 
             xover_dict = self.crossover.get_state_dict() if hasattr(self, "crossover") else dict(self.crossover_state)
+            mb_dict = self.multiband_dyn_in1.to_dict() if hasattr(self, "multiband_dyn_in1") else (self.multiband_dyn.to_dict() if hasattr(self, "multiband_dyn") else {"bypass": False, "bands": []})
+            mb_dict_in2 = self.multiband_dyn_in2.to_dict() if hasattr(self, "multiband_dyn_in2") else {"bypass": False, "bands": []}
+            lim_dict = self.eq_proc_in1.limiter_a.to_dict()
 
             data = {
                 "version": "1.0",
                 "bands": _serialize(b1),
                 "bands_in2": _serialize(b2),
                 "crossover": xover_dict,
+                "multiband_dynamics": mb_dict,
+                "multiband_dynamics_in2": mb_dict_in2,
+                "limiter": lim_dict,
                 "input_routing": {
                     "route_in1_to_a": bool(self.route_in1_to_a),
                     "route_in1_to_b": bool(self.route_in1_to_b),
@@ -3945,10 +4179,46 @@ class AudioAnalyzerApp(QMainWindow):
                 self.recalculate_autogain_target()
                 self.schedule_config_save()
 
+            if mode == "all":
+                if hasattr(self, "multiband_dyn_in1"):
+                    if "multiband_dynamics" in data and isinstance(data["multiband_dynamics"], dict):
+                        self.multiband_dyn_in1.load_from_dict(data["multiband_dynamics"])
+                    else:
+                        self.multiband_dyn_in1.load_from_dict({"bypass": False, "bands": []})
+                if hasattr(self, "multiband_dyn_in2"):
+                    if "multiband_dynamics_in2" in data and isinstance(data["multiband_dynamics_in2"], dict):
+                        self.multiband_dyn_in2.load_from_dict(data["multiband_dynamics_in2"])
+                    else:
+                        self.multiband_dyn_in2.load_from_dict({"bypass": False, "bands": []})
+                if hasattr(self, "multiband_dyn"):
+                    self.multiband_dyn = self.multiband_dyn_in1 if getattr(self, "current_edit_input", 1) == 1 else self.multiband_dyn_in2
+                    self._selected_mb_idx_by_input[1] = 0 if self.multiband_dyn_in1.bands else -1
+                    self._selected_mb_idx_by_input[2] = 0 if self.multiband_dyn_in2.bands else -1
+                    if hasattr(self, "eq_overlay") and self.eq_overlay is not None:
+                        self.eq_overlay.selected_mb_idx = 0 if self.multiband_dyn.bands else -1
+                        self.eq_overlay._last_mb_rendered_version = -1
+                        self.eq_overlay.set_multiband_processor(self.multiband_dyn)
+                if "limiter" in data and isinstance(data["limiter"], dict):
+                    self.eq_proc_in1.limiter_a.load_from_dict(data["limiter"])
+                    self.eq_proc_in1.limiter_b.load_from_dict(data["limiter"])
+                    if (
+                        hasattr(self, "scope_overlay")
+                        and hasattr(self.scope_overlay, "limiter_popup")
+                        and self.scope_overlay.limiter_popup is not None
+                    ):
+                        self.scope_overlay.limiter_popup.sync_from_engine()
+                if hasattr(self, "eq_panel") and self.eq_panel is not None:
+                    self.eq_panel.set_multiband_processor(self.multiband_dyn)
+                    self.eq_panel.refresh_mb_from_engine()
+                    if hasattr(self, "multiband_dyn") and not self.multiband_dyn.bands and getattr(self.eq_panel, "_hud_mode", "eq") == "mb":
+                        self.eq_panel.set_hud_mode("eq")
+                if hasattr(self, "eq_overlay") and self.eq_overlay is not None:
+                    self.eq_overlay.update_eq_curves(force=True)
+                self.schedule_config_save()
+
             return True
         except Exception as e:
             print(f"[ERROR] Error al cargar preset desde {target}: {e}")
-            return False
             return False
 
     def _delete_preset_file(self, filepath: str):
@@ -4064,8 +4334,7 @@ class AudioAnalyzerApp(QMainWindow):
 
     def _show_presets_menu(self):
         """Despliega el menú HUD estilizado de Presets bajo el botón de la barra superior."""
-        c_eq_a = str(self.theme.get("curve_eq_a", "#FFD54F")) if hasattr(self, "theme") else "#FFD54F"
-        menu = HUDPopupMenu(self, accent_color=c_eq_a, corner_radius=8.0)
+        menu = HUDPopupMenu(self, accent_color=self._get_active_hud_accent_hex(), corner_radius=8.0)
 
         # 1. Resetear EQ
         act_reset = menu.addAction("Resetear EQ Actual (Plano)")
@@ -4128,12 +4397,21 @@ class AudioAnalyzerApp(QMainWindow):
     def toggle_fullscreen(self):
         if self.isFullScreen():
             self.showNormal()
+            self.fullscreen_btn.setForceActive(False)
         else:
             self.showFullScreen()
+            self.fullscreen_btn.setForceActive(True)
+
+    def _toggle_interactive_help(self):
+        if self._help_tour is None:
+            self._help_tour = InteractiveHelpTour(self)
+        if self._help_tour.is_active():
+            self._help_tour.stop()
+        else:
+            self._help_tour.start()
 
     def show_context_menu(self, pos):
-        c_out1 = str(self.theme.get("curve_out1", self.theme.get("curve", "#00E5FF"))) if hasattr(self, "theme") else "#00E5FF"
-        menu = HUDPopupMenu(self, accent_color=c_out1, corner_radius=8.0)
+        menu = HUDPopupMenu(self, accent_color=self._get_active_hud_accent_hex(), corner_radius=8.0)
 
         act_add = menu.addAction("+ Añadir Banda EQ (Doble clic en gráfico)")
         act_add.triggered.connect(self.eq_panel._on_add_band)
@@ -4182,7 +4460,9 @@ class AudioAnalyzerApp(QMainWindow):
             self.toggle_fullscreen()
             event.accept()
         elif event.key() == Qt.Key.Key_Escape:
-            if self.scope_overlay.isVisible():
+            if hasattr(self, "eq_overlay") and getattr(self.eq_overlay, "_mb_placement_armed", False):
+                self.eq_overlay.cancel_mb_placement()
+            elif self.scope_overlay.isVisible():
                 self.toggle_expanded_scope()
             elif self.isFullScreen():
                 self.showNormal()
@@ -4240,13 +4520,29 @@ class AudioAnalyzerApp(QMainWindow):
                 "scope_active_signals": list(self.scope_overlay.active_signals),
                 "scope_signal_colors": dict(self.scope_overlay.signal_colors),
                 "scope_opacity_pct": int(self.scope_overlay.opacity_pct),
-                "eq_range_db": float(self.eq_overlay.eq_range_db),
+                "eq_range_db": float(getattr(self.eq_overlay, "target_eq_range_db", self.eq_overlay.eq_range_db)),
+                "canvas_mode": str(getattr(self.eq_overlay, "canvas_mode", "BOTH")),
                 "autogain_enabled": bool(self.autogain_enabled),
             },
             "eq": {
-                **self.eq_engine.to_dict(),
-                "selected_band_idx": int(self.eq_overlay.selected_band_idx),
+                **self.eq_proc_in1.to_dict(),
+                "selected_band_idx": int(
+                    self.eq_overlay.selected_band_idx
+                    if getattr(self, "current_edit_input", 1) == 1
+                    else self._selected_band_idx_by_input.get(1, 0)
+                ),
             },
+            "eq_in2": {
+                **self.eq_proc_in2.to_dict(),
+                "selected_band_idx": int(
+                    self.eq_overlay.selected_band_idx
+                    if getattr(self, "current_edit_input", 1) == 2
+                    else self._selected_band_idx_by_input.get(2, 0)
+                ),
+            },
+            "multiband_dynamics": self.multiband_dyn_in1.to_dict() if hasattr(self, "multiband_dyn_in1") else {"bypass": False, "bands": []},
+            "multiband_dynamics_in2": self.multiband_dyn_in2.to_dict() if hasattr(self, "multiband_dyn_in2") else {"bypass": False, "bands": []},
+            "limiter": self.eq_proc_in1.limiter_a.to_dict(),
             "crossover": dict(self.crossover_state),
         }
         save_full_config(payload)
@@ -4345,7 +4641,13 @@ class AudioAnalyzerApp(QMainWindow):
                     self.fft_worker.set_sample_rate(self.current_sr)
                 else:
                     self.fft_analyzer.set_sample_rate(self.current_sr)
+                self.eq_proc_in1.set_sample_rate(self.current_sr)
+                self.eq_proc_in2.set_sample_rate(self.current_sr)
                 self.eq_engine.set_sample_rate(self.current_sr)
+                if hasattr(self, "multiband_dyn_in1"):
+                    self.multiband_dyn_in1.set_sample_rate(self.current_sr)
+                if hasattr(self, "multiband_dyn_in2"):
+                    self.multiband_dyn_in2.set_sample_rate(self.current_sr)
                 self.scope_buffer.set_sample_rate(self.current_sr)
 
             if hasattr(self, "delay_out1_spin") and "delay_out1_ms" in audio_cfg:
@@ -4408,7 +4710,7 @@ class AudioAnalyzerApp(QMainWindow):
             if scope_dur in (1, 3, 5, 10):
                 self.scope_widget.set_duration(int(scope_dur))
                 if hasattr(self, "scope_overlay") and hasattr(self.scope_overlay, "dur_btn"):
-                    self.scope_overlay.dur_btn.setText(f"{int(scope_dur)}s")
+                    self.scope_overlay.dur_btn.set_duration(int(scope_dur))
 
             scope_active = analyzer_cfg.get("scope_active_signals")
             if isinstance(scope_active, list):
@@ -4424,21 +4726,71 @@ class AudioAnalyzerApp(QMainWindow):
 
             eq_rng = analyzer_cfg.get("eq_range_db")
             if eq_rng in (12, 12.0, 30, 30.0):
-                self.eq_overlay.set_eq_range_db(float(eq_rng))
-                self.eq_range_badge.setText(f"+{int(float(eq_rng))} dB")
+                self.eq_overlay.set_eq_range_db(float(eq_rng), animate=False)
+                self.eq_range_badge.setRangeDb(float(eq_rng))
+
+            c_mode = analyzer_cfg.get("canvas_mode")
+            if c_mode in ("EQ", "MB", "BOTH", "NONE"):
+                if hasattr(self, "canvas_mode_selector") and self.canvas_mode_selector is not None:
+                    self.canvas_mode_selector.set_mode(c_mode, emit_signal=False)
+                self.eq_overlay.set_canvas_mode(c_mode)
+                if c_mode == "NONE" and hasattr(self, "eq_panel") and self.eq_panel is not None:
+                    self._hud_was_auto_minimized_for_fft = True
+                    self.eq_panel.set_minimized(True)
 
             if "autogain_enabled" in analyzer_cfg:
                 self._on_autogain_toggled(bool(analyzer_cfg.get("autogain_enabled", False)))
 
         eq_cfg = self.saved_config.get("eq", {})
         if isinstance(eq_cfg, dict):
-            self.eq_engine.load_from_dict(eq_cfg)
+            self.eq_proc_in1.load_from_dict(eq_cfg)
+            self.bands_in1 = self.eq_proc_in1.bands
             sel_idx = int(eq_cfg.get("selected_band_idx", 0))
-            if 0 <= sel_idx < len(self.eq_engine.bands):
-                self.eq_overlay.selected_band_idx = sel_idx
+            if 0 <= sel_idx < len(self.eq_proc_in1.bands):
+                self._selected_band_idx_by_input[1] = sel_idx
+                if getattr(self, "current_edit_input", 1) == 1:
+                    self.eq_overlay.selected_band_idx = sel_idx
             self.bypass_btn.setChecked(self.eq_engine.bypass)
             self._on_global_bypass_toggled(self.eq_engine.bypass)
             self.eq_panel.refresh_from_engine()
+
+        eq_in2_cfg = self.saved_config.get("eq_in2", {})
+        if isinstance(eq_in2_cfg, dict) and eq_in2_cfg:
+            self.eq_proc_in2.load_from_dict(eq_in2_cfg)
+            self.bands_in2 = self.eq_proc_in2.bands
+            sel_idx2 = int(eq_in2_cfg.get("selected_band_idx", 0))
+            if 0 <= sel_idx2 < len(self.eq_proc_in2.bands):
+                self._selected_band_idx_by_input[2] = sel_idx2
+                if getattr(self, "current_edit_input", 1) == 2:
+                    self.eq_overlay.selected_band_idx = sel_idx2
+            if getattr(self, "current_edit_input", 1) == 2:
+                self.eq_panel.refresh_from_engine()
+
+        mb_cfg = self.saved_config.get("multiband_dynamics")
+        if isinstance(mb_cfg, dict) and hasattr(self, "multiband_dyn_in1"):
+            self.multiband_dyn_in1.load_from_dict(mb_cfg)
+            self._selected_mb_idx_by_input[1] = 0 if self.multiband_dyn_in1.bands else -1
+        mb_in2_cfg = self.saved_config.get("multiband_dynamics_in2")
+        if isinstance(mb_in2_cfg, dict) and hasattr(self, "multiband_dyn_in2"):
+            self.multiband_dyn_in2.load_from_dict(mb_in2_cfg)
+            self._selected_mb_idx_by_input[2] = 0 if self.multiband_dyn_in2.bands else -1
+        if hasattr(self, "multiband_dyn"):
+            self.multiband_dyn = self.multiband_dyn_in1 if getattr(self, "current_edit_input", 1) == 1 else self.multiband_dyn_in2
+            self.eq_overlay.selected_mb_idx = 0 if self.multiband_dyn.bands else -1
+            self.eq_overlay.set_multiband_processor(self.multiband_dyn)
+            self.eq_panel.set_multiband_processor(self.multiband_dyn)
+            self.eq_panel.refresh_mb_from_engine()
+
+        lim_cfg = self.saved_config.get("limiter")
+        if isinstance(lim_cfg, dict):
+            self.eq_proc_in1.limiter_a.load_from_dict(lim_cfg)
+            self.eq_proc_in1.limiter_b.load_from_dict(lim_cfg)
+            if (
+                hasattr(self, "scope_overlay")
+                and hasattr(self.scope_overlay, "limiter_popup")
+                and self.scope_overlay.limiter_popup is not None
+            ):
+                self.scope_overlay.limiter_popup.sync_from_engine()
 
         if "crossover" in self.saved_config and isinstance(self.saved_config["crossover"], dict):
             self.crossover_state.update(self.saved_config["crossover"])
@@ -4451,6 +4803,7 @@ class AudioAnalyzerApp(QMainWindow):
         self.update_axes_config()
         self.eq_overlay.update_eq_curves(force=True)
         self.update_crossover_visuals()
+        self._sync_main_menus_accent()
 
     def _update_curve_brush(self):
         t = self.theme
@@ -4508,12 +4861,14 @@ class AudioAnalyzerApp(QMainWindow):
         # Sincronizar colores contextuales de los botones con el resto de la interfaz
         c_out1_hex = c_out1.name()
         c_in2_hex = c_in2.name()
-        for btn_attr in ("audio_menu_btn", "analyzer_menu_btn", "fullscreen_btn"):
+        for btn_attr in ("audio_menu_btn", "analyzer_menu_btn", "fullscreen_btn", "help_btn"):
             btn_w = getattr(self, btn_attr, None)
             if btn_w is not None and hasattr(btn_w, "setActiveTintColor"):
                 btn_w.setActiveTintColor(c_out1_hex)
         if hasattr(self, "scope_widget") and hasattr(self.scope_widget, "setAccentColor"):
             self.scope_widget.setAccentColor(c_out1_hex)
+        if hasattr(self, "scope_widget") and hasattr(self.scope_widget, "mini_scope") and hasattr(self.scope_widget.mini_scope, "set_wave_color"):
+            self.scope_widget.mini_scope.set_wave_color(t.get("mini_scope", "#00E5FF"))
         if hasattr(self, "autogain_mini_bar") and hasattr(self.autogain_mini_bar, "setAccentColor"):
             self.autogain_mini_bar.setAccentColor(c_out1_hex)
         if hasattr(self, "edit_input_selector"):
@@ -4524,17 +4879,14 @@ class AudioAnalyzerApp(QMainWindow):
         if hasattr(self, "eq_range_badge"):
             self.eq_range_badge.setActiveTintColor(c_eq_a)
         if hasattr(self, "scope_overlay"):
-            for s_attr in ("settings_btn", "btn_scope_autogain", "dur_btn"):
+            for s_attr in ("settings_btn", "dur_btn"):
                 sw = getattr(self.scope_overlay, s_attr, None)
                 if sw is not None and hasattr(sw, "setActiveTintColor"):
                     sw.setActiveTintColor(c_out1_hex)
             self.scope_overlay.invalidate_cache()
         if hasattr(self, "stereo_meter"):
             self.stereo_meter.update()
-        for pop_attr in ("audio_popup", "analyzer_popup"):
-            pop_w = getattr(self, pop_attr, None)
-            if pop_w is not None and hasattr(pop_w, "set_accent_color"):
-                pop_w.set_accent_color(c_out1_hex)
+        self._sync_main_menus_accent()
 
         self._update_curve_brush()
         self.plot_widget.showGrid(x=False, y=False)
@@ -4972,6 +5324,10 @@ class AudioAnalyzerApp(QMainWindow):
         self.eq_proc_in1.set_sample_rate(self.current_sr)
         self.eq_proc_in2.set_sample_rate(self.current_sr)
         self.eq_engine.set_sample_rate(self.current_sr)
+        if hasattr(self, "multiband_dyn_in1"):
+            self.multiband_dyn_in1.set_sample_rate(self.current_sr)
+        if hasattr(self, "multiband_dyn_in2"):
+            self.multiband_dyn_in2.set_sample_rate(self.current_sr)
         self.scope_buffer.set_sample_rate(self.current_sr)
         if hasattr(self, "crossover"):
             self.crossover.set_config(self.crossover_state, self.current_sr)
@@ -5037,19 +5393,23 @@ class AudioAnalyzerApp(QMainWindow):
 
     def audio_callback(self, indata, outdata, frames, time_info, status):
         _boost_audio_thread_priority()
-        # 1. Procesamiento independiente de Input 1
+        # 1. Procesamiento independiente de Input 1 (EQ + Multiband Dynamics In 1)
         if self.route_in1_to_a or self.route_in1_to_b:
             in1_a, in1_b = self.eq_proc_in1.process_dual_block(indata, apply_limiter=False, apply_autogain=False)
+            if hasattr(self, "multiband_dyn_in1"):
+                in1_a, in1_b = self.multiband_dyn_in1.process_dual_block(in1_a, in1_b)
         else:
             in1_a = in1_b = None
 
-        # 2. Lectura y procesamiento independiente de Input 2 (Aux / Mic) desde el ring buffer lock-free
+        # 2. Lectura y procesamiento independiente de Input 2 (Aux / Mic: EQ + Multiband Dynamics In 2)
         if not hasattr(self, "in2_block") or self.in2_block.shape[0] != frames:
             self.in2_block = np.zeros((frames, 2), dtype=np.float32)
         if self.stream_in2 is not None:
             self.in2_ring_buffer.read_into(self.in2_block)
             if self.route_in2_to_a or self.route_in2_to_b:
                 in2_a, in2_b = self.eq_proc_in2.process_dual_block(self.in2_block, apply_limiter=False, apply_autogain=False)
+                if hasattr(self, "multiband_dyn_in2"):
+                    in2_a, in2_b = self.multiband_dyn_in2.process_dual_block(in2_a, in2_b)
             else:
                 in2_a = in2_b = None
         else:
@@ -5116,7 +5476,8 @@ class AudioAnalyzerApp(QMainWindow):
                 self.rta_measurement_done = True
 
         # 5. Compensador de Loudness (Auto-Gain Independiente por Bus A y B)
-        if getattr(self, "autogain_enabled", False) and not getattr(self, "bypass_eq", False):
+        eq_active_engine = self.eq_engine
+        if getattr(self, "autogain_enabled", False) and not bool(getattr(eq_active_engine, "bypass", False)):
             peak_a = float(np.max(np.abs(out_A))) if out_A.size else 0.0
             peak_b = float(np.max(np.abs(out_B))) if out_B.size else 0.0
 
@@ -5394,9 +5755,13 @@ class AudioAnalyzerApp(QMainWindow):
                         f"No se pudo iniciar la Salida Secundaria (Bus B) en el dispositivo seleccionado:\n{out_b_err}",
                     )
 
-        # Actualizar frecuencia de muestreo de las líneas de retardo estéreo
+        # Actualizar frecuencia de muestreo de las líneas de retardo estéreo y multibanda
         self.delay_bus_a.set_sample_rate(self.current_sr)
         self.delay_bus_b.set_sample_rate(self.current_sr)
+        if hasattr(self, "multiband_dyn_in1"):
+            self.multiband_dyn_in1.set_sample_rate(self.current_sr)
+        if hasattr(self, "multiband_dyn_in2"):
+            self.multiband_dyn_in2.set_sample_rate(self.current_sr)
 
         if hasattr(self, "delay_out1_spin"):
             if self.stream_out_b is not None:
@@ -5449,8 +5814,8 @@ class AudioAnalyzerApp(QMainWindow):
             except IndexError:
                 break
 
-        # Actualiza curvas EQ (en IDLE retorna en 0 ms gracias a dirty-check)
-        self.eq_overlay.update_eq_curves(force=False)
+        # Actualiza curvas EQ (en IDLE retorna False en 0 ms gracias a dirty-check)
+        eq_updated = bool(self.eq_overlay.update_eq_curves(force=False))
         self.eq_overlay.update_ghost_tick()
         self.eq_panel.update_live_Readouts()
 
@@ -5466,14 +5831,8 @@ class AudioAnalyzerApp(QMainWindow):
         ag_b = getattr(self, "current_autogain_b_db", 0.0)
         if hasattr(self, "autogain_mini_bar"):
             self.autogain_mini_bar.set_state(ag_en, ag_a, ag_b)
-        if hasattr(self, "scope_overlay") and hasattr(self.scope_overlay, "lbl_scope_ag"):
-            txt = f"AG A:{ag_a:+.1f} | B:{ag_b:+.1f} dB" if ag_en else "AG: OFF"
-            if self.scope_overlay.lbl_scope_ag.text() != txt:
-                self.scope_overlay.lbl_scope_ag.setText(txt)
-            target_c = ("#00E676" if (ag_a > 0 or ag_b > 0) else "#00E5FF") if ag_en else "#8C96A5"
-            if getattr(self, "_last_scope_ag_c", None) != target_c:
-                self._last_scope_ag_c = target_c
-                self.scope_overlay.lbl_scope_ag.setStyleSheet(f"color: {target_c}; font-size: 9px; font-weight: 600; background: transparent;")
+        if hasattr(self, "scope_overlay") and hasattr(self.scope_overlay, "ag_scope_meter"):
+            self.scope_overlay.ag_scope_meter.set_state(ag_en, ag_a, ag_b)
 
         gr_db = float(min(self.eq_proc_in1.limiter_a.last_gr_db, self.eq_proc_in1.limiter_b.last_gr_db))
 
@@ -5492,16 +5851,18 @@ class AudioAnalyzerApp(QMainWindow):
 
         if hasattr(self, "scope_widget"):
             self.scope_widget.update_gr(gr_db)
-            self.scope_widget.mini_scope.push_audio_peaks(vmin, vmax, gr_db)
-            self.scope_widget.mini_scope.tick_render(QColor("#00E5FF"))
+            if post_blocks or gr_db < -0.05 or getattr(self.scope_widget, "_limit_glow_alpha", 0.0) > 0.01:
+                self.scope_widget.mini_scope.push_audio_peaks(vmin, vmax, gr_db)
+                self.scope_widget.mini_scope.tick_render(QColor(self.theme.get("mini_scope", "#00E5FF")))
 
         # 2. Regla de Oro de Rendimiento: Solo actualizar el osciloscopio grande si está visible
-        if self.scope_overlay.isVisible() and post_blocks:
+        if self.scope_overlay.isVisible():
             self.scope_overlay.update_gr(gr_db)
-            scope_changed = self.scope_buffer.push_multi_blocks(pre_blocks, post_blocks, post2_blocks, gr_db=gr_db)
-            self._scope_tick_counter = (self._scope_tick_counter + 1) % 2
-            if scope_changed and self._scope_tick_counter == 0:
-                self.scope_overlay.update()
+            if post_blocks:
+                scope_changed = self.scope_buffer.push_multi_blocks(pre_blocks, post_blocks, post2_blocks, gr_db=gr_db)
+                self._scope_tick_counter = (self._scope_tick_counter + 1) % 2
+                if scope_changed and self._scope_tick_counter == 0:
+                    self.scope_overlay.update()
 
         # 3. Medición y Promediado RTA (10.0s) + Detección de Resonancias
         listen_in = getattr(self, "rta_listen_input", 2)
@@ -5678,8 +6039,10 @@ class AudioAnalyzerApp(QMainWindow):
         )
 
         snap = self.fft_worker.get_latest_snapshot()
+        fft_updated = False
         if snap is not None and snap is not getattr(self, "_last_rendered_snapshot", None):
             self._last_rendered_snapshot = snap
+            fft_updated = True
 
             # Curva 1: Input (Pre-EQ)
             if show_in and snap.in_changed and snap.x_in is not None:
@@ -5702,8 +6065,12 @@ class AudioAnalyzerApp(QMainWindow):
                 self.fft_curve_out2.setData(snap.x_out2, snap.y_out2)
                 self._out2_was_shown = True
 
-        # Actualiza el buffer compartido de Gaussian Blur a 60 FPS para HUD, callouts y popups abiertos
-        HUDOpenGLBackgroundItem.invalidate_scene_blur_cache(self.eq_overlay, self.plot_widget)
+        # Actualiza el buffer compartido de Gaussian Blur (~30 Hz cuando cambia FFT/EQ/RTA) para evitar repintados en reposo
+        if fft_updated or eq_updated or getattr(self, "rta_measuring", False):
+            now_blur = time.perf_counter()
+            if (now_blur - getattr(self, "_last_blur_invalidate_ts", 0.0)) >= 0.030:
+                self._last_blur_invalidate_ts = now_blur
+                HUDOpenGLBackgroundItem.invalidate_scene_blur_cache(self.eq_overlay, self.plot_widget)
 
 
     def changeEvent(self, event):
@@ -5717,6 +6084,11 @@ class AudioAnalyzerApp(QMainWindow):
             pass
 
     def closeEvent(self, event):
+        if getattr(self, "_help_tour", None) is not None and self._help_tour.is_active():
+            try:
+                self._help_tour.stop()
+            except Exception:
+                pass
         if hasattr(self, "fft_worker") and self.fft_worker is not None:
             try:
                 self.fft_worker.stop()
@@ -5757,6 +6129,10 @@ class AudioAnalyzerApp(QMainWindow):
         try:
             if hasattr(self, "_icon_path") and self._icon_path:
                 apply_windows_taskbar_icon(int(self.winId()), self._icon_path)
+                QTimer.singleShot(
+                    50,
+                    lambda: apply_windows_taskbar_icon(int(self.winId()), self._icon_path),
+                )
         except Exception:
             pass
 
@@ -5784,11 +6160,14 @@ if __name__ == "__main__":
     if sys.platform == "win32":
         try:
             import ctypes
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("bdj.ffteq.audioanalyzer.1.0")
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("heaviside.dsp.1.0")
         except Exception:
             pass
 
     app = QApplication(sys.argv)
+    app.setApplicationName("Heaviside DSP")
+    app.setApplicationDisplayName("Heaviside DSP")
+    app.setOrganizationName("Heaviside DSP")
     app.setStyle("Fusion")
 
     dark_stylesheet = """

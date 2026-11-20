@@ -1,7 +1,7 @@
-# Especificación Técnica y Reglas de Arquitectura: BDJ-FFT-EQ & Limiter Standalone
+# Especificación Técnica y Reglas de Arquitectura: Heaviside DSP Standalone
 
 ## 1. Descripción del Sistema y Propuesta de Valor
-Aplicación de escritorio standalone en Python para Windows que combina un **Analizador de Espectro FFT multi-resolución a 60+ FPS**, un **Ecualizador Paramétrico y Dinámico en Tiempo Real (BDJ-FFT-EQ)**, una **Matriz de Crossover Digital Linkwitz-Riley**, un **Sistema Inteligente de Auto-Gain**, un **Limitador de Picos Master con visualización de Reducción de Ganancia (GR)** y un **Osciloscopio acelerado por hardware OpenGL**, capaz de procesar todo el audio del sistema sin necesidad de abrir un DAW.
+Aplicación de escritorio standalone en Python para Windows que combina un **Analizador de Espectro FFT multi-resolución a 60+ FPS**, un **Ecualizador Paramétrico y Dinámico en Tiempo Real (Heaviside DSP)**, una **Matriz de Crossover Digital Linkwitz-Riley**, un **Sistema Inteligente de Auto-Gain**, un **Limitador de Picos Master con visualización de Reducción de Ganancia (GR)** y un **Osciloscopio acelerado por hardware OpenGL**, capaz de procesar todo el audio del sistema sin necesidad de abrir un DAW.
 - Recibe la señal desde un dispositivo de entrada (ej. cable virtual en Windows) y la envía procesada con latencia ultra baja hacia altavoces físicos individuales o matrices de doble bus (`Bus A` y `Bus B`).
 - Permite ecualización estática y **ecualización dinámica por banda (Dynamic EQ)** (comprimiendo o expandiendo rangos de frecuencia específicos según un `Threshold`, `Dynamic Range`, `Attack` y `Release`).
 - Integra **Crossover Digital** con pendientes Linkwitz-Riley de 12, 24 y 48 dB/oct, línea de corte interactiva en el gráfico y exportador de imágenes de alta resolución en PNG.
@@ -20,7 +20,7 @@ Aplicación de escritorio standalone en Python para Windows que combina un **Ana
   - `scipy.signal.sosfreqz` (evaluación de la respuesta en frecuencia compleja para renderizado de curvas estáticas y dinámicas a 60+ FPS).
   - `scipy.interpolate.make_interp_spline` (interpolación cúbica del espectro FFT).
 - **Empaquetado y Distribución:**
-  - `PyInstaller` con especificación `FFTEQ&LIM.spec` (`--noconsole --onefile`).
+  - `PyInstaller` con especificación `Heaviside DSP.spec` (`--noconsole --onefile`).
   - `Inno Setup 6 / 7` (`setup.iss`, `setup.ino`, `build_installer.iss`) con compresión `lzma2/ultra64` y soporte bilingüe (Español / Inglés).
 
 ---
@@ -72,10 +72,10 @@ El proyecto está estructurado en componentes fuertemente desacoplados que opera
 5. **Estética Visual Unificada:**
    - Toda la interfaz sigue la estética oscura profesional `#0D0F14` con componentes Liquid Glass translúcidos. Queda prohibido cualquier estilo de controles nativos claros de Windows o el antiguo modo retro VFD.
 6. **Compilación de Instaladores y Versionado:**
-   - El script oficial de Inno Setup es `setup.iss` (con alias `setup.ino` y `build_installer.iss`), configurado para generar `setup.exe` con compresión `lzma2/ultra64` y modo 64 bits (`x64compatible`).
+   - El script oficial de Inno Setup es `setup.iss` (con alias `setup.ino` y `build_installer.iss`), configurado para generar `Heaviside DSP Setup.exe` con compresión `lzma2/ultra64` y modo 64 bits (`x64compatible`).
 7. **Compatibilidad con UAC y Directorios Protegidos (Program Files):**
    - Queda estrictamente prohibido usar llamadas relativas directas del tipo `os.makedirs("presets")` o asumir que `_app_dir()` es escribible.
-   - Todo guardado de datos mutables (presets, `config.json`, archivos temporales) debe verificar `_is_writable_dir(_app_dir())`: si es escribible (entorno de desarrollo o modo portable), se utiliza la ruta local; si la aplicación está instalada en `C:\Program Files` u otra ruta protegida por UAC en Windows, los datos se deben escribir y cargar desde `%APPDATA%\BDJ_FFT_EQ\`.
+   - Todo guardado de datos mutables (presets, `config.json`, archivos temporales) debe verificar `_is_writable_dir(_app_dir())`: si es escribible (entorno de desarrollo o modo portable), se utiliza la ruta local; si la aplicación está instalada en `C:\Program Files` u otra ruta protegida por UAC en Windows, los datos se deben escribir y cargar desde `%APPDATA%\Heaviside_DSP\`.
 8. **Arquitectura Dual-Input e Input 2 (Aux / Mic):**
    - El stream secundario (`stream_in2`) opera en un hilo independiente de PortAudio desacoplado del stream maestro mediante `AsyncInputRingBuffer` con protección de concurrencia (`threading.Lock()`).
    - El hilo maestro `audio_callback` debe vaciar y procesar `in2_block` continuamente siempre que `stream_in2` esté activo para alimentar el analizador espectral FFT y la medición acústica RTA, independientemente de si el ruteo acústico hacia los altavoces (`route_in2_to_a` / `route_in2_to_b`) está silenciado.
