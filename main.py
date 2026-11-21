@@ -3990,58 +3990,159 @@ class AudioAnalyzerApp(QMainWindow):
                 continue
         return sorted(files, key=lambda x: x[0].lower())
 
-    def save_preset_to_file(self, filepath: str) -> bool:
+    def _inspect_preset_sections(self, filepath: str) -> tuple[str, set[str]]:
+        """Inspecciona qué secciones (eq, mb, xover) contiene un archivo de preset."""
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return ("all", set())
+        except Exception:
+            return ("all", set())
+
+        preset_scope = str(data.get("preset_scope", "all"))
+        sections: set[str] = set()
+        if isinstance(data.get("bands"), list) or isinstance(data.get("bands_in2"), list):
+            sections.add("eq")
+        if isinstance(data.get("multiband_dynamics"), dict) or isinstance(data.get("multiband_dynamics_in2"), dict):
+            sections.add("mb")
+        if isinstance(data.get("crossover"), dict):
+            sections.add("xover")
+        return (preset_scope, sections)
+
+    def _sync_mb_ui_after_change(
+        self,
+        switch_to_eq_if_empty: bool = False,
+        select_first_if_present: bool = False,
+        ensure_mb_layer: bool = False,
+    ):
+        """Sincroniza el HUD, el lienzo y el estado de selección tras cambios en el Compresor Multibanda."""
+        if hasattr(self, "multiband_dyn_in1") and hasattr(self, "multiband_dyn_in2"):
+            self.multiband_dyn = (
+                self.multiband_dyn_in1
+                if getattr(self, "current_edit_input", 1) == 1
+                else self.multiband_dyn_in2
+            )
+        if not hasattr(self, "multiband_dyn"):
+            return
+
+        if hasattr(self, "multiband_dyn_in1"):
+            self._selected_mb_idx_by_input[1] = 0 if self.multiband_dyn_in1.bands else -1
+        if hasattr(self, "multiband_dyn_in2"):
+            self._selected_mb_idx_by_input[2] = 0 if self.multiband_dyn_in2.bands else -1
+
+        if hasattr(self, "eq_panel") and self.eq_panel is not None:
+            char_pop = getattr(self.eq_panel, "_mb_char_popup", None)
+            if char_pop is not None and char_pop.isVisible():
+                char_pop.close()
+
+        if hasattr(self, "eq_overlay") and self.eq_overlay is not None:
+            self.eq_overlay.cancel_mb_placement()
+            self.eq_overlay.selected_mb_idx = 0 if self.multiband_dyn.bands else -1
+            self.eq_overlay._last_mb_rendered_version = -1
+            self.eq_overlay.set_multiband_processor(self.multiband_dyn)
+
+        if ensure_mb_layer and self.multiband_dyn.bands:
+            self._ensure_canvas_layer_enabled("MB")
+
+        if hasattr(self, "eq_panel") and self.eq_panel is not None:
+            self.eq_panel.set_multiband_processor(self.multiband_dyn)
+            self.eq_panel.refresh_mb_from_engine()
+            if select_first_if_present and self.multiband_dyn.bands:
+                self.eq_panel.select_mb_band(0)
+            elif switch_to_eq_if_empty and not self.multiband_dyn.bands:
+                c_mode = (
+                    getattr(self.eq_overlay, "canvas_mode", "BOTH")
+                    if hasattr(self, "eq_overlay") and self.eq_overlay is not None
+                    else "BOTH"
+                )
+                if getattr(self.eq_panel, "_hud_mode", "eq") == "mb" and c_mode != "MB":
+                    self.eq_panel.set_hud_mode("eq")
+
+        if hasattr(self, "eq_overlay") and self.eq_overlay is not None:
+            self.eq_overlay.update_eq_curves(force=True)
+            self.eq_overlay.update()
+
+    def save_preset_to_file(self, filepath: str, scope: str = "all") -> bool:
         """
-        Guarda el estado actual de bandas EQ (In 1 e In 2), Crossover y Ruteo de Entradas en un archivo .json.
+        Guarda el estado actual en un archivo .json:
+        - scope='all': EQ (In 1 e In 2), Compresor Multibanda (In 1 e In 2), Crossover, Limitador y Ruteo.
+        - scope='mb_only' (o 'comp_only'): únicamente el Compresor Multibanda (In 1 e In 2).
         """
         try:
-            def _serialize(bands_seq):
-                res = []
-                for b in bands_seq:
-                    res.append({
-                        "freq": float(b.freq),
-                        "gain": float(getattr(b, "gain_db", getattr(b, "gain", 0.0))),
-                        "q": float(b.q),
-                        "filter_type": str(b.filter_type),
-                        "enabled": bool(b.enabled),
-                        "channel_mode": str(getattr(b, "channel_mode", "LR")),
-                        "output_bus": str(getattr(b, "target_output", getattr(b, "output_bus", "A+B"))),
-                        "dyn_enabled": bool(getattr(b, "dyn_enabled", False)),
-                        "dyn_threshold": float(getattr(b, "threshold_db", getattr(b, "dyn_threshold", -20.0))),
-                        "dyn_ratio": float(getattr(b, "dyn_ratio", 2.0)),
-                        "dyn_range_db": float(getattr(b, "dyn_range_db", 0.0)),
-                        "attack_ms": float(getattr(b, "attack_ms", 15.0)),
-                        "release_ms": float(getattr(b, "release_ms", 120.0)),
-                        "slope": int(getattr(b, "slope", 12)),
-                        "color": str(getattr(b, "color", "#00E5FF")),
-                    })
-                return res
+            mb_dict = (
+                self.multiband_dyn_in1.to_dict()
+                if hasattr(self, "multiband_dyn_in1")
+                else (self.multiband_dyn.to_dict() if hasattr(self, "multiband_dyn") else {"bypass": False, "bands": []})
+            )
+            mb_dict_in2 = (
+                self.multiband_dyn_in2.to_dict()
+                if hasattr(self, "multiband_dyn_in2")
+                else {"bypass": False, "bands": []}
+            )
 
-            with self.eq_proc_in1.lock:
-                b1 = list(self.eq_proc_in1.bands)
-            with self.eq_proc_in2.lock:
-                b2 = list(self.eq_proc_in2.bands)
+            if scope in ("mb_only", "comp_only"):
+                data = {
+                    "version": "1.0",
+                    "preset_scope": "mb_only",
+                    "multiband_dynamics": mb_dict,
+                    "multiband_dynamics_in2": mb_dict_in2,
+                }
+            else:
+                def _serialize(bands_seq):
+                    res = []
+                    for b in bands_seq:
+                        res.append({
+                            "freq": float(b.freq),
+                            "gain": float(getattr(b, "gain_db", getattr(b, "gain", 0.0))),
+                            "q": float(b.q),
+                            "filter_type": str(b.filter_type),
+                            "enabled": bool(b.enabled),
+                            "channel_mode": str(getattr(b, "channel_mode", "LR")),
+                            "output_bus": str(getattr(b, "target_output", getattr(b, "output_bus", "A+B"))),
+                            "dyn_enabled": bool(getattr(b, "dyn_enabled", False)),
+                            "dyn_threshold": float(getattr(b, "threshold_db", getattr(b, "dyn_threshold", -20.0))),
+                            "dyn_ratio": float(getattr(b, "dyn_ratio", 2.0)),
+                            "dyn_range_db": float(getattr(b, "dyn_range_db", 0.0)),
+                            "attack_ms": float(getattr(b, "attack_ms", 15.0)),
+                            "release_ms": float(getattr(b, "release_ms", 120.0)),
+                            "slope": int(getattr(b, "slope", 12)),
+                            "color": str(getattr(b, "color", "#00E5FF")),
+                        })
+                    return res
 
-            xover_dict = self.crossover.get_state_dict() if hasattr(self, "crossover") else dict(self.crossover_state)
-            mb_dict = self.multiband_dyn_in1.to_dict() if hasattr(self, "multiband_dyn_in1") else (self.multiband_dyn.to_dict() if hasattr(self, "multiband_dyn") else {"bypass": False, "bands": []})
-            mb_dict_in2 = self.multiband_dyn_in2.to_dict() if hasattr(self, "multiband_dyn_in2") else {"bypass": False, "bands": []}
-            lim_dict = self.eq_proc_in1.limiter_a.to_dict()
+                with self.eq_proc_in1.lock:
+                    b1 = list(self.eq_proc_in1.bands)
+                    eq1_out_gain = float(self.eq_proc_in1.output_gain_db)
+                    eq1_bypass = bool(self.eq_proc_in1.bypass)
+                with self.eq_proc_in2.lock:
+                    b2 = list(self.eq_proc_in2.bands)
+                    eq2_out_gain = float(self.eq_proc_in2.output_gain_db)
+                    eq2_bypass = bool(self.eq_proc_in2.bypass)
 
-            data = {
-                "version": "1.0",
-                "bands": _serialize(b1),
-                "bands_in2": _serialize(b2),
-                "crossover": xover_dict,
-                "multiband_dynamics": mb_dict,
-                "multiband_dynamics_in2": mb_dict_in2,
-                "limiter": lim_dict,
-                "input_routing": {
-                    "route_in1_to_a": bool(self.route_in1_to_a),
-                    "route_in1_to_b": bool(self.route_in1_to_b),
-                    "route_in2_to_a": bool(self.route_in2_to_a),
-                    "route_in2_to_b": bool(self.route_in2_to_b),
-                },
-            }
+                xover_dict = self.crossover.get_state_dict() if hasattr(self, "crossover") else dict(self.crossover_state)
+                lim_dict = self.eq_proc_in1.limiter_a.to_dict()
+
+                data = {
+                    "version": "1.0",
+                    "preset_scope": "all",
+                    "bands": _serialize(b1),
+                    "bands_in2": _serialize(b2),
+                    "eq_output_gain_db": eq1_out_gain,
+                    "eq_bypass": eq1_bypass,
+                    "eq_in2_output_gain_db": eq2_out_gain,
+                    "eq_in2_bypass": eq2_bypass,
+                    "crossover": xover_dict,
+                    "multiband_dynamics": mb_dict,
+                    "multiband_dynamics_in2": mb_dict_in2,
+                    "limiter": lim_dict,
+                    "input_routing": {
+                        "route_in1_to_a": bool(self.route_in1_to_a),
+                        "route_in1_to_b": bool(self.route_in1_to_b),
+                        "route_in2_to_a": bool(self.route_in2_to_a),
+                        "route_in2_to_b": bool(self.route_in2_to_b),
+                    },
+                }
 
             dirpath = os.path.dirname(filepath)
             if dirpath:
@@ -4056,8 +4157,9 @@ class AudioAnalyzerApp(QMainWindow):
     def load_preset_from_file(self, filepath: str, mode: str = "all") -> bool:
         """
         Carga un preset desde un archivo .json:
-        - mode='all': carga EQ (In 1 e In 2) + Crossover + Ruteo de Entradas
-        - mode='eq_only': carga solo bandas de EQ
+        - mode='all': carga EQ (In 1 e In 2) + Compresor Multibanda + Crossover + Limitador + Ruteo
+        - mode='eq_only': carga solo bandas y estado de EQ
+        - mode='mb_only' (o 'comp_only'): carga solo Compresor Multibanda (In 1 e In 2)
         - mode='xover_only': carga solo Crossover
         """
         target = filepath
@@ -4077,17 +4179,21 @@ class AudioAnalyzerApp(QMainWindow):
             if not isinstance(data, dict):
                 return False
 
+            eff_mode = "mb_only" if mode in ("mb_only", "comp_only") else mode
+            any_applied = False
+
             # 1. Cargar Crossover si corresponde
-            if mode in ("all", "xover_only") and "crossover" in data and isinstance(data["crossover"], dict):
+            if eff_mode in ("all", "xover_only") and "crossover" in data and isinstance(data["crossover"], dict):
                 self.crossover_state = dict(data["crossover"])
                 if hasattr(self, "crossover"):
                     self.crossover.set_config(self.crossover_state, self.current_sr)
                 if hasattr(self, "crossover_widget") and self.crossover_widget is not None:
                     self.crossover_widget.set_state(self.crossover_state)
                 self.update_crossover_visuals()
+                any_applied = True
 
             # 2. Cargar ruteo de entradas si corresponde
-            if mode == "all" and "input_routing" in data and isinstance(data["input_routing"], dict):
+            if eff_mode == "all" and "input_routing" in data and isinstance(data["input_routing"], dict):
                 r = data["input_routing"]
                 self.route_in1_to_a = bool(r.get("route_in1_to_a", True))
                 self.route_in1_to_b = bool(r.get("route_in1_to_b", True))
@@ -4098,9 +4204,10 @@ class AudioAnalyzerApp(QMainWindow):
                     self.chk_route_in1_b.setChecked(self.route_in1_to_b)
                     self.chk_route_in2_a.setChecked(self.route_in2_to_a)
                     self.chk_route_in2_b.setChecked(self.route_in2_to_b)
+                any_applied = True
 
             # 3. Cargar bandas de EQ si corresponde
-            if mode in ("all", "eq_only"):
+            if eff_mode in ("all", "eq_only") and ("bands" in data or "bands_in2" in data):
                 from eq_dsp import EQBand, BAND_COLORS
 
                 def _deserialize(raw_list):
@@ -4154,6 +4261,11 @@ class AudioAnalyzerApp(QMainWindow):
                     with self.eq_proc_in1.lock:
                         self.eq_proc_in1.bands = nb1
                         self.bands_in1 = nb1
+                        self.eq_proc_in1.isolated_band_index = None
+                        if "eq_output_gain_db" in data:
+                            self.eq_proc_in1.output_gain_db = float(np.clip(data["eq_output_gain_db"], -24.0, 24.0))
+                        if "eq_bypass" in data:
+                            self.eq_proc_in1.bypass = bool(data["eq_bypass"])
                         self.eq_proc_in1.mark_dirty()
 
                 if "bands_in2" in data and isinstance(data["bands_in2"], list):
@@ -4161,11 +4273,22 @@ class AudioAnalyzerApp(QMainWindow):
                     with self.eq_proc_in2.lock:
                         self.eq_proc_in2.bands = nb2
                         self.bands_in2 = nb2
+                        self.eq_proc_in2.isolated_band_index = None
+                        if "eq_in2_output_gain_db" in data:
+                            self.eq_proc_in2.output_gain_db = float(np.clip(data["eq_in2_output_gain_db"], -24.0, 24.0))
+                        if "eq_in2_bypass" in data:
+                            self.eq_proc_in2.bypass = bool(data["eq_in2_bypass"])
                         self.eq_proc_in2.mark_dirty()
 
                 # Actualiza el motor actualmente visible
                 active_engine = self.eq_proc_in1 if getattr(self, "current_edit_input", 1) == 1 else self.eq_proc_in2
                 self.eq_engine = active_engine
+                self.bypass_eq = bool(active_engine.bypass)
+                if hasattr(self, "bypass_btn") and self.bypass_btn is not None:
+                    self.bypass_btn.setChecked(self.bypass_eq)
+                    self.bypass_btn.update()
+                self._selected_band_idx_by_input[1] = 0 if self.eq_proc_in1.bands else -1
+                self._selected_band_idx_by_input[2] = 0 if self.eq_proc_in2.bands else -1
                 if hasattr(self, "eq_overlay") and self.eq_overlay is not None:
                     self.eq_overlay.eq_engine = active_engine
                     self.eq_overlay.selected_band_idx = 0 if active_engine.bands else -1
@@ -4177,9 +4300,17 @@ class AudioAnalyzerApp(QMainWindow):
                     self.eq_panel.refresh_from_engine()
 
                 self.recalculate_autogain_target()
-                self.schedule_config_save()
+                any_applied = True
 
-            if mode == "all":
+            # 4. Cargar Compresor Multibanda si corresponde
+            if eff_mode in ("all", "mb_only"):
+                has_mb_data = (
+                    isinstance(data.get("multiband_dynamics"), dict)
+                    or isinstance(data.get("multiband_dynamics_in2"), dict)
+                )
+                if eff_mode == "mb_only" and not has_mb_data:
+                    return False
+
                 if hasattr(self, "multiband_dyn_in1"):
                     if "multiband_dynamics" in data and isinstance(data["multiband_dynamics"], dict):
                         self.multiband_dyn_in1.load_from_dict(data["multiband_dynamics"])
@@ -4190,33 +4321,31 @@ class AudioAnalyzerApp(QMainWindow):
                         self.multiband_dyn_in2.load_from_dict(data["multiband_dynamics_in2"])
                     else:
                         self.multiband_dyn_in2.load_from_dict({"bypass": False, "bands": []})
-                if hasattr(self, "multiband_dyn"):
-                    self.multiband_dyn = self.multiband_dyn_in1 if getattr(self, "current_edit_input", 1) == 1 else self.multiband_dyn_in2
-                    self._selected_mb_idx_by_input[1] = 0 if self.multiband_dyn_in1.bands else -1
-                    self._selected_mb_idx_by_input[2] = 0 if self.multiband_dyn_in2.bands else -1
-                    if hasattr(self, "eq_overlay") and self.eq_overlay is not None:
-                        self.eq_overlay.selected_mb_idx = 0 if self.multiband_dyn.bands else -1
-                        self.eq_overlay._last_mb_rendered_version = -1
-                        self.eq_overlay.set_multiband_processor(self.multiband_dyn)
-                if "limiter" in data and isinstance(data["limiter"], dict):
-                    self.eq_proc_in1.limiter_a.load_from_dict(data["limiter"])
-                    self.eq_proc_in1.limiter_b.load_from_dict(data["limiter"])
-                    if (
-                        hasattr(self, "scope_overlay")
-                        and hasattr(self.scope_overlay, "limiter_popup")
-                        and self.scope_overlay.limiter_popup is not None
-                    ):
-                        self.scope_overlay.limiter_popup.sync_from_engine()
-                if hasattr(self, "eq_panel") and self.eq_panel is not None:
-                    self.eq_panel.set_multiband_processor(self.multiband_dyn)
-                    self.eq_panel.refresh_mb_from_engine()
-                    if hasattr(self, "multiband_dyn") and not self.multiband_dyn.bands and getattr(self.eq_panel, "_hud_mode", "eq") == "mb":
-                        self.eq_panel.set_hud_mode("eq")
-                if hasattr(self, "eq_overlay") and self.eq_overlay is not None:
-                    self.eq_overlay.update_eq_curves(force=True)
-                self.schedule_config_save()
 
-            return True
+                is_comp_focus = (eff_mode == "mb_only") or (data.get("preset_scope") == "mb_only")
+                self._sync_mb_ui_after_change(
+                    switch_to_eq_if_empty=True,
+                    select_first_if_present=is_comp_focus,
+                    ensure_mb_layer=is_comp_focus,
+                )
+                any_applied = True
+
+            # 5. Cargar Limitador Master si corresponde
+            if eff_mode == "all" and "limiter" in data and isinstance(data["limiter"], dict):
+                self.eq_proc_in1.limiter_a.load_from_dict(data["limiter"])
+                self.eq_proc_in1.limiter_b.load_from_dict(data["limiter"])
+                if (
+                    hasattr(self, "scope_overlay")
+                    and hasattr(self.scope_overlay, "limiter_popup")
+                    and self.scope_overlay.limiter_popup is not None
+                ):
+                    self.scope_overlay.limiter_popup.sync_from_engine()
+                any_applied = True
+
+            if any_applied:
+                self.schedule_config_save()
+                return True
+            return False
         except Exception as e:
             print(f"[ERROR] Error al cargar preset desde {target}: {e}")
             return False
@@ -4235,20 +4364,96 @@ class AudioAnalyzerApp(QMainWindow):
         self.save_preset_to_file(startup_path)
 
     def _restore_factory_startup(self):
-        """Restaura el inicio de fábrica eliminando default_startup.json."""
-        target = os.path.join(self._get_presets_dir(), "default_startup.json")
-        if os.path.isfile(target):
-            try:
-                os.remove(target)
-            except Exception as e:
-                print(f"[ERROR] Error al eliminar preset de inicio: {e}")
+        """Restaura el estado de fábrica (EQ plano, Compresor vacío, Crossover apagado) y elimina default_startup.json."""
+        candidates = [
+            os.path.join(self._get_presets_dir(), "default_startup.json"),
+            os.path.join(_app_dir(), "presets", "default_startup.json"),
+        ]
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            candidates.append(os.path.join(appdata, "BDJ_FFT_EQ", "presets", "default_startup.json"))
+        for target in candidates:
+            if target and os.path.isfile(target):
+                try:
+                    os.remove(target)
+                except Exception as e:
+                    print(f"[ERROR] Error al eliminar preset de inicio {target}: {e}")
 
-    def _on_save_preset_dialog(self):
-        """Abre un diálogo oscuro pidiendo el nombre del preset."""
+        with self.eq_proc_in1.lock:
+            self.eq_proc_in1.init_default_bands()
+            self.eq_proc_in1.output_gain_db = 0.0
+            self.eq_proc_in1.bypass = False
+            self.bands_in1 = self.eq_proc_in1.bands
+            self.eq_proc_in1.mark_dirty()
+        with self.eq_proc_in2.lock:
+            self.eq_proc_in2.init_default_bands()
+            self.eq_proc_in2.output_gain_db = 0.0
+            self.eq_proc_in2.bypass = False
+            self.bands_in2 = self.eq_proc_in2.bands
+            self.eq_proc_in2.mark_dirty()
+
+        self.bypass_eq = False
+        if hasattr(self, "bypass_btn") and self.bypass_btn is not None:
+            self.bypass_btn.setChecked(False)
+            self.bypass_btn.update()
+        self._selected_band_idx_by_input = {1: 0, 2: 0}
+
+        if hasattr(self, "multiband_dyn_in1"):
+            self.multiband_dyn_in1.load_from_dict({"bypass": False, "bands": []})
+        if hasattr(self, "multiband_dyn_in2"):
+            self.multiband_dyn_in2.load_from_dict({"bypass": False, "bands": []})
+
+        self.crossover_state = {
+            "enabled": False,
+            "freq_hz": 80.0,
+            "filter_type": "Linkwitz-Riley",
+            "slope_db": 24,
+            "routing_mode": "A_Tops_B_Sub",
+        }
+        if hasattr(self, "crossover"):
+            self.crossover.set_config(self.crossover_state, self.current_sr)
+        if hasattr(self, "crossover_widget") and self.crossover_widget is not None:
+            self.crossover_widget.set_state(self.crossover_state)
+        self.update_crossover_visuals()
+
+        factory_lim = {
+            "enabled": True,
+            "ceiling_db": -0.1,
+            "threshold_db": 0.0,
+            "attack_ms": 2.0,
+            "release_ms": 50.0,
+        }
+        self.eq_proc_in1.limiter_a.load_from_dict(factory_lim)
+        self.eq_proc_in1.limiter_b.load_from_dict(factory_lim)
+        if (
+            hasattr(self, "scope_overlay")
+            and hasattr(self.scope_overlay, "limiter_popup")
+            and self.scope_overlay.limiter_popup is not None
+        ):
+            self.scope_overlay.limiter_popup.sync_from_engine()
+
+        if hasattr(self, "eq_overlay") and self.eq_overlay is not None:
+            self.eq_overlay.selected_band_idx = 0
+        self._sync_mb_ui_after_change(switch_to_eq_if_empty=True)
+        if hasattr(self, "eq_panel") and self.eq_panel is not None:
+            self.eq_panel.refresh_from_engine()
+        self.recalculate_autogain_target()
+        if hasattr(self, "config_save_timer") and self.config_save_timer.isActive():
+            self.config_save_timer.stop()
+        if not self._loading_config:
+            self.save_app_config()
+
+    def _on_save_preset_dialog(self, scope: str = "all"):
+        """Abre un diálogo oscuro pidiendo el nombre del preset (completo o solo compresor)."""
+        is_mb = scope in ("mb_only", "comp_only")
         dialog = QInputDialog(self)
-        dialog.setWindowTitle("Guardar Preset")
-        dialog.setLabelText("Nombre del Preset:")
-        dialog.setTextValue("Mi Preset")
+        dialog.setWindowTitle("Guardar Preset de Compresor" if is_mb else "Guardar Preset Completo")
+        dialog.setLabelText(
+            "Nombre del Preset de Compresor:"
+            if is_mb
+            else "Nombre del Preset (EQ + Compresor + Crossover):"
+        )
+        dialog.setTextValue("Mi Compresor" if is_mb else "Mi Preset")
         dialog.setStyle(QStyleFactory.create("Fusion"))
         dialog.setStyleSheet("""
             QInputDialog, QDialog {
@@ -4295,22 +4500,79 @@ class AudioAnalyzerApp(QMainWindow):
             if raw_name:
                 safe_name = "".join(c for c in raw_name if c.isalnum() or c in (" ", "-", "_", "(", ")", ".")).strip()
                 if not safe_name:
-                    safe_name = "Preset"
+                    safe_name = "Mi Compresor" if is_mb else "Preset"
                 if not safe_name.lower().endswith(".json"):
                     safe_name += ".json"
                 target_path = os.path.join(self._get_presets_dir(), safe_name)
-                self.save_preset_to_file(target_path)
+                self.save_preset_to_file(target_path, scope=scope)
+
+    def _reset_current_eq(self):
+        """Resetea a plano el EQ de la entrada activa sin modificar el Compresor Multibanda."""
+        inp = getattr(self, "current_edit_input", 1)
+        with self.eq_engine.lock:
+            self.eq_engine.output_gain_db = 0.0
+            self.eq_engine.bypass = False
+        if hasattr(self, "eq_panel") and self.eq_panel is not None:
+            self.eq_panel._on_reset_eq()
+        else:
+            self.eq_engine.init_default_bands()
+        if inp == 1:
+            self.bands_in1 = self.eq_proc_in1.bands
+        else:
+            self.bands_in2 = self.eq_proc_in2.bands
+        self.bypass_eq = False
+        if hasattr(self, "bypass_btn") and self.bypass_btn is not None:
+            self.bypass_btn.setChecked(False)
+            self.bypass_btn.update()
+        self._selected_band_idx_by_input[inp] = 0 if self.eq_engine.bands else -1
+        self.recalculate_autogain_target()
+        self.schedule_config_save()
+
+    def _reset_current_compressor(self):
+        """Resetea (limpia bandas y quita bypass) únicamente el Compresor Multibanda de la entrada activa."""
+        inp = getattr(self, "current_edit_input", 1)
+        active_mb = (
+            self.multiband_dyn_in1
+            if inp == 1 and hasattr(self, "multiband_dyn_in1")
+            else (
+                self.multiband_dyn_in2
+                if inp == 2 and hasattr(self, "multiband_dyn_in2")
+                else getattr(self, "multiband_dyn", None)
+            )
+        )
+        if active_mb is not None:
+            active_mb.load_from_dict({"bypass": False, "bands": []})
+        self._sync_mb_ui_after_change(switch_to_eq_if_empty=True)
+        self.schedule_config_save()
 
     def _reset_all_eq_and_crossover(self):
-        """Resetea completamente todas las bandas de In 1 e In 2 y desactiva el Crossover."""
+        """Resetea completamente EQ (In 1 e In 2), Compresor Multibanda (In 1 e In 2) y desactiva el Crossover."""
         with self.eq_proc_in1.lock:
             self.eq_proc_in1.bands = []
             self.bands_in1 = []
+            self.eq_proc_in1.isolated_band_index = None
+            self.eq_proc_in1.output_gain_db = 0.0
+            self.eq_proc_in1.bypass = False
             self.eq_proc_in1.mark_dirty()
         with self.eq_proc_in2.lock:
             self.eq_proc_in2.bands = []
             self.bands_in2 = []
+            self.eq_proc_in2.isolated_band_index = None
+            self.eq_proc_in2.output_gain_db = 0.0
+            self.eq_proc_in2.bypass = False
             self.eq_proc_in2.mark_dirty()
+
+        self.bypass_eq = False
+        if hasattr(self, "bypass_btn") and self.bypass_btn is not None:
+            self.bypass_btn.setChecked(False)
+            self.bypass_btn.update()
+        self._selected_band_idx_by_input = {1: -1, 2: -1}
+
+        if hasattr(self, "multiband_dyn_in1"):
+            self.multiband_dyn_in1.load_from_dict({"bypass": False, "bands": []})
+        if hasattr(self, "multiband_dyn_in2"):
+            self.multiband_dyn_in2.load_from_dict({"bypass": False, "bands": []})
+
         self.crossover_state = {
             "enabled": False,
             "freq_hz": 80.0,
@@ -4325,54 +4587,86 @@ class AudioAnalyzerApp(QMainWindow):
         self.update_crossover_visuals()
         if hasattr(self, "eq_overlay") and self.eq_overlay is not None:
             self.eq_overlay.selected_band_idx = -1
-            self.eq_overlay.update_eq_curves(force=True)
-            self.eq_overlay.update()
+        self._sync_mb_ui_after_change(switch_to_eq_if_empty=True)
         if hasattr(self, "eq_panel") and self.eq_panel is not None:
             self.eq_panel.refresh_from_engine()
         self.recalculate_autogain_target()
         self.schedule_config_save()
 
-    def _show_presets_menu(self):
-        """Despliega el menú HUD estilizado de Presets bajo el botón de la barra superior."""
+    def _build_presets_menu(self) -> HUDPopupMenu:
+        """Construye y retorna el menú HUD estilizado de Presets y Reset."""
         menu = HUDPopupMenu(self, accent_color=self._get_active_hud_accent_hex(), corner_radius=8.0)
 
-        # 1. Resetear EQ
+        # 1. Resetear EQ / Compresor / Todo
         act_reset = menu.addAction("Resetear EQ Actual (Plano)")
-        act_reset.triggered.connect(lambda: self.eq_panel._on_reset_eq())
+        act_reset.triggered.connect(self._reset_current_eq)
 
-        act_reset_all = menu.addAction("Resetear Todo (EQ + Crossover)")
+        act_reset_comp = menu.addAction("Resetear Compresor Actual (Sin Bandas)")
+        act_reset_comp.triggered.connect(self._reset_current_compressor)
+
+        act_reset_all = menu.addAction("Resetear Todo (EQ + Compresor + Crossover)")
         act_reset_all.triggered.connect(self._reset_all_eq_and_crossover)
 
         menu.addSeparator()
 
         # 2. Guardar Preset
-        act_save = menu.addAction("Guardar Preset Como...")
-        act_save.triggered.connect(self._on_save_preset_dialog)
+        act_save = menu.addAction("Guardar Preset Completo Como...")
+        act_save.triggered.connect(lambda _=False: self._on_save_preset_dialog(scope="all"))
+
+        act_save_mb = menu.addAction("Guardar Solo Compresor Como...")
+        act_save_mb.triggered.connect(lambda _=False: self._on_save_preset_dialog(scope="mb_only"))
+
+        menu.addSeparator()
 
         # 3. Submenús dinámicos
         preset_files = self._get_preset_files()
 
         def _make_loader(p, m):
-            return lambda: self.load_preset_from_file(p, mode=m)
+            return lambda _=False: self.load_preset_from_file(p, mode=m)
 
         def _make_deleter(p):
-            return lambda: self._delete_preset_file(p)
+            return lambda _=False: self._delete_preset_file(p)
 
-        sub_load_all = menu.addMenu("Cargar Completo (EQ + Crossover)")
+        sub_load_all = menu.addMenu("Cargar Completo (EQ + Compresor + Crossover)")
         sub_load_eq = menu.addMenu("Cargar Solo EQ")
+        sub_load_mb = menu.addMenu("Cargar Solo Compresor")
         sub_load_xover = menu.addMenu("Cargar Solo Crossover")
         sub_del = menu.addMenu("Eliminar Preset")
 
+        eq_count = 0
+        mb_count = 0
+        xover_count = 0
+
         if not preset_files:
-            for sm in (sub_load_all, sub_load_eq, sub_load_xover, sub_del):
-                empty_act = sm.addAction("(Sin presets guardados)")
-                empty_act.setEnabled(False)
+            empty_all = sub_load_all.addAction("(Sin presets guardados)")
+            empty_all.setEnabled(False)
+            empty_del = sub_del.addAction("(Sin presets guardados)")
+            empty_del.setEnabled(False)
         else:
             for name, path in preset_files:
-                sub_load_all.addAction(name, _make_loader(path, "all"))
-                sub_load_eq.addAction(name, _make_loader(path, "eq_only"))
-                sub_load_xover.addAction(name, _make_loader(path, "xover_only"))
+                preset_scope, sections = self._inspect_preset_sections(path)
+                label_all = f"{name} (Solo Compresor)" if preset_scope == "mb_only" else name
+                sub_load_all.addAction(label_all, _make_loader(path, "all"))
+                if "eq" in sections:
+                    sub_load_eq.addAction(name, _make_loader(path, "eq_only"))
+                    eq_count += 1
+                if "mb" in sections:
+                    sub_load_mb.addAction(name, _make_loader(path, "mb_only"))
+                    mb_count += 1
+                if "xover" in sections:
+                    sub_load_xover.addAction(name, _make_loader(path, "xover_only"))
+                    xover_count += 1
                 sub_del.addAction(name, _make_deleter(path))
+
+        if eq_count == 0:
+            empty_eq = sub_load_eq.addAction("(Sin presets con EQ)")
+            empty_eq.setEnabled(False)
+        if mb_count == 0:
+            empty_mb = sub_load_mb.addAction("(Sin presets de compresor)")
+            empty_mb.setEnabled(False)
+        if xover_count == 0:
+            empty_xo = sub_load_xover.addAction("(Sin presets con Crossover)")
+            empty_xo.setEnabled(False)
 
         menu.addSeparator()
 
@@ -4384,6 +4678,11 @@ class AudioAnalyzerApp(QMainWindow):
         act_factory = menu.addAction("Restaurar Inicio de Fábrica (Plano)")
         act_factory.triggered.connect(self._restore_factory_startup)
 
+        return menu
+
+    def _show_presets_menu(self):
+        """Despliega el menú HUD estilizado de Presets bajo el botón de la barra superior."""
+        menu = self._build_presets_menu()
         btn_pos = self.presets_btn.mapToGlobal(QPoint(0, self.presets_btn.height() + 2))
         menu.exec(btn_pos)
 

@@ -476,7 +476,7 @@ class InteractiveHelpTour(QObject):
             ),
             HelpStep(
                 "top_presets", "Barra Superior", "Presets y Reset",
-                "Guarda, carga, elimina presets, fija el preset predeterminado de inicio o resetea el EQ actual o todo el procesador.",
+                "Guarda y carga presets completos o solo de EQ, Compresor Multibanda o Crossover; resetea el EQ, el Compresor o todo el procesador y configura el inicio predeterminado.",
                 lambda: app.presets_btn,
             ),
             HelpStep(
